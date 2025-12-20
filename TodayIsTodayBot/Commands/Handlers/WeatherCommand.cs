@@ -16,7 +16,7 @@ public class WeatherCommand : ICommandHandler
 
     public string CommandName => "weather";
     
-    public string Description => "指定した地域の天気情報を取得します（例: /weather 東京）";
+    public string Description => "指定した地域の天気情報を取得します（日本語・英語対応、例: /weather 東京 または /weather Tokyo）";
 
     public async Task ExecuteAsync(SocketMessage message, string[] args)
     {
