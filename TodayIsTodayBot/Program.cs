@@ -1,6 +1,8 @@
 ﻿using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Configuration;
+using TodayIsTodayBot.Commands;
+using TodayIsTodayBot.Handlers;
 
 namespace TodayIsTodayBot;
 
@@ -10,6 +12,8 @@ class Program
     private bool _isRunning = true;
     private IConfiguration? _configuration;
     private int _frameRate = 60;
+    private CommandService? _commandService;
+    private MessageHandler? _messageHandler;
 
     static async Task Main(string[] args)
     {
@@ -28,6 +32,15 @@ class Program
         // 設定からフレームレートを取得
         _frameRate = _configuration.GetValue<int>("Bot:FrameRate", 60);
 
+        // コマンドサービスの初期化
+        _commandService = new CommandService("/");
+        
+        // コマンドの登録
+        RegisterCommands();
+        
+        // メッセージハンドラの初期化
+        _messageHandler = new MessageHandler(_commandService);
+
         // Discord クライアントの設定
         var config = new DiscordSocketConfig
         {
@@ -39,6 +52,7 @@ class Program
         // イベントハンドラの登録
         _client.Log += LogAsync;
         _client.Ready += ReadyAsync;
+        _client.MessageReceived += MessageReceivedAsync;
 
         // 設定ファイルからトークンを読み込み
         var token = _configuration["Discord:BotToken"];
@@ -57,6 +71,23 @@ class Program
         await MainLoopAsync();
 
         await _client.StopAsync();
+    }
+
+    /// <summary>
+    /// コマンドを登録する
+    /// </summary>
+    private void RegisterCommands()
+    {
+        if (_commandService == null)
+        {
+            return;
+        }
+
+        // 基本コマンドの登録
+        _commandService.RegisterCommand(new Commands.Handlers.PingCommand());
+        _commandService.RegisterCommand(new Commands.Handlers.HelpCommand(_commandService));
+        
+        // 今後、新しいコマンドはここに追加していきます
     }
 
     /// <summary>
@@ -124,6 +155,16 @@ class Program
     private Task ReadyAsync()
     {
         Console.WriteLine($"{_client?.CurrentUser} として接続しました！");
+        Console.WriteLine($"コマンドプレフィックス: /");
+        Console.WriteLine($"登録されているコマンド数: {_commandService?.GetAllCommands().Count ?? 0}");
         return Task.CompletedTask;
+    }
+
+    private async Task MessageReceivedAsync(SocketMessage message)
+    {
+        if (_messageHandler != null)
+        {
+            await _messageHandler.HandleMessageAsync(message);
+        }
     }
 }
