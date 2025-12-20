@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace TodayIsTodayBot.Services;
 
@@ -265,14 +266,24 @@ public class WeatherService
 // Open-Meteo APIレスポンスのデータモデル
 public class OpenMeteoResponse
 {
+    [JsonPropertyName("current")]
     public CurrentWeather? Current { get; set; }
 }
 
 public class CurrentWeather
 {
+    [JsonPropertyName("temperature_2m")]
     public double Temperature { get; set; }
+    
+    [JsonPropertyName("apparent_temperature")]
     public double ApparentTemperature { get; set; }
+    
+    [JsonPropertyName("relative_humidity_2m")]
     public int RelativeHumidity { get; set; }
+    
+    [JsonPropertyName("weather_code")]
     public int WeatherCode { get; set; }
+    
+    [JsonPropertyName("wind_speed_10m")]
     public double WindSpeed { get; set; }
 }
