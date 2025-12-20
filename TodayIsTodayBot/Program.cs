@@ -92,9 +92,8 @@ class Program
         _commandService.RegisterCommand(new Commands.Handlers.PingCommand());
         _commandService.RegisterCommand(new Commands.Handlers.HelpCommand(_commandService));
         
-        // 天気コマンドの登録
-        var weatherApiKey = _configuration?["OpenWeatherMap:ApiKey"];
-        var weatherService = new WeatherService(_httpClient!, weatherApiKey);
+        // 天気コマンドの登録（Open-Meteo使用、APIキー不要）
+        var weatherService = new WeatherService(_httpClient!);
         _commandService.RegisterCommand(new Commands.Handlers.WeatherCommand(weatherService));
         
         // 今後、新しいコマンドはここに追加していきます
