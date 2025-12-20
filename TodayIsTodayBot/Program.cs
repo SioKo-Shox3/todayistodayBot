@@ -43,11 +43,10 @@ class Program
         // 設定ファイルからトークンを読み込み
         var token = _configuration["Discord:BotToken"];
         
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrEmpty(token) || token == "ここにDiscordボットトークンを入力してください")
         {
             Console.WriteLine("エラー: Discord ボットトークンが設定されていません。");
-            Console.WriteLine("appsettings.json ファイルを作成し、Discord:BotToken を設定してください。");
-            Console.WriteLine("appsettings.example.json を参考にしてください。");
+            Console.WriteLine("appsettings.json ファイルの Discord:BotToken を設定してください。");
             return;
         }
 

@@ -21,16 +21,7 @@ cd todayistodayBot/TodayIsTodayBot
 dotnet restore
 ```
 
-3. 設定ファイルの作成
-
-`appsettings.example.json` をコピーして `appsettings.json` を作成します。
-
-Windowsの場合（PowerShell）:
-```powershell
-Copy-Item appsettings.example.json appsettings.json
-```
-
-4. `appsettings.json` を編集して、Discordボットトークンを設定
+3. `appsettings.json` を編集して、Discordボットトークンを設定
 
 ```json
 {
@@ -43,7 +34,7 @@ Copy-Item appsettings.example.json appsettings.json
 }
 ```
 
-5. アプリケーションの実行
+4. アプリケーションの実行
 ```bash
 dotnet run
 ```
@@ -67,7 +58,7 @@ dotnet run
 ```
 TodayIsTodayBot/
 ├── Program.cs                    # メインプログラム
-├── appsettings.example.json      # 設定ファイルのサンプル
+├── appsettings.json             # 設定ファイル（Botトークンなどを設定）
 └── TodayIsTodayBot.csproj       # プロジェクトファイル
 ```
 

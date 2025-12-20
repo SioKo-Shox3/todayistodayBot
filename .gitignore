@@ -399,9 +399,9 @@ FodyWeavers.xsd
 .idea/
 
 # Discord Bot specific
-appsettings.json
-appsettings.*.json
-!appsettings.example.json
+# 機密情報を含む可能性のある設定ファイル
+appsettings.Development.json
+appsettings.Production.json
 config.json
 *.env
 .env
