@@ -21,16 +21,29 @@ cd todayistodayBot/TodayIsTodayBot
 dotnet restore
 ```
 
-3. 環境変数の設定
+3. 設定ファイルの作成
+
+`appsettings.example.json` をコピーして `appsettings.json` を作成します。
 
 Windowsの場合（PowerShell）:
 ```powershell
-$env:DISCORD_BOT_TOKEN="あなたのDiscordボットトークン"
+Copy-Item appsettings.example.json appsettings.json
 ```
 
-または、`.env`ファイルを作成して設定することもできます。
+4. `appsettings.json` を編集して、Discordボットトークンを設定
 
-4. アプリケーションの実行
+```json
+{
+  "Discord": {
+    "BotToken": "あなたのDiscordボットトークンをここに入力"
+  },
+  "Bot": {
+    "FrameRate": 60
+  }
+}
+```
+
+5. アプリケーションの実行
 ```bash
 dotnet run
 ```
@@ -38,8 +51,16 @@ dotnet run
 ## 機能
 
 - Discord.Netを使用したDiscord Bot
-- 毎フレーム実行されるメインループ（約60FPS）
+- 毎フレーム実行されるメインループ（設定可能なFPS）
 - デルタタイム計算による時間管理
+- JSON設定ファイルによる構成管理
+
+## 設定
+
+`appsettings.json` で以下の設定が可能です：
+
+- `Discord:BotToken`: Discordボットのトークン（必須）
+- `Bot:FrameRate`: メインループのフレームレート（デフォルト: 60）
 
 ## プロジェクト構造
 

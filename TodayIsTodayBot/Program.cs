@@ -1,5 +1,6 @@
 ﻿using Discord;
 using Discord.WebSocket;
+using Microsoft.Extensions.Configuration;
 
 namespace TodayIsTodayBot;
 
@@ -7,6 +8,8 @@ class Program
 {
     private DiscordSocketClient? _client;
     private bool _isRunning = true;
+    private IConfiguration? _configuration;
+    private int _frameRate = 60;
 
     static async Task Main(string[] args)
     {
@@ -16,6 +19,15 @@ class Program
 
     public async Task RunAsync()
     {
+        // 設定ファイルの読み込み
+        _configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .Build();
+
+        // 設定からフレームレートを取得
+        _frameRate = _configuration.GetValue<int>("Bot:FrameRate", 60);
+
         // Discord クライアントの設定
         var config = new DiscordSocketConfig
         {
@@ -28,14 +40,14 @@ class Program
         _client.Log += LogAsync;
         _client.Ready += ReadyAsync;
 
-        // TODO: ここにDiscordボットのトークンを設定してください
-        // 環境変数や設定ファイルから読み込むことを推奨
-        var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN") ?? "";
+        // 設定ファイルからトークンを読み込み
+        var token = _configuration["Discord:BotToken"];
         
         if (string.IsNullOrEmpty(token))
         {
             Console.WriteLine("エラー: Discord ボットトークンが設定されていません。");
-            Console.WriteLine("環境変数 DISCORD_BOT_TOKEN を設定してください。");
+            Console.WriteLine("appsettings.json ファイルを作成し、Discord:BotToken を設定してください。");
+            Console.WriteLine("appsettings.example.json を参考にしてください。");
             return;
         }
 
@@ -54,6 +66,7 @@ class Program
     private async Task MainLoopAsync()
     {
         Console.WriteLine("メインループを開始します。終了するには Ctrl+C を押してください。");
+        Console.WriteLine($"フレームレート: {_frameRate} FPS");
         
         // Ctrl+C でループを終了できるようにする
         Console.CancelKeyPress += (sender, e) =>
@@ -64,6 +77,7 @@ class Program
 
         var lastUpdateTime = DateTime.Now;
         var frameCount = 0;
+        var frameDelay = 1000 / _frameRate; // ミリ秒単位のフレーム遅延
 
         while (_isRunning)
         {
@@ -72,12 +86,12 @@ class Program
             lastUpdateTime = currentTime;
 
             // 毎フレームの処理をここに記述
-            await UpdateAsync(deltaTime);
+            await UpdateAsync(deltaTime, frameCount);
 
             frameCount++;
 
-            // フレームレートを制限（例: 60FPS）
-            await Task.Delay(16); // 約60FPS (1000ms / 60 ≈ 16ms)
+            // フレームレートを制限
+            await Task.Delay(frameDelay);
         }
 
         Console.WriteLine($"メインループを終了します。総フレーム数: {frameCount}");
@@ -87,19 +101,20 @@ class Program
     /// 毎フレーム呼び出される更新処理
     /// </summary>
     /// <param name="deltaTime">前フレームからの経過時間（秒）</param>
-    private async Task UpdateAsync(double deltaTime)
+    /// <param name="frameCount">現在のフレーム数</param>
+    private async Task UpdateAsync(double deltaTime, int frameCount)
     {
         // ここに毎フレーム実行したい処理を記述
         // 例: ステータスの更新、定期的なチェック処理など
 
         // デバッグ用: 1秒ごとにログ出力
-        if (frameCount % 60 == 0)
+        if (frameCount % _frameRate == 0 && frameCount > 0)
         {
             Console.WriteLine($"[Update] フレーム: {frameCount}, デルタタイム: {deltaTime:F3}秒");
         }
+        
+        await Task.CompletedTask;
     }
-
-    private int frameCount = 0;
 
     private Task LogAsync(LogMessage log)
     {
