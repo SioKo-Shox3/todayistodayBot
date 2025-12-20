@@ -3,6 +3,7 @@ using Discord.WebSocket;
 using Microsoft.Extensions.Configuration;
 using TodayIsTodayBot.Commands;
 using TodayIsTodayBot.Handlers;
+using TodayIsTodayBot.Services;
 
 namespace TodayIsTodayBot;
 
@@ -14,6 +15,7 @@ class Program
     private int _frameRate = 60;
     private CommandService? _commandService;
     private MessageHandler? _messageHandler;
+    private HttpClient? _httpClient;
 
     static async Task Main(string[] args)
     {
@@ -31,6 +33,9 @@ class Program
 
         // 設定からフレームレートを取得
         _frameRate = _configuration.GetValue<int>("Bot:FrameRate", 60);
+
+        // HttpClientの初期化
+        _httpClient = new HttpClient();
 
         // コマンドサービスの初期化
         _commandService = new CommandService("/");
@@ -86,6 +91,11 @@ class Program
         // 基本コマンドの登録
         _commandService.RegisterCommand(new Commands.Handlers.PingCommand());
         _commandService.RegisterCommand(new Commands.Handlers.HelpCommand(_commandService));
+        
+        // 天気コマンドの登録
+        var weatherApiKey = _configuration?["OpenWeatherMap:ApiKey"];
+        var weatherService = new WeatherService(_httpClient!, weatherApiKey);
+        _commandService.RegisterCommand(new Commands.Handlers.WeatherCommand(weatherService));
         
         // 今後、新しいコマンドはここに追加していきます
     }
