@@ -5,7 +5,7 @@ Discord用の応答Botです。
 ## セットアップ
 
 ### 必要なもの
-- .NET 8.0 SDK以降
+- .NET 9.0 SDK以降
 - Discordボットトークン
 
 ### インストール手順
@@ -21,7 +21,12 @@ cd todayistodayBot/TodayIsTodayBot
 dotnet restore
 ```
 
-3. `appsettings.json` を編集して、Discordボットトークンを設定
+3. 設定ファイルの準備
+```bash
+cp appsettings.json.template appsettings.json
+```
+
+4. `appsettings.json` を編集して、Discordボットトークンを設定
 
 ```json
 {
@@ -34,17 +39,57 @@ dotnet restore
 }
 ```
 
-4. アプリケーションの実行
+⚠️ **重要**: `appsettings.json`は機密情報を含むため、`.gitignore`に追加されています。絶対にGitにコミットしないでください。
+
+5. アプリケーションの実行
 ```bash
 dotnet run
 ```
 
+## 利用可能なコマンド
+
+- `/ping` - ボットが応答しているか確認
+- `/help` - 利用可能なコマンド一覧を表示
+- `/weather [地域名]` - 指定した地域の天気情報を取得（例: `/weather 東京`）
+
 ## 機能
 
+### コマンドシステム
+- `/` から始まるコマンドを認識
+- 拡張可能なコマンドハンドラアーキテクチャ
+- エラーハンドリングとログ機能
+
+### 天気情報取得
+- Open-Meteo APIを使用（APIキー不要）
+- 日本全国47都道府県に対応
+- リアルタイムの気温、湿度、風速などを表示
+
+### メインループシステム
 - Discord.Netを使用したDiscord Bot
 - 毎フレーム実行されるメインループ（設定可能なFPS）
 - デルタタイム計算による時間管理
 - JSON設定ファイルによる構成管理
+
+## プロジェクト構造
+
+```
+TodayIsTodayBot/
+├── Commands/                    # コマンド処理
+│   ├── ICommandHandler.cs       # コマンドハンドラインターフェース
+│   ├── CommandContext.cs        # コマンド実行コンテキスト
+│   ├── CommandService.cs        # コマンド管理サービス
+│   └── Handlers/                # 各コマンドハンドラ
+│       ├── PingCommand.cs
+│       ├── HelpCommand.cs
+│       └── WeatherCommand.cs
+├── Handlers/                    # イベントハンドラ
+│   └── MessageHandler.cs
+├── Services/                    # 外部サービス連携
+│   └── WeatherService.cs
+├── Program.cs                   # メインプログラム
+├── appsettings.json.template    # 設定ファイルのテンプレート
+└── TodayIsTodayBot.csproj       # プロジェクトファイル
+```
 
 ## 設定
 
@@ -53,27 +98,30 @@ dotnet run
 - `Discord:BotToken`: Discordボットのトークン（必須）
 - `Bot:FrameRate`: メインループのフレームレート（デフォルト: 60）
 
-## プロジェクト構造
-
-```
-TodayIsTodayBot/
-├── Program.cs                    # メインプログラム
-├── appsettings.json             # 設定ファイル（Botトークンなどを設定）
-└── TodayIsTodayBot.csproj       # プロジェクトファイル
-```
-
 ## 開発
 
+### 新しいコマンドの追加
+
+1. `Commands/Handlers/`に新しいコマンドクラスを作成
+2. `ICommandHandler`インターフェースを実装
+3. `Program.cs`の`RegisterCommands()`メソッドに登録
+
+```csharp
+public class YourCommand : ICommandHandler
+{
+    public string CommandName => "yourcommand";
+    public string Description => "説明";
+    
+    public async Task ExecuteAsync(SocketMessage message, string[] args)
+    {
+        // コマンドの処理
+        await message.Channel.SendMessageAsync("応答メッセージ");
+    }
+}
+```
+
 ### ブランチ戦略
-- `main`: 本番用ブランチ
-- `develop`: 開発用ブランチ
-
-### メインループについて
-
-`MainLoopAsync()`メソッドが毎フレーム実行されるルーチンです。
-- フレームレート: 約60FPS（16msごとに更新）
-- デルタタイム計算による時間管理
-- `UpdateAsync()`メソッドに毎フレームの処理を記述
+- `develop`: 開発用ブランチ（デフォルト）
 
 ## ライセンス
 

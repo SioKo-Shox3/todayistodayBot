@@ -400,6 +400,7 @@ FodyWeavers.xsd
 
 # Discord Bot specific
 # 機密情報を含む可能性のある設定ファイル
+appsettings.json
 appsettings.Development.json
 appsettings.Production.json
 config.json
