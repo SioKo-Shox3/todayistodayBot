@@ -18,6 +18,7 @@ class Program
     private HttpClient? _httpClient;
     private ScheduleStorageService? _scheduleStorageService;
     private ReactionHandler? _reactionHandler;
+    private ReminderService? _reminderService;
 
     static async Task Main(string[] args)
     {
@@ -41,6 +42,9 @@ class Program
 
         // スケジュールストレージサービスの初期化
         _scheduleStorageService = new ScheduleStorageService();
+
+        // リマインダーサービスの初期化
+        _reminderService = new ReminderService();
 
         // コマンドサービスの初期化
         _commandService = new CommandService("/");
@@ -110,6 +114,9 @@ class Program
         _commandService.RegisterCommand(new Commands.Handlers.ScheduleCommand(_scheduleStorageService!));
         _commandService.RegisterCommand(new Commands.Handlers.ScheduleResultCommand(_scheduleStorageService!));
         
+        // リマインダーコマンドの登録
+        _commandService.RegisterCommand(new Commands.Handlers.ReminderCommand(_reminderService!, _scheduleStorageService!));
+        
         // 今後、新しいコマンドはここに追加していきます
     }
 
@@ -160,6 +167,12 @@ class Program
         // ここに毎フレーム実行したい処理を記述
         // 例: ステータスの更新、定期的なチェック処理など
 
+        // リマインダーチェック: 1分ごとに実行
+        if (frameCount % (_frameRate * 60) == 0 && frameCount > 0)
+        {
+            await CheckRemindersAsync();
+        }
+
         // デバッグ用: 1秒ごとにログ出力
         if (frameCount % _frameRate == 0 && frameCount > 0)
         {
@@ -167,6 +180,82 @@ class Program
         }
         
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// リマインダーをチェックして通知を送信
+    /// </summary>
+    private async Task CheckRemindersAsync()
+    {
+        if (_reminderService == null || _scheduleStorageService == null || _client == null)
+            return;
+
+        var now = DateTime.Now;
+        var enabledReminders = _reminderService.GetEnabledReminders();
+
+        foreach (var reminder in enabledReminders)
+        {
+            var poll = _scheduleStorageService.GetPollById(reminder.PollId);
+            if (poll == null)
+                continue;
+
+            // 全員が参加可能な日程を取得
+            var availableDates = _scheduleStorageService.GetDatesAvailableForAll(reminder.PollId);
+
+            foreach (var dateStr in availableDates)
+            {
+                if (!DateTime.TryParse(dateStr, out var scheduleDate))
+                    continue;
+
+                // 現在時刻が開始時間の±5分以内かチェック
+                var timeDiff = Math.Abs((now - scheduleDate).TotalMinutes);
+                if (timeDiff <= 5)
+                {
+                    // 未通知の場合のみ通知
+                    var shouldNotify = await _reminderService.MarkAsNotifiedAsync(reminder.PollId, dateStr);
+                    if (shouldNotify)
+                    {
+                        await SendReminderNotificationAsync(reminder, dateStr, poll);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// リマインダー通知を送信
+    /// </summary>
+    private async Task SendReminderNotificationAsync(
+        Models.ScheduleReminder reminder, 
+        string dateStr, 
+        Models.SchedulePoll poll)
+    {
+        try
+        {
+            var channel = _client?.GetChannel(reminder.ChannelId) as IMessageChannel;
+            if (channel == null)
+            {
+                Console.WriteLine($"⚠️ リマインダー通知失敗: チャンネル {reminder.ChannelId} が見つかりません");
+                return;
+            }
+
+            var date = DateTime.Parse(dateStr);
+            var japaneseWeekDays = new[] { "日", "月", "火", "水", "木", "金", "土" };
+            var weekDay = japaneseWeekDays[(int)date.DayOfWeek];
+
+            await channel.SendMessageAsync(
+                $"@everyone\n\n" +
+                $"⏰ **スケジュールリマインダー** ⏰\n\n" +
+                $"📅 **日時:** {dateStr} ({weekDay})\n" +
+                $"✅ 全員が参加可能な日程です！\n\n" +
+                $"Poll ID: `{poll.Id}`");
+
+            Console.WriteLine($"✅ リマインダー通知送信: {dateStr} (Poll ID: {reminder.PollId})");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️ リマインダー通知エラー: {ex.Message}");
+        }
     }
 
     private Task LogAsync(LogMessage log)
