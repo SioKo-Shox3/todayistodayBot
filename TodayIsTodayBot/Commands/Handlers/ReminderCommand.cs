@@ -1,5 +1,6 @@
 using Discord.WebSocket;
 using TodayIsTodayBot.Commands;
+using TodayIsTodayBot.Models;
 using TodayIsTodayBot.Services;
 
 namespace TodayIsTodayBot.Commands.Handlers;
@@ -28,16 +29,21 @@ public class ReminderCommand : ICommandHandler
         {
             await message.Channel.SendMessageAsync(
                 "⏰ **リマインダーの使い方**\n\n" +
-                "**コマンド一覧:**\n" +
-                "`/reminder set [poll-id]` - このチャンネルにリマインダーを設定\n" +
-                "`/reminder enable [poll-id]` - リマインダーを有効化\n" +
-                "`/reminder disable [poll-id]` - リマインダーを無効化\n" +
-                "`/reminder list` - 設定済みリマインダー一覧を表示\n" +
-                "`/reminder delete [poll-id]` - リマインダーを削除\n\n" +
+                "**基本的な使い方:**\n" +
+                "`/reminder set` - このチャンネルにリマインダーを送信する設定をします\n" +
+                "`/reminder enable` - リマインダー送信を有効化\n" +
+                "`/reminder disable` - リマインダー送信を無効化\n" +
+                "`/reminder delete` - リマインダー設定を削除\n" +
+                "`/reminder list` - 設定済みリマインダー一覧を表示\n\n" +
+                "**特定のアンケートを指定する場合:**\n" +
+                "`/reminder set [poll-id]`\n" +
+                "`/reminder enable [poll-id]`\n" +
+                "`/reminder disable [poll-id]`\n" +
+                "`/reminder delete [poll-id]`\n\n" +
                 "**説明:**\n" +
-                "- リマインダーを設定すると、全員が参加可能な日程の開始時間に @everyone で通知されます\n" +
-                "- 通知はこのコマンドを実行したチャンネルに送られます\n" +
-                "- poll-id は `/schedule` コマンド実行時に表示されます");
+                "- `/reminder set` と発言したチャンネルにリマインダーが送信されます\n" +
+                "- 全員が参加可能な日程の開始時間に @everyone で通知されます\n" +
+                "- poll-id を省略すると、このチャンネルで直前に作成されたアンケートが対象になります");
             return;
         }
 
@@ -73,21 +79,35 @@ public class ReminderCommand : ICommandHandler
     /// </summary>
     private async Task HandleSetAsync(SocketMessage message, string[] args)
     {
-        if (args.Length < 2)
+        SchedulePoll? poll;
+        string pollId;
+
+        // poll-idが指定されている場合
+        if (args.Length >= 2)
         {
-            await message.Channel.SendMessageAsync(
-                "❌ Poll ID を指定してください。\n" +
-                "使用例: `/reminder set [poll-id]`");
-            return;
+            pollId = args[1];
+            poll = _scheduleStorageService.GetPollById(pollId);
+
+            if (poll == null)
+            {
+                await message.Channel.SendMessageAsync($"❌ Poll ID `{pollId}` が見つかりませんでした。");
+                return;
+            }
         }
-
-        var pollId = args[1];
-        var poll = _scheduleStorageService.GetPollById(pollId);
-
-        if (poll == null)
+        // poll-idが指定されていない場合は、このチャンネルで直前に作成されたアンケートを使用
+        else
         {
-            await message.Channel.SendMessageAsync($"❌ Poll ID `{pollId}` が見つかりませんでした。");
-            return;
+            poll = _scheduleStorageService.GetLatestPollByChannelId(message.Channel.Id);
+
+            if (poll == null)
+            {
+                await message.Channel.SendMessageAsync(
+                    "❌ このチャンネルにアンケートが見つかりませんでした。\n" +
+                    "先に `/schedule` コマンドでアンケートを作成してから `/reminder set` を実行してください。");
+                return;
+            }
+
+            pollId = poll.Id;
         }
 
         var reminder = await _reminderService.CreateReminderAsync(
@@ -99,6 +119,7 @@ public class ReminderCommand : ICommandHandler
         await message.Channel.SendMessageAsync(
             $"✅ リマインダーを設定しました！\n" +
             $"Poll ID: `{pollId}`\n" +
+            $"対象日程: {poll.DateOptions.Count}個\n" +
             $"通知チャンネル: <#{message.Channel.Id}>\n" +
             $"有効化: `/reminder enable {pollId}`");
     }
@@ -108,15 +129,26 @@ public class ReminderCommand : ICommandHandler
     /// </summary>
     private async Task HandleEnableAsync(SocketMessage message, string[] args)
     {
-        if (args.Length < 2)
+        string pollId;
+
+        // poll-idが指定されている場合
+        if (args.Length >= 2)
         {
-            await message.Channel.SendMessageAsync(
-                "❌ Poll ID を指定してください。\n" +
-                "使用例: `/reminder enable [poll-id]`");
-            return;
+            pollId = args[1];
+        }
+        // poll-idが指定されていない場合は、このチャンネルの最新アンケートを使用
+        else
+        {
+            var poll = _scheduleStorageService.GetLatestPollByChannelId(message.Channel.Id);
+            if (poll == null)
+            {
+                await message.Channel.SendMessageAsync(
+                    "❌ このチャンネルにはアンケートが見つかりませんでした。");
+                return;
+            }
+            pollId = poll.Id;
         }
 
-        var pollId = args[1];
         var success = await _reminderService.EnableReminderAsync(pollId);
 
         if (success)
@@ -139,15 +171,26 @@ public class ReminderCommand : ICommandHandler
     /// </summary>
     private async Task HandleDisableAsync(SocketMessage message, string[] args)
     {
-        if (args.Length < 2)
+        string pollId;
+
+        // poll-idが指定されている場合
+        if (args.Length >= 2)
         {
-            await message.Channel.SendMessageAsync(
-                "❌ Poll ID を指定してください。\n" +
-                "使用例: `/reminder disable [poll-id]`");
-            return;
+            pollId = args[1];
+        }
+        // poll-idが指定されていない場合は、このチャンネルの最新アンケートを使用
+        else
+        {
+            var poll = _scheduleStorageService.GetLatestPollByChannelId(message.Channel.Id);
+            if (poll == null)
+            {
+                await message.Channel.SendMessageAsync(
+                    "❌ このチャンネルにはアンケートが見つかりませんでした。");
+                return;
+            }
+            pollId = poll.Id;
         }
 
-        var pollId = args[1];
         var success = await _reminderService.DisableReminderAsync(pollId);
 
         if (success)
@@ -194,15 +237,26 @@ public class ReminderCommand : ICommandHandler
     /// </summary>
     private async Task HandleDeleteAsync(SocketMessage message, string[] args)
     {
-        if (args.Length < 2)
+        string pollId;
+
+        // poll-idが指定されている場合
+        if (args.Length >= 2)
         {
-            await message.Channel.SendMessageAsync(
-                "❌ Poll ID を指定してください。\n" +
-                "使用例: `/reminder delete [poll-id]`");
-            return;
+            pollId = args[1];
+        }
+        // poll-idが指定されていない場合は、このチャンネルの最新アンケートを使用
+        else
+        {
+            var poll = _scheduleStorageService.GetLatestPollByChannelId(message.Channel.Id);
+            if (poll == null)
+            {
+                await message.Channel.SendMessageAsync(
+                    "❌ このチャンネルにはアンケートが見つかりませんでした。");
+                return;
+            }
+            pollId = poll.Id;
         }
 
-        var pollId = args[1];
         var success = await _reminderService.DeleteReminderAsync(pollId);
 
         if (success)

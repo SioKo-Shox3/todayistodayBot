@@ -114,6 +114,17 @@ public class ScheduleStorageService
     }
 
     /// <summary>
+    /// チャンネルIDで最新のアンケートを取得する
+    /// </summary>
+    public SchedulePoll? GetLatestPollByChannelId(ulong channelId)
+    {
+        return _polls.Values
+            .Where(p => p.ChannelId == channelId)
+            .OrderByDescending(p => p.CreatedAt)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
     /// 投票を追加する
     /// </summary>
     public async Task AddVoteAsync(string pollId, string dateOption, ulong userId)
