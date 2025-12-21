@@ -7,7 +7,7 @@ namespace TodayIsTodayBot.Commands.Handlers;
 
 /// <summary>
 /// 日程調整アンケートを作成するコマンド
-/// 使用例: /schedule 2025-01-15 19:00, 2025-01-16 19:00, 2025-01-17 19:00
+/// 使用例: /schedule +1 3 19:00 (明日から3日分、19:00で作成)
 /// </summary>
 public class ScheduleCommand : ICommandHandler
 {
@@ -19,7 +19,7 @@ public class ScheduleCommand : ICommandHandler
     };
 
     public string CommandName => "schedule";
-    public string Description => "日程調整アンケートを作成します（例: /schedule 2025-01-15 19:00, 2025-01-16 19:00）";
+    public string Description => "日程調整アンケートを作成します（例: /schedule +1 3 19:00 → 明日から3日分、19:00で作成）";
 
     public ScheduleCommand(ScheduleStorageService storageService)
     {
@@ -34,9 +34,14 @@ public class ScheduleCommand : ICommandHandler
             await message.Channel.SendMessageAsync(
                 "📅 **日程調整アンケートの使い方**\n\n" +
                 "**使用例:**\n" +
-                "`/schedule 2025-01-15 19:00, 2025-01-16 19:00, 2025-01-17 20:00`\n\n" +
+                "`/schedule +1 3 19:00` → 明日から3日分、各日19:00でアンケート作成\n" +
+                "`/schedule 0 5 20:00` → 今日から5日分、各日20:00でアンケート作成\n" +
+                "`/schedule -2 4 18:00` → 2日前から4日分、各日18:00でアンケート作成\n\n" +
+                "**パラメータ:**\n" +
+                "1. 基準日（+数字=○日後、-数字=○日前、0=今日）\n" +
+                "2. 作成する日程の数（1〜10）\n" +
+                "3. 時刻（HH:mm形式）\n\n" +
                 "**説明:**\n" +
-                "- カンマ区切りで複数の日程を指定できます\n" +
                 "- 各日程には数字の絵文字リアクションが付きます\n" +
                 "- 参加可能な日程にリアクションしてください\n" +
                 "- 最大10個の日程まで指定できます\n\n" +
@@ -45,38 +50,51 @@ public class ScheduleCommand : ICommandHandler
             return;
         }
 
-        // 引数を結合してカンマで分割
-        var fullArgs = string.Join(" ", args);
-        var dateStrings = fullArgs.Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Select(d => d.Trim())
-            .ToList();
-
-        // 日程数のチェック
-        if (dateStrings.Count == 0)
+        // パラメータチェック: 基準日オフセット、日数、時刻
+        if (args.Length != 3)
         {
-            await message.Channel.SendMessageAsync("❌ 日程を指定してください。例: `/schedule 2025-01-15 19:00, 2025-01-16 19:00`");
+            await message.Channel.SendMessageAsync(
+                "❌ パラメータが不足しています。\n" +
+                "正しい形式: `/schedule [基準日] [日数] [時刻]`\n" +
+                "例: `/schedule +1 3 19:00` （明日から3日分、19:00で作成）");
             return;
         }
 
-        if (dateStrings.Count > 10)
+        // 基準日オフセットのパース
+        if (!int.TryParse(args[0], out var dayOffset))
         {
-            await message.Channel.SendMessageAsync("❌ 日程は最大10個まで指定できます。");
+            await message.Channel.SendMessageAsync(
+                "❌ 基準日の形式が正しくありません。\n" +
+                "例: `+1`（明日）、`0`（今日）、`-1`（昨日）");
             return;
         }
 
-        // 日程のバリデーション
+        // 日数のパース
+        if (!int.TryParse(args[1], out var dayCount) || dayCount < 1 || dayCount > 10)
+        {
+            await message.Channel.SendMessageAsync(
+                "❌ 日数は1〜10の範囲で指定してください。\n" +
+                "例: `3`（3日分）");
+            return;
+        }
+
+        // 時刻のパース
+        if (!TimeSpan.TryParse(args[2], out var time))
+        {
+            await message.Channel.SendMessageAsync(
+                "❌ 時刻の形式が正しくありません。\n" +
+                "正しい形式: `19:00`、`09:30` など");
+            return;
+        }
+
+        // メッセージ送信日を基準に日程を生成
+        var baseDate = message.Timestamp.Date.AddDays(dayOffset);
         var validatedDates = new List<string>();
-        foreach (var dateStr in dateStrings)
+
+        for (int i = 0; i < dayCount; i++)
         {
-            if (DateTime.TryParse(dateStr, out var parsedDate))
-            {
-                validatedDates.Add(parsedDate.ToString("yyyy-MM-dd HH:mm"));
-            }
-            else
-            {
-                await message.Channel.SendMessageAsync($"❌ 無効な日時形式: `{dateStr}`\n正しい形式: `2025-01-15 19:00`");
-                return;
-            }
+            var date = baseDate.AddDays(i).Add(time);
+            validatedDates.Add(date.ToString("yyyy-MM-dd HH:mm"));
         }
 
         // Embedメッセージを作成
@@ -87,10 +105,16 @@ public class ScheduleCommand : ICommandHandler
             .WithFooter($"作成者: {message.Author.Username}")
             .WithCurrentTimestamp();
 
-        // 日程リストをフィールドに追加
+        // 日程リストをフィールドに追加（曜日も表示）
+        var japaneseWeekDays = new[] { "日", "月", "火", "水", "木", "金", "土" };
         for (int i = 0; i < validatedDates.Count; i++)
         {
-            embedBuilder.AddField($"{_emojiNumbers[i]} 候補{i + 1}", validatedDates[i], inline: false);
+            var date = DateTime.Parse(validatedDates[i]);
+            var weekDay = japaneseWeekDays[(int)date.DayOfWeek];
+            embedBuilder.AddField(
+                $"{_emojiNumbers[i]} 候補{i + 1}", 
+                $"{validatedDates[i]} ({weekDay})", 
+                inline: false);
         }
 
         // メッセージを送信
