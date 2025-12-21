@@ -406,3 +406,6 @@ appsettings.Production.json
 config.json
 *.env
 .env
+
+# 日程調整アンケートのデータファイル
+schedules.json
