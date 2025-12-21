@@ -16,6 +16,8 @@ class Program
     private CommandService? _commandService;
     private MessageHandler? _messageHandler;
     private HttpClient? _httpClient;
+    private ScheduleStorageService? _scheduleStorageService;
+    private ReactionHandler? _reactionHandler;
 
     static async Task Main(string[] args)
     {
@@ -37,6 +39,9 @@ class Program
         // HttpClientの初期化
         _httpClient = new HttpClient();
 
+        // スケジュールストレージサービスの初期化
+        _scheduleStorageService = new ScheduleStorageService();
+
         // コマンドサービスの初期化
         _commandService = new CommandService("/");
         
@@ -45,6 +50,9 @@ class Program
         
         // メッセージハンドラの初期化
         _messageHandler = new MessageHandler(_commandService);
+
+        // リアクションハンドラの初期化
+        _reactionHandler = new ReactionHandler(_scheduleStorageService);
 
         // Discord クライアントの設定
         var config = new DiscordSocketConfig
@@ -58,6 +66,8 @@ class Program
         _client.Log += LogAsync;
         _client.Ready += ReadyAsync;
         _client.MessageReceived += MessageReceivedAsync;
+        _client.ReactionAdded += ReactionAddedAsync;
+        _client.ReactionRemoved += ReactionRemovedAsync;
 
         // 設定ファイルからトークンを読み込み
         var token = _configuration["Discord:BotToken"];
@@ -95,6 +105,10 @@ class Program
         // 天気コマンドの登録（Open-Meteo使用、APIキー不要）
         var weatherService = new WeatherService(_httpClient!);
         _commandService.RegisterCommand(new Commands.Handlers.WeatherCommand(weatherService));
+        
+        // 日程調整コマンドの登録
+        _commandService.RegisterCommand(new Commands.Handlers.ScheduleCommand(_scheduleStorageService!));
+        _commandService.RegisterCommand(new Commands.Handlers.ScheduleResultCommand(_scheduleStorageService!));
         
         // 今後、新しいコマンドはここに追加していきます
     }
@@ -174,6 +188,28 @@ class Program
         if (_messageHandler != null)
         {
             await _messageHandler.HandleMessageAsync(message);
+        }
+    }
+
+    private async Task ReactionAddedAsync(
+        Cacheable<IUserMessage, ulong> cachedMessage,
+        Cacheable<IMessageChannel, ulong> cachedChannel,
+        SocketReaction reaction)
+    {
+        if (_reactionHandler != null)
+        {
+            await _reactionHandler.HandleReactionAddedAsync(cachedMessage, cachedChannel, reaction);
+        }
+    }
+
+    private async Task ReactionRemovedAsync(
+        Cacheable<IUserMessage, ulong> cachedMessage,
+        Cacheable<IMessageChannel, ulong> cachedChannel,
+        SocketReaction reaction)
+    {
+        if (_reactionHandler != null)
+        {
+            await _reactionHandler.HandleReactionRemovedAsync(cachedMessage, cachedChannel, reaction);
         }
     }
 }

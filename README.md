@@ -48,9 +48,21 @@ dotnet run
 
 ## 利用可能なコマンド
 
+### 基本コマンド
 - `/ping` - ボットが応答しているか確認
 - `/help` - 利用可能なコマンド一覧を表示
+
+### 天気情報
 - `/weather [地域名]` - 指定した地域の天気情報を取得（例: `/weather 東京`）
+
+### 日程調整
+- `/schedule [日程1], [日程2], ...` - 日程調整アンケートを作成
+  - 例: `/schedule 2025-01-15 19:00, 2025-01-16 19:00, 2025-01-17 20:00`
+  - カンマ区切りで複数の日程を指定（最大10個）
+  - リアクション（数字の絵文字）で投票
+- `/schedule-result [poll-id]` - アンケート結果を表示
+  - 全員が参加可能な日程を自動判定
+  - 各日程の投票状況を可視化
 
 ## 機能
 
@@ -63,6 +75,12 @@ dotnet run
 - Open-Meteo APIを使用（APIキー不要）
 - 日本全国47都道府県に対応
 - リアルタイムの気温、湿度、風速などを表示
+
+### 日程調整システム
+- Discordのリアクション機能を活用したアンケート作成
+- JSONファイルによる投票データの永続化
+- 全員が参加可能な日程の自動判定
+- 投票状況の可視化（進捗バー表示）
 
 ### メインループシステム
 - Discord.Netを使用したDiscord Bot
@@ -81,11 +99,17 @@ TodayIsTodayBot/
 │   └── Handlers/                # 各コマンドハンドラ
 │       ├── PingCommand.cs
 │       ├── HelpCommand.cs
-│       └── WeatherCommand.cs
+│       ├── WeatherCommand.cs
+│       ├── ScheduleCommand.cs
+│       └── ScheduleResultCommand.cs
 ├── Handlers/                    # イベントハンドラ
-│   └── MessageHandler.cs
+│   ├── MessageHandler.cs
+│   └── ReactionHandler.cs
+├── Models/                      # データモデル
+│   └── SchedulePoll.cs
 ├── Services/                    # 外部サービス連携
-│   └── WeatherService.cs
+│   ├── WeatherService.cs
+│   └── ScheduleStorageService.cs
 ├── Program.cs                   # メインプログラム
 ├── appsettings.json.template    # 設定ファイルのテンプレート
 └── TodayIsTodayBot.csproj       # プロジェクトファイル
