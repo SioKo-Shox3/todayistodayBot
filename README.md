@@ -56,13 +56,26 @@ dotnet run
 - `/weather [地域名]` - 指定した地域の天気情報を取得（例: `/weather 東京`）
 
 ### 日程調整
-- `/schedule [日程1], [日程2], ...` - 日程調整アンケートを作成
-  - 例: `/schedule 2025-01-15 19:00, 2025-01-16 19:00, 2025-01-17 20:00`
-  - カンマ区切りで複数の日程を指定（最大10個）
+- `/schedule [基準日] [日数] [時刻]` - 日程調整アンケートを作成
+  - 例: `/schedule +1 3 19:00` → 明日から3日分、各日19:00でアンケート作成
+  - 例: `/schedule 0 5 20:00` → 今日から5日分、各日20:00でアンケート作成
+  - 基準日: +数字（○日後）、-数字（○日前）、0（今日）
+  - 日数: 1〜10個まで指定可能
+  - 曜日も自動表示
   - リアクション（数字の絵文字）で投票
 - `/schedule-result [poll-id]` - アンケート結果を表示
   - 全員が参加可能な日程を自動判定
   - 各日程の投票状況を可視化
+
+### スケジュールリマインダー
+- `/reminder set [poll-id]` - このチャンネルにリマインダーを設定
+- `/reminder enable [poll-id]` - リマインダーを有効化
+- `/reminder disable [poll-id]` - リマインダーを無効化
+- `/reminder list` - 設定済みリマインダー一覧を表示
+- `/reminder delete [poll-id]` - リマインダーを削除
+  - 全員が参加可能な日程の開始時間に @everyone で自動通知
+  - 通知はリマインダー設定時のチャンネルに送信
+  - 1分間隔でチェック（開始時間の±5分以内に通知）
 
 ## 機能
 
@@ -101,10 +114,22 @@ TodayIsTodayBot/
 │       ├── HelpCommand.cs
 │       ├── WeatherCommand.cs
 │       ├── ScheduleCommand.cs
-│       └── ScheduleResultCommand.cs
+│       ├── ScheduleResultCommand.cs
+│       └── ReminderCommand.cs
 ├── Handlers/                    # イベントハンドラ
 │   ├── MessageHandler.cs
 │   └── ReactionHandler.cs
+├── Models/                      # データモデル
+│   ├── SchedulePoll.cs
+│   └── ScheduleReminder.cs
+├── Services/                    # 外部サービス連携
+│   ├── WeatherService.cs
+│   ├── ScheduleStorageService.cs
+│   └── ReminderService.cs
+├── Program.cs                   # メインプログラム
+├── appsettings.json.template    # 設定ファイルのテンプレート
+└── TodayIsTodayBot.csproj       # プロジェクトファイル
+```
 ├── Models/                      # データモデル
 │   └── SchedulePoll.cs
 ├── Services/                    # 外部サービス連携

@@ -28,9 +28,30 @@ class Program
 
     public async Task RunAsync()
     {
-        // 設定ファイルの読み込み
+        // 設定ファイルの読み込み（実行ファイルのディレクトリを基準にする）
+        var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+        Console.WriteLine($"📁 アプリケーションディレクトリ: {appDirectory}");
+        
+        // 設定ファイルが存在しない場合は作成
+        var appSettingsPath = Path.Combine(appDirectory, "appsettings.json");
+        if (!File.Exists(appSettingsPath))
+        {
+            Console.WriteLine("⚠️ appsettings.json が見つかりません。新規作成します...");
+            var defaultSettings = @"{
+  ""Discord"": {
+    ""BotToken"": ""ここにDiscordボットトークンを入力してください""
+  },
+  ""Bot"": {
+    ""FrameRate"": 60
+  }
+}";
+            await File.WriteAllTextAsync(appSettingsPath, defaultSettings);
+            Console.WriteLine($"✅ appsettings.json を作成しました: {appSettingsPath}");
+            Console.WriteLine("⚠️ Discord:BotToken を設定してからアプリケーションを再起動してください。");
+        }
+        
         _configuration = new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
+            .SetBasePath(appDirectory)
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
             .Build();
 

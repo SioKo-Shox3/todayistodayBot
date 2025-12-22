@@ -12,9 +12,36 @@ public class ScheduleStorageService
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private Dictionary<string, SchedulePoll> _polls = new();
 
-    public ScheduleStorageService(string dataFilePath = "schedules.json")
+    public ScheduleStorageService(string? dataFilePath = null)
     {
-        _dataFilePath = dataFilePath;
+        if (string.IsNullOrEmpty(dataFilePath))
+        {
+            // 実行ファイルのディレクトリを基準にパスを設定
+            var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            var dataDirectory = Path.Combine(appDirectory, "data");
+            
+            try
+            {
+                if (!Directory.Exists(dataDirectory))
+                {
+                    Directory.CreateDirectory(dataDirectory);
+                    Console.WriteLine($"✅ データディレクトリを作成しました: {dataDirectory}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ データディレクトリの作成に失敗しました: {ex.Message}");
+                // ディレクトリが作成できない場合は実行ディレクトリ直下に保存
+                dataDirectory = appDirectory;
+            }
+            
+            _dataFilePath = Path.Combine(dataDirectory, "schedules.json");
+        }
+        else
+        {
+            _dataFilePath = dataFilePath;
+        }
+        Console.WriteLine($"📁 スケジュールデータファイル: {_dataFilePath}");
         LoadData();
     }
 
@@ -30,6 +57,15 @@ public class ScheduleStorageService
                 var json = File.ReadAllText(_dataFilePath);
                 _polls = JsonSerializer.Deserialize<Dictionary<string, SchedulePoll>>(json) 
                     ?? new Dictionary<string, SchedulePoll>();
+                Console.WriteLine($"✅ スケジュールデータを読み込みました ({_polls.Count}件)");
+            }
+            else
+            {
+                // ファイルが存在しない場合は空のJSONファイルを作成
+                Console.WriteLine("⚠️ schedules.json が見つかりません。新規作成します...");
+                _polls = new Dictionary<string, SchedulePoll>();
+                File.WriteAllText(_dataFilePath, "{}");
+                Console.WriteLine($"✅ schedules.json を作成しました: {_dataFilePath}");
             }
         }
         catch (Exception ex)

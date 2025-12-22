@@ -409,3 +409,6 @@ config.json
 
 # 日程調整アンケートのデータファイル
 schedules.json
+
+# スケジュールリマインダーのデータファイル
+reminders.json

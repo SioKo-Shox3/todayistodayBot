@@ -12,9 +12,36 @@ public class ReminderService
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private Dictionary<string, ScheduleReminder> _reminders = new();
 
-    public ReminderService(string dataFilePath = "reminders.json")
+    public ReminderService(string? dataFilePath = null)
     {
-        _dataFilePath = dataFilePath;
+        if (string.IsNullOrEmpty(dataFilePath))
+        {
+            // 実行ファイルのディレクトリを基準にパスを設定
+            var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            var dataDirectory = Path.Combine(appDirectory, "data");
+            
+            try
+            {
+                if (!Directory.Exists(dataDirectory))
+                {
+                    Directory.CreateDirectory(dataDirectory);
+                    Console.WriteLine($"✅ データディレクトリを作成しました: {dataDirectory}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ データディレクトリの作成に失敗しました: {ex.Message}");
+                // ディレクトリが作成できない場合は実行ディレクトリ直下に保存
+                dataDirectory = appDirectory;
+            }
+            
+            _dataFilePath = Path.Combine(dataDirectory, "reminders.json");
+        }
+        else
+        {
+            _dataFilePath = dataFilePath;
+        }
+        Console.WriteLine($"📁 リマインダーデータファイル: {_dataFilePath}");
         LoadData();
     }
 
@@ -30,6 +57,15 @@ public class ReminderService
                 var json = File.ReadAllText(_dataFilePath);
                 _reminders = JsonSerializer.Deserialize<Dictionary<string, ScheduleReminder>>(json) 
                     ?? new Dictionary<string, ScheduleReminder>();
+                Console.WriteLine($"✅ リマインダーデータを読み込みました ({_reminders.Count}件)");
+            }
+            else
+            {
+                // ファイルが存在しない場合は空のJSONファイルを作成
+                Console.WriteLine("⚠️ reminders.json が見つかりません。新規作成します...");
+                _reminders = new Dictionary<string, ScheduleReminder>();
+                File.WriteAllText(_dataFilePath, "{}");
+                Console.WriteLine($"✅ reminders.json を作成しました: {_dataFilePath}");
             }
         }
         catch (Exception ex)
