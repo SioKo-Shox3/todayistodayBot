@@ -138,6 +138,10 @@ class Program
         // リマインダーコマンドの登録
         _commandService.RegisterCommand(new Commands.Handlers.ReminderCommand(_reminderService!, _scheduleStorageService!));
         
+        // 今日は何の日コマンドの登録
+        var todayService = new TodayService(_httpClient!);
+        _commandService.RegisterCommand(new Commands.Handlers.TodayCommand(todayService));
+        
         // 今後、新しいコマンドはここに追加していきます
     }
 
