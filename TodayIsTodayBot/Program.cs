@@ -142,6 +142,9 @@ class Program
         var todayService = new TodayService(_httpClient!);
         _commandService.RegisterCommand(new Commands.Handlers.TodayCommand(todayService));
         
+        // サイコロコマンドの登録
+        _commandService.RegisterCommand(new Commands.Handlers.DiceCommand());
+        
         // 今後、新しいコマンドはここに追加していきます
     }
 
