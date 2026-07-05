@@ -5,7 +5,7 @@ Discord用の応答Botです。
 ## セットアップ
 
 ### 必要なもの
-- .NET 9.0 SDK以降
+- `go.mod` の `go` ディレクティブが指定するバージョンの Go toolchain
 - Discordボットトークン
 
 ### インストール手順
@@ -13,38 +13,33 @@ Discord用の応答Botです。
 1. リポジトリをクローン
 ```bash
 git clone https://github.com/SioKo-Shox3/todayistodayBot.git
-cd todayistodayBot/TodayIsTodayBot
+cd todayistodayBot
 ```
 
-2. 必要なパッケージの復元
+2. 設定ファイルの準備
 ```bash
-dotnet restore
+cp config.json.template config.json
 ```
 
-3. 設定ファイルの準備
-```bash
-cp appsettings.json.template appsettings.json
-```
-
-4. `appsettings.json` を編集して、Discordボットトークンを設定
+3. `config.json` を編集して、Discordボットトークンを設定
 
 ```json
 {
-  "Discord": {
-    "BotToken": "あなたのDiscordボットトークンをここに入力"
-  },
-  "Bot": {
-    "FrameRate": 60
-  }
+  "discord_token": "あなたのDiscordボットトークンをここに入力"
 }
 ```
 
-⚠️ **重要**: `appsettings.json`は機密情報を含むため、`.gitignore`に追加されています。絶対にGitにコミットしないでください。
+⚠️ **重要**: `config.json`は機密情報を含むため、`.gitignore`に追加されています。絶対にGitにコミットしないでください。
 
-5. アプリケーションの実行
+代わりに `DISCORD_TOKEN` 環境変数でトークンを渡すこともできます（環境変数が `config.json` より優先されます）。
+
+4. アプリケーションのビルドと実行
 ```bash
-dotnet run
+go build ./cmd/bot
+./bot
 ```
+
+または `make build && ./bin/todayistodaybot`、開発中は `go run ./cmd/bot` でも実行できます。
 
 ## 利用可能なコマンド
 
@@ -96,76 +91,75 @@ dotnet run
 - 投票状況の可視化（進捗バー表示）
 
 ### メインループシステム
-- Discord.Netを使用したDiscord Bot
-- 毎フレーム実行されるメインループ（設定可能なFPS）
-- デルタタイム計算による時間管理
-- JSON設定ファイルによる構成管理
+- discordgo（Go）を使用したDiscord Bot
+- スラッシュコマンド（Interaction）ベースのイベント駆動処理
+- JSON設定ファイル・環境変数による構成管理
 
 ## プロジェクト構造
 
 ```
-TodayIsTodayBot/
-├── Commands/                    # コマンド処理
-│   ├── ICommandHandler.cs       # コマンドハンドラインターフェース
-│   ├── CommandContext.cs        # コマンド実行コンテキスト
-│   ├── CommandService.cs        # コマンド管理サービス
-│   └── Handlers/                # 各コマンドハンドラ
-│       ├── PingCommand.cs
-│       ├── HelpCommand.cs
-│       ├── WeatherCommand.cs
-│       ├── ScheduleCommand.cs
-│       ├── ScheduleResultCommand.cs
-│       └── ReminderCommand.cs
-├── Handlers/                    # イベントハンドラ
-│   ├── MessageHandler.cs
-│   └── ReactionHandler.cs
-├── Models/                      # データモデル
-│   ├── SchedulePoll.cs
-│   └── ScheduleReminder.cs
-├── Services/                    # 外部サービス連携
-│   ├── WeatherService.cs
-│   ├── ScheduleStorageService.cs
-│   └── ReminderService.cs
-├── Program.cs                   # メインプログラム
-├── appsettings.json.template    # 設定ファイルのテンプレート
-└── TodayIsTodayBot.csproj       # プロジェクトファイル
-```
-├── Models/                      # データモデル
-│   └── SchedulePoll.cs
-├── Services/                    # 外部サービス連携
-│   ├── WeatherService.cs
-│   └── ScheduleStorageService.cs
-├── Program.cs                   # メインプログラム
-├── appsettings.json.template    # 設定ファイルのテンプレート
-└── TodayIsTodayBot.csproj       # プロジェクトファイル
+todayistodayBot/
+├── cmd/
+│   └── bot/                     # エントリポイント
+│       └── main.go
+├── internal/
+│   ├── commands/                # 各スラッシュコマンド（Command インターフェース実装）
+│   │   ├── registry.go          # Command インターフェース定義・自己登録レジストリ
+│   │   ├── ping.go
+│   │   ├── help.go
+│   │   ├── weather.go
+│   │   ├── today.go
+│   │   └── dice.go
+│   ├── config/                  # 設定読み込み（config.json / 環境変数）
+│   │   └── config.go
+│   ├── weather/                 # Open-Meteo クライアント
+│   │   ├── client.go
+│   │   └── cities.go
+│   └── today/                   # 今日は何の日 API クライアント
+│       └── client.go
+├── deploy/                      # Dockerfile・systemd unit
+├── Makefile                     # ビルド/テスト/Docker イメージ用タスク
+├── config.json.template         # 設定ファイルのテンプレート
+└── go.mod
 ```
 
 ## 設定
 
-`appsettings.json` で以下の設定が可能です：
+`config.json`（または `DISCORD_TOKEN` 環境変数）で以下の設定が可能です：
 
-- `Discord:BotToken`: Discordボットのトークン（必須）
-- `Bot:FrameRate`: メインループのフレームレート（デフォルト: 60）
+- `discord_token`: Discordボットのトークン（必須。環境変数 `DISCORD_TOKEN` が設定されている場合はそちらが優先）
 
 ## 開発
 
 ### 新しいコマンドの追加
 
-1. `Commands/Handlers/`に新しいコマンドクラスを作成
-2. `ICommandHandler`インターフェースを実装
-3. `Program.cs`の`RegisterCommands()`メソッドに登録
+1. `internal/commands/` に新しいコマンドファイルを作成
+2. `Command` インターフェース（`Definition()` / `Handle()`）を実装
+3. ファイル内の `init()` で `Register(&YourCommand{})` を呼んで自己登録（`main.go` の編集は不要）
 
-```csharp
-public class YourCommand : ICommandHandler
-{
-    public string CommandName => "yourcommand";
-    public string Description => "説明";
-    
-    public async Task ExecuteAsync(SocketMessage message, string[] args)
-    {
-        // コマンドの処理
-        await message.Channel.SendMessageAsync("応答メッセージ");
-    }
+```go
+package commands
+
+import "github.com/bwmarrin/discordgo"
+
+func init() { Register(&YourCommand{}) }
+
+type YourCommand struct{}
+
+func (c *YourCommand) Definition() *discordgo.ApplicationCommand {
+	return &discordgo.ApplicationCommand{
+		Name:        "yourcommand",
+		Description: "説明",
+	}
+}
+
+func (c *YourCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "応答メッセージ",
+		},
+	})
 }
 ```
 
