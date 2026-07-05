@@ -1,0 +1,5 @@
+.git
+bin/
+config.json
+*.env
+Docs/
