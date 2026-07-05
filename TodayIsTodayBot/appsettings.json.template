@@ -1,8 +1,0 @@
-{
-  "Discord": {
-    "BotToken": "ここにDiscordボットトークンを入力してください"
-  },
-  "Bot": {
-    "FrameRate": 60
-  }
-}
