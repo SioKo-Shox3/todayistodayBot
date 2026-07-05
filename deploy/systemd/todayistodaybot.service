@@ -1,0 +1,20 @@
+[Unit]
+Description=TodayIsTodayBot Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=todayistodaybot
+Group=todayistodaybot
+WorkingDirectory=/opt/todayistodaybot
+ExecStart=/opt/todayistodaybot/todayistodaybot
+EnvironmentFile=-/etc/todayistodaybot/todayistodaybot.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
