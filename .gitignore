@@ -412,3 +412,7 @@ schedules.json
 
 # スケジュールリマインダーのデータファイル
 reminders.json
+
+# Claude Code ワークフロー(マシンローカル。別マシンでは deploy.ps1 で再展開)
+.claude/settings.local.json
+.claude/worktrees/
