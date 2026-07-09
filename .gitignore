@@ -407,11 +407,9 @@ config.json
 *.env
 .env
 
-# 日程調整アンケートのデータファイル
-schedules.json
-
-# スケジュールリマインダーのデータファイル
-reminders.json
+# chosei-sama連携のローカルイベント参照ファイル(internal/store が書き込む。
+# owner tokenを含む秘密情報 — 絶対にコミットしない)
+/data/
 
 # Claude Code ワークフロー(マシンローカル。別マシンでは deploy.ps1 で再展開)
 .claude/settings.local.json
