@@ -55,33 +55,26 @@ go build ./cmd/bot
 ### 天気情報
 - `/weather [地域名]` - 指定した地域の天気情報を取得（例: `/weather 東京`）
 
-### 日程調整（フェーズB予定・現時点では未実装）
-> ⚠️ 以下の `/schedule` `/schedule-result` コマンドは、フェーズBでchosei-sama連携として
-> 再実装予定の機能であり、**現在のGo実装にはまだ含まれていません**。
+### 日程調整（chosei-sama連携）
+- `/schedule <title> <start> <days> <time>` - 日程調整アンケートを作成（chosei-samaに委譲）
+  - 例: `/schedule 忘年会 +1 3 19:00` → 明日から3日分、各日19:00で候補を作成
+  - `start`: 起点日（+数字=○日後、-数字=○日前、0=今日）
+  - `days`: 候補日数（1〜50）
+  - `time`: 候補の時刻（HH:mm形式）
+  - 作成後、chosei-samaの公開URL付きEmbedを投稿します。回答はそのURL先のWebフォームから行います
+- `/schedule-result [event]` - アンケート結果を表示
+  - `event`: 対象イベントの参照（省略時はこのチャンネルで最後に作成したイベント）
+  - 各候補の✅（参加可能）🤔（未定）❌（不参加）集計を表示
 
-- `/schedule [基準日] [日数] [時刻]` - 日程調整アンケートを作成
-  - 例: `/schedule +1 3 19:00` → 明日から3日分、各日19:00でアンケート作成
-  - 例: `/schedule 0 5 20:00` → 今日から5日分、各日20:00でアンケート作成
-  - 基準日: +数字（○日後）、-数字（○日前）、0（今日）
-  - 日数: 1〜10個まで指定可能
-  - 曜日も自動表示
-  - リアクション（数字の絵文字）で投票
-- `/schedule-result [poll-id]` - アンケート結果を表示
-  - 全員が参加可能な日程を自動判定
-  - 各日程の投票状況を可視化
-
-### スケジュールリマインダー（フェーズB予定・現時点では未実装）
-> ⚠️ 以下の `/reminder` コマンドは、フェーズBでchosei-sama連携として再実装予定の機能であり、
-> **現在のGo実装にはまだ含まれていません**。
-
-- `/reminder set [poll-id]` - このチャンネルにリマインダーを設定
-- `/reminder enable [poll-id]` - リマインダーを有効化
-- `/reminder disable [poll-id]` - リマインダーを無効化
-- `/reminder list` - 設定済みリマインダー一覧を表示
-- `/reminder delete [poll-id]` - リマインダーを削除
-  - 全員が参加可能な日程の開始時間に @everyone で自動通知
-  - 通知はリマインダー設定時のチャンネルに送信
-  - 1分間隔でチェック（開始時間の±5分以内に通知）
+### スケジュールリマインダー（chosei-sama連携）
+- `/reminder set [all-ok-hours] [deadline-hours] [mention-everyone] [event]` - このチャンネルにDiscord Webhookを作成し、chosei-samaにリマインダーを登録
+  - `all-ok-hours`: 全員が参加可能な候補の何時間前に通知するか（1〜168、既定3）
+  - `deadline-hours`: 回答締切の何時間前に通知するか（1〜168、指定すると締切リマインダーが有効になります、既定24）
+  - `mention-everyone`: @everyoneで通知するか（既定false）
+  - ⚠️ Botに対象チャンネルの「Webhookの管理」権限が必要です
+- `/reminder off [event]` - リマインダーを無効化
+- `/reminder status [event]` - 現在のリマインダー設定を表示
+- 通知の配信自体はchosei-sama側のCron（30分おき）が行い、Botはタイマーロジックを一切持ちません
 
 ## 機能
 
@@ -95,14 +88,10 @@ go build ./cmd/bot
 - 日本全国47都道府県に対応
 - リアルタイムの気温、湿度、風速などを表示
 
-### 日程調整システム（フェーズB予定・現時点では未実装）
-> ⚠️ 日程調整・リマインダー機能はフェーズBでchosei-sama連携として再実装予定(現時点では未実装)。
-> 以下は将来の構想であり、現在のGo実装には含まれていません。
-
-- Discordのリアクション機能を活用したアンケート作成
-- JSONファイルによる投票データの永続化
-- 全員が参加可能な日程の自動判定
-- 投票状況の可視化（進捗バー表示）
+### 日程調整システム（chosei-sama連携）
+- 候補生成・回答集計・リマインダー配信のロジックは外部サービス [chosei-sama](https://chosei-sama.choseisama.workers.dev/) に委譲
+- Botは「Discordコマンド ⇄ chosei-sama API」の橋渡しと、作成したイベントの参照情報(イベントID・owner token)をチャンネルごとにローカル保持する役割のみを持つ
+- ローカル保持先: `data/chosei-events.json`（`sync.Mutex`で保護された単一ライター。`.gitignore`対象 — owner tokenを含むため絶対にコミットしない）
 
 ### メインループシステム
 - discordgo（Go）を使用したDiscord Bot
@@ -123,14 +112,21 @@ todayistodayBot/
 │   │   ├── help.go
 │   │   ├── weather.go
 │   │   ├── today.go
-│   │   └── dice.go
+│   │   ├── dice.go
+│   │   ├── schedule.go
+│   │   ├── schedule_result.go
+│   │   └── reminder.go
 │   ├── config/                  # 設定読み込み（config.json / 環境変数）
 │   │   └── config.go
 │   ├── weather/                 # Open-Meteo クライアント
 │   │   ├── client.go
 │   │   └── cities.go
-│   └── today/                   # 今日は何の日 API クライアント
-│       └── client.go
+│   ├── today/                   # 今日は何の日 API クライアント
+│   │   └── client.go
+│   ├── choseisama/               # chosei-sama API クライアント
+│   │   └── client.go
+│   └── store/                    # chosei-sama イベント参照のローカルJSON永続化
+│       └── events.go
 ├── deploy/                      # Dockerfile・systemd unit
 ├── Makefile                     # ビルド/テスト/Docker イメージ用タスク
 ├── config.json.template         # 設定ファイルのテンプレート
@@ -142,6 +138,16 @@ todayistodayBot/
 `config.json`（または `DISCORD_TOKEN` 環境変数）で以下の設定が可能です：
 
 - `discord_token`: Discordボットのトークン（必須。環境変数 `DISCORD_TOKEN` が設定されている場合はそちらが優先）
+
+`/reminder set` を使うには、Botに対象チャンネルでの「Webhookの管理」権限が必要です。
+
+### 高度な設定（通常は不要）
+
+- `CHOSEI_SAMA_BASE_URL` 環境変数: chosei-samaのベースURLを上書きします（既定値
+  `https://chosei-sama.choseisama.workers.dev`）。ローカルの `wrangler dev` インスタンス相手に
+  動作確認する場合など、稀な用途向けです。`config.json` にこれに対応するフィールドはありません
+  （環境変数のみ対応 — `internal/choseisama` パッケージが直接読みます。詳細は
+  `internal/choseisama/client.go` の `NewClient`/`resolveBaseURL`）。
 
 ## 開発
 
