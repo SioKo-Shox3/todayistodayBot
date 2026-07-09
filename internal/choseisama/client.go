@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 )
 
 // defaultBaseURL is chosei-sama's production origin (Cloudflare Workers
@@ -29,9 +30,30 @@ type Client struct {
 	BaseURL string
 }
 
-// NewClient returns a Client pointed at chosei-sama's production API.
+// NewClient returns a Client pointed at chosei-sama's production API, or
+// at the URL in the CHOSEI_SAMA_BASE_URL environment variable if it is
+// set and non-empty — an escape hatch for pointing the bot at a local
+// `wrangler dev` instance (see chosei-sama/README.md's "Local Setup"
+// section), not a config.json-backed setting. This is resolved entirely
+// inside internal/choseisama (no internal/config involvement) precisely
+// because every command's init() constructs its *choseisama.Client
+// before main() ever calls config.Load() — routing this through
+// internal/config would require either wiring config.Load()'s result
+// into each command's init() (impossible: init() order is unspecified
+// relative to main()'s body) or breaking the "zero main.go changes"
+// property Task 14 verifies. An env var read at NewClient() call time
+// has neither problem.
 func NewClient(httpClient *http.Client) *Client {
-	return &Client{httpClient: httpClient, BaseURL: defaultBaseURL}
+	return &Client{httpClient: httpClient, BaseURL: resolveBaseURL()}
+}
+
+// resolveBaseURL returns CHOSEI_SAMA_BASE_URL's value if set and
+// non-empty, else defaultBaseURL.
+func resolveBaseURL() string {
+	if v := os.Getenv("CHOSEI_SAMA_BASE_URL"); v != "" {
+		return v
+	}
+	return defaultBaseURL
 }
 
 // APIError represents a non-2xx response from chosei-sama.

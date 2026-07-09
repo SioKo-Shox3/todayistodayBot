@@ -318,3 +318,19 @@ func TestPublicEventURL(t *testing.T) {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
 }
+
+func TestNewClient_DefaultsToProductionBaseURL(t *testing.T) {
+	t.Setenv("CHOSEI_SAMA_BASE_URL", "") // Setenv restores the original value/absence via t.Cleanup, so this is safe regardless of host env state; an empty string is indistinguishable from "unset" to os.Getenv.
+	client := NewClient(http.DefaultClient)
+	if client.BaseURL != defaultBaseURL {
+		t.Fatalf("expected default base URL %q, got %q", defaultBaseURL, client.BaseURL)
+	}
+}
+
+func TestNewClient_ChoseiSamaBaseURLEnvOverride(t *testing.T) {
+	t.Setenv("CHOSEI_SAMA_BASE_URL", "http://localhost:8787")
+	client := NewClient(http.DefaultClient)
+	if client.BaseURL != "http://localhost:8787" {
+		t.Fatalf("expected env override %q, got %q", "http://localhost:8787", client.BaseURL)
+	}
+}
