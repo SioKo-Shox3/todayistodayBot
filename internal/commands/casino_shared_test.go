@@ -1,0 +1,203 @@
+package commands
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/SioKo-Shox3/todayistodayBot/internal/casino"
+	"github.com/bwmarrin/discordgo"
+)
+
+func TestRequireGuildContext_EmptyGuildID(t *testing.T) {
+	msg := requireGuildContext(&discordgo.InteractionCreate{Interaction: &discordgo.Interaction{GuildID: ""}})
+	if msg != "❌ このコマンドはサーバー内で使用してください。" {
+		t.Fatalf("unexpected message for a DM invocation: %q", msg)
+	}
+}
+
+func TestRequireGuildContext_NonEmptyGuildID(t *testing.T) {
+	if msg := requireGuildContext(&discordgo.InteractionCreate{Interaction: &discordgo.Interaction{GuildID: "g1"}}); msg != "" {
+		t.Fatalf("expected no message inside a guild, got %q", msg)
+	}
+}
+
+func TestRequireAdministrator_NilMember(t *testing.T) {
+	msg := requireAdministrator(&discordgo.InteractionCreate{Interaction: &discordgo.Interaction{GuildID: "g1"}})
+	if msg != "❌ このコマンドはサーバー管理者のみ使用できます" {
+		t.Fatalf("unexpected message for a nil Member: %q", msg)
+	}
+}
+
+func TestRequireAdministrator_MissingPermission(t *testing.T) {
+	i := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		GuildID: "g1",
+		Member:  &discordgo.Member{Permissions: discordgo.PermissionSendMessages},
+	}}
+	if msg := requireAdministrator(i); msg != "❌ このコマンドはサーバー管理者のみ使用できます" {
+		t.Fatalf("unexpected message for a non-administrator: %q", msg)
+	}
+}
+
+func TestRequireAdministrator_HasPermission(t *testing.T) {
+	i := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		GuildID: "g1",
+		Member:  &discordgo.Member{Permissions: discordgo.PermissionSendMessages | discordgo.PermissionAdministrator},
+	}}
+	if msg := requireAdministrator(i); msg != "" {
+		t.Fatalf("expected no message for an administrator, got %q", msg)
+	}
+}
+
+func TestSparkline_Empty(t *testing.T) {
+	if got := sparkline(nil); got != "" {
+		t.Fatalf("expected an empty string for an empty series, got %q", got)
+	}
+}
+
+func TestSparkline_FlatSeries(t *testing.T) {
+	if got := sparkline([]int{5, 5, 5}); got != "▁▁▁" {
+		t.Fatalf("expected the lowest bar for every point of a flat series, got %q", got)
+	}
+}
+
+func TestSparkline_IncreasingSeries(t *testing.T) {
+	// lo=1, hi=3, span=2 → idx = (v-1)*7/2 → 0, 3, 7.
+	if got := sparkline([]int{1, 2, 3}); got != "▁▄█" {
+		t.Fatalf("unexpected sparkline for an increasing series: %q", got)
+	}
+}
+
+func TestRateRankCommentary_TodayIsHighest_Rank1(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 90}, {Rate: 100}}
+	if got := rateRankCommentary(history); got != "今日のレートは直近2日で1番目の高値です" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestRateRankCommentary_TodayIsSecondHighest_Rank2(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 110}, {Rate: 100}}
+	if got := rateRankCommentary(history); got != "今日のレートは直近2日で2番目の高値です" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestRateRankCommentary_WindowCapsAt7Entries(t *testing.T) {
+	// The three leading 200s are OUTSIDE the 7-entry window, so today (70) is
+	// the highest of the window. Without the cap the rank would be 4.
+	history := []casino.DailyRate{
+		{Rate: 200}, {Rate: 200}, {Rate: 200},
+		{Rate: 10}, {Rate: 20}, {Rate: 30}, {Rate: 40}, {Rate: 50}, {Rate: 60}, {Rate: 70},
+	}
+	if got := rateRankCommentary(history); got != "今日のレートは直近7日で1番目の高値です" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestRateRankCommentary_Empty(t *testing.T) {
+	if got := rateRankCommentary(nil); got != "" {
+		t.Fatalf("expected an empty string for an empty history, got %q", got)
+	}
+}
+
+func TestTrendStreak_Empty(t *testing.T) {
+	if got := trendStreak(nil); got != 0 {
+		t.Fatalf("expected 0 for an empty history, got %d", got)
+	}
+}
+
+func TestTrendStreak_SingleEntry(t *testing.T) {
+	if got := trendStreak([]casino.DailyRate{{Trend: casino.TrendBull}}); got != 1 {
+		t.Fatalf("expected 1 for a single entry, got %d", got)
+	}
+}
+
+func TestTrendStreak_ThreeConsecutive(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBull}, {Trend: casino.TrendBull}, {Trend: casino.TrendBull},
+	}
+	if got := trendStreak(history); got != 3 {
+		t.Fatalf("expected 3, got %d", got)
+	}
+}
+
+func TestTrendStreak_BrokenByOtherTrend(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBull}, {Trend: casino.TrendBear},
+		{Trend: casino.TrendBull}, {Trend: casino.TrendBull},
+	}
+	if got := trendStreak(history); got != 2 {
+		t.Fatalf("expected the streak to stop at the TrendBear entry, got %d", got)
+	}
+}
+
+func TestMarketCommentary_Empty(t *testing.T) {
+	if got := marketCommentary(nil); got != "" {
+		t.Fatalf("expected an empty string for an empty history, got %q", got)
+	}
+}
+
+func TestMarketCommentary_Bull3Days(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBull, Event: casino.EventNone},
+		{Trend: casino.TrendBull, Event: casino.EventNone},
+		{Trend: casino.TrendBull, Event: casino.EventNone},
+	}
+	if got := marketCommentary(history); got != "コイン強気3日目。天井はどこだ?" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestMarketCommentary_Bear1Day(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBull, Event: casino.EventNone},
+		{Trend: casino.TrendBear, Event: casino.EventNone},
+	}
+	if got := marketCommentary(history); got != "コイン弱気1日目。底値を狙うなら今か。" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestMarketCommentary_Flat(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendFlat, Event: casino.EventNone},
+		{Trend: casino.TrendFlat, Event: casino.EventNone},
+	}
+	if got := marketCommentary(history); got != "凪2日目。動かない相場も相場だ。" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestMarketCommentary_Surge(t *testing.T) {
+	// A surge outranks the trend: the trend is still bull, but the headline
+	// of the day is the event.
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBull, Event: casino.EventNone},
+		{Trend: casino.TrendBull, Event: casino.EventSurge},
+	}
+	got := marketCommentary(history)
+	if got != "🚀 暴騰デー! コインが跳ねた。売り抜けるなら今日だ。" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+	if strings.Contains(got, "強気") {
+		t.Fatalf("the surge wording must replace the trend wording, got %q", got)
+	}
+}
+
+func TestMarketCommentary_Crash(t *testing.T) {
+	history := []casino.DailyRate{
+		{Trend: casino.TrendBear, Event: casino.EventNone},
+		{Trend: casino.TrendBear, Event: casino.EventCrash},
+	}
+	if got := marketCommentary(history); got != "💥 暴落デー! コインが崩れた。拾いに行くか、様子を見るか。" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+func TestMarketCommentary_LegacyEmptyEventTreatedAsNone(t *testing.T) {
+	// "" is what a hand-edited or pre-C-1 record carries; it must fall
+	// through to the trend wording, not to a surge/crash headline.
+	history := []casino.DailyRate{{Trend: casino.TrendBull, Event: ""}}
+	if got := marketCommentary(history); got != "コイン強気1日目。天井はどこだ?" {
+		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
