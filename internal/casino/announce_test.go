@@ -3,6 +3,7 @@ package casino
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -337,6 +338,38 @@ func TestCollectDailyAnnouncements_NilGuildValue_DoesNotPanic(t *testing.T) {
 		t.Fatalf("got %d jobs, want 0 (the repaired guild has no announce channel): %+v", len(jobs), jobs)
 	}
 	assertTodayRateExists(t, path, "guild1", announceAt1000)
+}
+
+// TestCollectDailyAnnouncements_NilAccountDoesNotPanic is the announcement
+// half of the nil-account regression. The nil-guild guard above does not cover
+// it: ensureGuildLocked repairs the guild and its Users map, but a null value
+// INSIDE that map survives into topAssetsLocked, so the 9am top-3 build would
+// panic — in the scheduler goroutine, with no recover anywhere above it.
+func TestCollectDailyAnnouncements_NilAccountDoesNotPanic(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate is already in the file, so no draw may happen"}
+	writeHandEditedFile(t, path, fmt.Sprintf(
+		`{"guild1":{"announce_channel_id":"chan1","last_announced":"",`+
+			`"rates":[{"date":%q,"rate":100,"trend":"flat","event":"none"}],`+
+			`"users":{"ghost":null,"user-a":{"chips":100,"coins":1}}}}`,
+		announceDay))
+
+	jobs, err := st.collectDailyAnnouncements(announceAt1000)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	want := RankEntry{UserID: "user-a", TotalAssets: 200} // 100 + 1*100
+	if len(jobs[0].TopAssets) != 1 || jobs[0].TopAssets[0] != want {
+		t.Fatalf("job.TopAssets = %+v, want exactly [%+v] (the nil account must be skipped, not ranked)", jobs[0].TopAssets, want)
+	}
+	economy := readGuild(t, path, "guild1")
+	if account := economy.Users["ghost"]; account != nil {
+		t.Fatalf("building the announcement opened an account for the nil user: %+v", account)
+	}
 }
 
 func TestMarkAnnounced_PersistsLastAnnouncedDate(t *testing.T) {

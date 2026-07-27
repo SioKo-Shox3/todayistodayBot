@@ -14,6 +14,15 @@ const (
 	eventProb           = 0.05
 )
 
+// validRate reports whether rate is inside the [minRate, maxRate] clamp, whose
+// bounds are both inclusive and both reachable. nextRate clamps every value it
+// returns, so a rate failing this check never came from this package: it was
+// hand-edited into data/casino.json, or the record was written partially (one
+// with no "rate" field unmarshals as Rate 0). Guards against such values live
+// in ensureTodayRateLocked (the source) and in the two exchange helpers below
+// (defence in depth) — see their doc comments for the crash-loop this prevents.
+func validRate(rate int) bool { return rate >= minRate && rate <= maxRate }
+
 // nextRate computes tomorrow's rate, trend and event kind from today's
 // rate/trend, using rng for all randomness. Pure — no I/O, no locking, no
 // wall-clock reads. hasPrev=false means "this guild's very first day":
@@ -111,7 +120,18 @@ func dailyBonusAmount(streak int) int64 {
 // call for; under the MaxCoins economic cap it is unreachable in production
 // (the threshold at rate 140 is ~6.79e14 against a 1e12 cap), and it is kept
 // as the last line of defence for callers outside that cap.
+//
+// Returns ErrInvalidAmount — the package's existing "input outside the allowed
+// domain" sentinel — for a rate outside the clamp, BEFORE any division. rate 0
+// (what a persisted record with no "rate" field unmarshals to) would otherwise
+// make math.MaxInt64/(rate*97) an integer division by zero, i.e. a panic that
+// discordgo's handler goroutines do not recover from. ensureTodayRateLocked is
+// the primary fix and keeps this unreachable through the store; this function
+// is pure and package-wide, so it must not rely on its caller for safety.
 func exchangeCoinToChip(coins int64, rate int) (int64, error) {
+	if !validRate(rate) {
+		return 0, ErrInvalidAmount
+	}
 	if coins > math.MaxInt64/(int64(rate)*97) {
 		return 0, ErrAmountOverflow
 	}
@@ -119,7 +139,12 @@ func exchangeCoinToChip(coins int64, rate int) (int64, error) {
 }
 
 // exchangeChipToCoin converts chips to coins at rate, single final division.
+// Rejects an out-of-clamp rate first, for the same reason exchangeCoinToChip
+// does: here the zero divisor is the 100*rate of the payout expression itself.
 func exchangeChipToCoin(chips int64, rate int) (int64, error) {
+	if !validRate(rate) {
+		return 0, ErrInvalidAmount
+	}
 	if chips > math.MaxInt64/97 {
 		return 0, ErrAmountOverflow
 	}

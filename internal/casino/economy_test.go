@@ -416,3 +416,56 @@ func TestExchangeChipToCoin_OverflowGuard(t *testing.T) {
 		t.Fatalf("exchangeChipToCoin(%d, %d) returned %v, want the last in-range amount to be accepted", threshold, rate, err)
 	}
 }
+
+// invalidRates are the rate values no generated DailyRate can hold — nextRate
+// clamps everything it returns into [minRate, maxRate]. 0 is the dangerous one:
+// it is what a persisted record with no "rate" field unmarshals to, and it is
+// an integer division by zero in BOTH helpers below.
+var invalidRates = []int{0, -1, minRate - 1, maxRate + 1, 1_000_000}
+
+// validRates spans the accepted range including both inclusive boundaries, so
+// the guard cannot silently narrow the exchange's real domain.
+var validRates = []int{minRate, baseRate, maxRate}
+
+// TestExchangeCoinToChip_InvalidRate_ReturnsError is the defence-in-depth half
+// of the divide-by-zero regression: rate 0 turns math.MaxInt64/(rate*97) into
+// an integer division by zero, and a panic in a discordgo handler goroutine
+// (no recover) kills the bot. ensureTodayRateLocked is the primary fix — it
+// stops a bad rate from ever reaching a consumer — but this helper is pure and
+// exported to the whole package, so it must not depend on its caller for
+// safety.
+func TestExchangeCoinToChip_InvalidRate_ReturnsError(t *testing.T) {
+	for _, rate := range invalidRates {
+		got, err := exchangeCoinToChip(100, rate)
+		if !errors.Is(err, ErrInvalidAmount) {
+			t.Fatalf("exchangeCoinToChip(100, %d) = (%d, %v), want ErrInvalidAmount", rate, got, err)
+		}
+		if got != 0 {
+			t.Fatalf("exchangeCoinToChip(100, %d) returned %d chips alongside an error; a refusal must yield 0", rate, got)
+		}
+	}
+	for _, rate := range validRates {
+		if _, err := exchangeCoinToChip(100, rate); err != nil {
+			t.Fatalf("exchangeCoinToChip(100, %d) returned %v, want every rate in [%d, %d] to stay accepted", rate, err, minRate, maxRate)
+		}
+	}
+}
+
+// TestExchangeChipToCoin_InvalidRate_ReturnsError mirrors it for the other
+// direction, whose divisor is the 100*rate in the payout expression itself.
+func TestExchangeChipToCoin_InvalidRate_ReturnsError(t *testing.T) {
+	for _, rate := range invalidRates {
+		got, err := exchangeChipToCoin(100, rate)
+		if !errors.Is(err, ErrInvalidAmount) {
+			t.Fatalf("exchangeChipToCoin(100, %d) = (%d, %v), want ErrInvalidAmount", rate, got, err)
+		}
+		if got != 0 {
+			t.Fatalf("exchangeChipToCoin(100, %d) returned %d coins alongside an error; a refusal must yield 0", rate, got)
+		}
+	}
+	for _, rate := range validRates {
+		if _, err := exchangeChipToCoin(100, rate); err != nil {
+			t.Fatalf("exchangeChipToCoin(100, %d) returned %v, want every rate in [%d, %d] to stay accepted", rate, err, minRate, maxRate)
+		}
+	}
+}

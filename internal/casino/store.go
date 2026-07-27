@@ -298,13 +298,37 @@ func (s *Store) EnsureTodayRate(guildID string, now time.Time) (DailyRate, error
 }
 
 // ensureTodayRateLocked returns economy's DailyRate for `today`, appending
-// a freshly-generated one (via nextRate) if missing, and trimming history to
-// the most recent 30 entries (設計書). Caller must already hold the Store's
-// lock, which is also what makes reading s.rng here safe — *rand.Rand is not
-// safe for concurrent use.
+// a freshly-generated one (via nextRate) if missing or unusable, and trimming
+// history to the most recent 30 entries (設計書). Caller must already hold the
+// Store's lock, which is also what makes reading s.rng here safe — *rand.Rand
+// is not safe for concurrent use.
+//
+// A stored rate outside the [minRate, maxRate] clamp counts as MISSING, not as
+// today's rate. nextRate clamps everything it returns, so such a record can
+// only come from a hand edit or a partial write — and a record that simply
+// lacks the "rate" field unmarshals as Rate 0. Returning that 0 would feed a
+// zero divisor to exchangeCoinToChip/exchangeChipToCoin, and an integer
+// divide-by-zero panic in a discordgo handler goroutine (no recover) kills the
+// bot while the bad file stays on disk: every restart re-crashes. Repairing it
+// HERE, at the single point every consumer reads today's rate through, protects
+// /exchange, /rank, /rate and the 9am announcement in one place.
 func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) DailyRate {
-	if n := len(economy.Rates); n > 0 && economy.Rates[n-1].Date == today {
-		return economy.Rates[n-1]
+	// Drop unusable today records rather than appending after them, so the
+	// history never ends up holding two entries for the same date, and so the
+	// regeneration below starts from the last VALID day instead of from a
+	// corrupt one. The loop (rather than a single check) matters only for a
+	// file hand-edited into holding SEVERAL today records: stripping just the
+	// last one would leave the previous corrupt one both as a duplicate date
+	// and as nextRate's prevRate.
+	for len(economy.Rates) > 0 {
+		last := len(economy.Rates) - 1
+		if economy.Rates[last].Date != today {
+			break
+		}
+		if validRate(economy.Rates[last].Rate) {
+			return economy.Rates[last]
+		}
+		economy.Rates = economy.Rates[:last]
 	}
 	var prevRate int
 	var prevTrend TrendState
@@ -347,8 +371,8 @@ type RankEntry struct {
 }
 
 // topAssetsLocked ranks economy's users by total assets at `rate`, ties
-// broken by ascending UserID for deterministic output. Caller must already
-// hold the Store's lock.
+// broken by ascending UserID for deterministic output. Nil accounts are
+// skipped (see below). Caller must already hold the Store's lock.
 //
 // Chips + Coins*rate cannot overflow int64: the store invariants are
 // Chips <= MaxChips (1e12), Coins <= MaxCoins (1e12) and rate <= maxRate
@@ -358,6 +382,24 @@ type RankEntry struct {
 func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 	entries := make([]RankEntry, 0, len(economy.Users))
 	for userID, account := range economy.Users {
+		if account == nil {
+			// A hand-edited or partially-written file can hold
+			// {"users":{"someone":null}}. ensureGuildLocked repairs the guild
+			// and its Users map, and ensureAccountLocked repairs only the ONE
+			// user a write path touches — so ANOTHER user's null reaches this
+			// loop intact, where account.Chips dereferences nil. discordgo runs
+			// handlers in goroutines without recover, so that kills the bot and
+			// leaves the same bad file behind: a permanent crash loop, exactly
+			// like readLocked's nil-map hazard.
+			//
+			// SKIPPED, NOT REPAIRED: this is a display-only read path, and
+			// opening an account grants the 1,000-chip welcome bonus, which
+			// would mint currency for someone who never ran a casino command
+			// merely because a third party read the ranking. Account creation
+			// belongs to the write path (ensureAccountLocked), which repairs
+			// the entry the moment that user actually plays.
+			continue
+		}
 		entries = append(entries, RankEntry{UserID: userID, TotalAssets: account.Chips + account.Coins*int64(rate)})
 	}
 	sort.Slice(entries, func(i, j int) bool {

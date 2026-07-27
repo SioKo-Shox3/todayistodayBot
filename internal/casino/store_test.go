@@ -482,6 +482,18 @@ func seedAccounts(t *testing.T, st *Store, guildID string, users map[string]User
 	}
 }
 
+// writeHandEditedFile writes raw straight to path, bypassing the Store
+// entirely. The corrupt shapes the §3.3 crash-loop regressions need
+// (a null account value, a rate record with no "rate" field) cannot be
+// produced by any write path in this package, so they cannot be seeded with
+// seedAccounts/seedRate — only a hand edit or a partial write creates them.
+func writeHandEditedFile(t *testing.T, path, raw string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("writing hand-edited data file: %v", err)
+	}
+}
+
 // readGuild reads guildID back through a *fresh* Store, so the assertion is
 // about what actually reached the file.
 func readGuild(t *testing.T, path, guildID string) GuildEconomy {
@@ -613,6 +625,142 @@ func TestStore_EnsureTodayRate_PersistsEventKind(t *testing.T) {
 	stored := economy.Rates[len(economy.Rates)-1]
 	if stored.Event != EventSurge {
 		t.Fatalf("persisted Event = %q, want %q — the draw must be stored, not re-derived from the day-over-day move", stored.Event, EventSurge)
+	}
+}
+
+// TestStore_EnsureTodayRate_InRangePersistedEntry_KeptAsIs is the
+// over-repair guard for the regeneration rule below: minRate and maxRate are
+// legitimate, reachable values (the clamp is inclusive), so a stored record
+// sitting exactly on either boundary must be returned untouched, with no draw
+// at all.
+func TestStore_EnsureTodayRate_InRangePersistedEntry_KeptAsIs(t *testing.T) {
+	for _, rate := range []int{minRate, baseRate, maxRate} {
+		t.Run(fmt.Sprintf("rate %d", rate), func(t *testing.T) {
+			st, path := newTempStore(t)
+			st.rng = forbiddenRand{t: t, reason: "a valid rate for today must be returned as stored, never regenerated"}
+			writeHandEditedFile(t, path, fmt.Sprintf(
+				`{"guild1":{"rates":[{"date":%q,"rate":%d,"trend":"bull","event":"surge"}],"users":{}}}`,
+				jstDate(fixedNow), rate))
+
+			want := DailyRate{Date: jstDate(fixedNow), Rate: rate, Trend: TrendBull, Event: EventSurge}
+			got, err := st.EnsureTodayRate("guild1", fixedNow)
+			if err != nil {
+				t.Fatalf("EnsureTodayRate returned error: %v", err)
+			}
+			if got != want {
+				t.Fatalf("EnsureTodayRate = %+v, want the stored %+v", got, want)
+			}
+
+			economy := readGuild(t, path, "guild1")
+			if len(economy.Rates) != 1 || economy.Rates[0] != want {
+				t.Fatalf("persisted rates = %+v, want exactly the stored %+v", economy.Rates, want)
+			}
+		})
+	}
+}
+
+// TestStore_EnsureTodayRate_OutOfRangePersistedEntry_Regenerates is the
+// crash-loop regression at its SOURCE. nextRate clamps every value it returns
+// into [minRate, maxRate], so a today record outside that range can only come
+// from a hand edit or a partial write — and a record that simply lacks the
+// "rate" field unmarshals as Rate 0. Handing that 0 back as today's rate makes
+// both exchange helpers divide by zero, which panics in a discordgo handler
+// goroutine (no recover), kills the bot, and leaves the same bad file on disk:
+// every restart re-crashes. Repairing it here covers every consumer at once
+// (/exchange, /rank, /rate, the 9am announcement).
+func TestStore_EnsureTodayRate_OutOfRangePersistedEntry_Regenerates(t *testing.T) {
+	today := jstDate(fixedNow)
+	yesterday := jstYesterday(fixedNow)
+	// No previous day survives in the first six cases, so regeneration is the
+	// day-1 fixed 基準100 with no randomness consumed.
+	dayOne := DailyRate{Date: today, Rate: baseRate, Trend: TrendFlat, Event: EventNone}
+
+	tests := []struct {
+		name  string
+		rates string
+		want  []DailyRate // the full persisted history after the repair
+	}{
+		{
+			name:  "rate field absent",
+			rates: fmt.Sprintf(`[{"date":%q,"trend":"flat"}]`, today),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			name:  "rate zero",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":0,"trend":"flat","event":"none"}]`, today),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			name:  "negative rate",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":-5,"trend":"flat","event":"none"}]`, today),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			name:  "one below minRate",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":%d,"trend":"flat","event":"none"}]`, today, minRate-1),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			name:  "one above maxRate",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":%d,"trend":"flat","event":"none"}]`, today, maxRate+1),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			name:  "absurd rate",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":1000000,"trend":"flat","event":"none"}]`, today),
+			want:  []DailyRate{dayOne},
+		},
+		{
+			// Two corrupt today records: stripping only the last one would
+			// leave the other as both a duplicate date and nextRate's prevRate.
+			name: "two corrupt today entries",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":0,"trend":"flat","event":"none"},{"date":%q,"trend":"flat"}]`,
+				today, today),
+			want: []DailyRate{dayOne},
+		},
+		{
+			// The valid yesterday must survive and become the regeneration's
+			// starting point — the repair drops the corrupt record only.
+			name: "corrupt today entry after a valid yesterday",
+			rates: fmt.Sprintf(`[{"date":%q,"rate":120,"trend":"flat","event":"none"},{"date":%q,"trend":"flat"}]`,
+				yesterday, today),
+			want: []DailyRate{
+				{Date: yesterday, Rate: 120, Trend: TrendFlat, Event: EventNone},
+				{Date: today, Rate: 120, Trend: TrendFlat, Event: EventNone},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			// fixedRand{0.5}: no trend flip (0.5 >= 0.15), no event (0.5 >= 0.05),
+			// flat drift 0 and noise -3+0.5*6 = 0, so a regenerated day keeps the
+			// previous rate. Deterministic without pinning a draw count.
+			st.rng = fixedRand{float: 0.5}
+			writeHandEditedFile(t, path, fmt.Sprintf(`{"guild1":{"rates":%s,"users":{}}}`, tc.rates))
+
+			got, err := st.EnsureTodayRate("guild1", fixedNow)
+			if err != nil {
+				t.Fatalf("EnsureTodayRate returned error: %v", err)
+			}
+			if want := tc.want[len(tc.want)-1]; got != want {
+				t.Fatalf("EnsureTodayRate = %+v, want %+v — an out-of-clamp record must count as \"no rate for today\" and be regenerated", got, want)
+			}
+			if got.Rate < minRate || got.Rate > maxRate {
+				t.Fatalf("returned rate %d escapes the [%d, %d] clamp", got.Rate, minRate, maxRate)
+			}
+
+			economy := readGuild(t, path, "guild1")
+			if len(economy.Rates) != len(tc.want) {
+				t.Fatalf("persisted rates = %+v, want %+v — the corrupt record must be replaced, not left behind as a duplicate date", economy.Rates, tc.want)
+			}
+			for i := range tc.want {
+				if economy.Rates[i] != tc.want[i] {
+					t.Fatalf("persisted rate %d = %+v, want %+v", i, economy.Rates[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
 
@@ -1038,6 +1186,58 @@ func TestStore_ExchangeChipToCoin_CoinCapExceeded_NoMutation(t *testing.T) {
 	}
 }
 
+// TestStore_ExchangeCoinToChip_ZeroRatePersistedEntry_DoesNotPanic is the
+// end-to-end half of the divide-by-zero regression: a today record with no
+// "rate" field unmarshals as Rate 0, and exchangeCoinToChip's overflow guard
+// divides by rate*97. The exchange must complete against a regenerated rate
+// instead of taking the process down with it.
+func TestStore_ExchangeCoinToChip_ZeroRatePersistedEntry_DoesNotPanic(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = fixedRand{float: 0.5}
+	writeHandEditedFile(t, path, fmt.Sprintf(
+		`{"guild1":{"rates":[{"date":%q,"trend":"flat"}],"users":{"user-1":{"coins":10,"chips":0}}}}`,
+		jstDate(fixedNow)))
+
+	result, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow)
+	if err != nil {
+		t.Fatalf("ExchangeCoinToChip returned error: %v", err)
+	}
+
+	// The corrupt record was the guild's only one, so it regenerates to the
+	// day-1 基準100: 10 * 100 * 97 / 100 = 970 chips.
+	if result.RateUsed != baseRate || result.Spent != 10 || result.Received != 970 {
+		t.Fatalf("result = %+v, want {Spent:10 Received:970 RateUsed:%d}", result, baseRate)
+	}
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != 0 || account.Chips != 970 {
+		t.Fatalf("persisted account = %+v, want {Coins:0 Chips:970}", account)
+	}
+}
+
+// TestStore_ExchangeChipToCoin_ZeroRatePersistedEntry_DoesNotPanic covers the
+// other direction, whose divisor is 100*rate in the payout expression itself.
+func TestStore_ExchangeChipToCoin_ZeroRatePersistedEntry_DoesNotPanic(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = fixedRand{float: 0.5}
+	writeHandEditedFile(t, path, fmt.Sprintf(
+		`{"guild1":{"rates":[{"date":%q,"trend":"flat"}],"users":{"user-1":{"coins":0,"chips":1000}}}}`,
+		jstDate(fixedNow)))
+
+	result, err := st.ExchangeChipToCoin("guild1", "user-1", 1000, fixedNow)
+	if err != nil {
+		t.Fatalf("ExchangeChipToCoin returned error: %v", err)
+	}
+
+	// Regenerated to 基準100: 1000 * 97 / (100 * 100) = 9 coins.
+	if result.RateUsed != baseRate || result.Spent != 1000 || result.Received != 9 {
+		t.Fatalf("result = %+v, want {Spent:1000 Received:9 RateUsed:%d}", result, baseRate)
+	}
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != 9 || account.Chips != 0 {
+		t.Fatalf("persisted account = %+v, want {Coins:9 Chips:0}", account)
+	}
+}
+
 func TestStore_TopAssets_SortsDescendingTieBrokenByUserID(t *testing.T) {
 	st, _ := newTempStore(t)
 	seedAccounts(t, st, "guild1", map[string]UserAccount{
@@ -1110,6 +1310,49 @@ func TestStore_TopAssets_MaxBalances_DoesNotOverflow(t *testing.T) {
 	}
 	if len(entries) != 2 || entries[0].UserID != "user-a" {
 		t.Fatalf("entries = %+v, want both users with the tie broken by ascending user ID", entries)
+	}
+}
+
+// TestTopAssets_NilAccountDoesNotPanic covers the §3.3 nil-pointer path the
+// existing nil-guild regression does NOT reach. ensureGuildLocked repairs the
+// guild and its Users map, and ensureAccountLocked repairs only the ONE user a
+// write path touches — so `{"users":{"someone":null}}` survives into the
+// ranking loop, where account.Chips dereferences nil. discordgo runs handlers
+// in goroutines without recover, so /rank would kill the bot and the bad file
+// would still be there after the restart.
+func TestTopAssets_NilAccountDoesNotPanic(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate is already in the file, so no draw may happen"}
+	writeHandEditedFile(t, path, fmt.Sprintf(
+		`{"guild1":{"rates":[{"date":%q,"rate":100,"trend":"flat","event":"none"}],`+
+			`"users":{"ghost":null,"user-a":{"chips":100,"coins":1},"user-b":{"chips":50}}}}`,
+		jstDate(fixedNow)))
+
+	entries, err := st.TopAssets("guild1", fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+
+	want := []RankEntry{
+		{UserID: "user-a", TotalAssets: 200}, // 100 + 1*100
+		{UserID: "user-b", TotalAssets: 50},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d entries, want %d (the nil account must be skipped, not ranked): %+v", len(entries), len(want), entries)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Fatalf("entry %d = %+v, want %+v", i, entries[i], want[i])
+		}
+	}
+
+	// Skipped, not opened: ranking is a display-only read path, and granting
+	// the 1,000-chip welcome bonus to someone who never ran a casino command
+	// would let a /rank query mint currency. Account creation belongs to the
+	// write path (ensureAccountLocked).
+	economy := readGuild(t, path, "guild1")
+	if account := economy.Users["ghost"]; account != nil {
+		t.Fatalf("reading the ranking opened an account for the nil user: %+v", account)
 	}
 }
 
