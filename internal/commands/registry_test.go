@@ -35,3 +35,14 @@ func TestRegisterAndAll(t *testing.T) {
 		t.Fatalf("expected foo and bar registered, got %v", names)
 	}
 }
+
+func TestRegister_DuplicateName_Panics(t *testing.T) {
+	resetForTest()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected Register to panic on a duplicate command name")
+		}
+	}()
+	Register(&fakeCommand{name: "dup"})
+	Register(&fakeCommand{name: "dup"})
+}
