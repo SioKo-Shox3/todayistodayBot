@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -60,10 +61,13 @@ func Default() *Store {
 // RE-ENTRANCY CONTRACT (危険地帯 — violating this deadlocks the bot):
 // s.mu is a plain, NON-reentrant sync.Mutex. fn therefore must NOT call any
 // method that takes the lock (Update, Snapshot, Mint, SetAnnounceChannel,
-// and every locking method added by later tasks). Use the unexported
-// *Locked helpers instead. fn must also not perform network I/O, Discord
-// API calls, or sleeps — the whole guild economy is blocked for its
-// duration.
+// EnsureTodayRate, EnsureCasinoAccess, ClaimDaily, ExchangeCoinToChip,
+// ExchangeChipToCoin, ViewAccount, TopAssets, RecentRates, and every locking
+// method added by later tasks). Use the unexported *Locked helpers instead
+// (ensureGuildLocked, ensureAccountLocked, ensureTodayRateLocked,
+// topAssetsLocked, creditChipsLocked, creditCoinsLocked) — none of those take
+// the lock. fn must also not perform network I/O, Discord API calls, or
+// sleeps — the whole guild economy is blocked for its duration.
 func (s *Store) Update(fn func(*Data) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,6 +191,14 @@ var jst = time.FixedZone("JST", 9*3600)
 // time.Local here: the bot's host may run in any zone.
 func jstDate(t time.Time) string { return t.In(jst).Format("2006-01-02") }
 
+// jstYesterday returns the JST calendar date one day before t's JST date.
+// It converts to JST FIRST and only then subtracts a day: doing
+// jstDate(t.AddDate(0,0,-1)) instead would subtract one calendar day in t's
+// OWN location, which is 23h or 25h long on a DST transition day in
+// America/*, Europe/* etc. On a Linux host with such a TZ that silently
+// yields 一昨日 or 今日 in JST terms, breaking /daily streaks.
+func jstYesterday(t time.Time) string { return t.In(jst).AddDate(0, 0, -1).Format("2006-01-02") }
+
 // ensureGuildLocked returns d's entry for guildID, creating an empty one if
 // absent. Also repairs a nil Users map and a nil *GuildEconomy value (which
 // a hand-edited or partially-written file can contain as `{"g": null}`).
@@ -265,4 +277,264 @@ func (s *Store) SetAnnounceChannel(guildID, channelID string) error {
 		ensureGuildLocked(d, guildID).AnnounceChannelID = channelID
 		return nil
 	})
+}
+
+// EnsureTodayRate makes sure guildID has a DailyRate for today's JST
+// calendar date, generating one via a random-walk step if missing. Public
+// entry point — takes the lock itself. Do NOT call this from inside
+// another Update closure (deadlock) — internal callers that need "today's
+// rate" as part of their own transaction must call ensureTodayRateLocked
+// directly instead (see EnsureCasinoAccess/TopAssets/ClaimDaily's
+// neighbours/Exchange*/ViewAccount/RecentRates below).
+func (s *Store) EnsureTodayRate(guildID string, now time.Time) (DailyRate, error) {
+	today := jstDate(now)
+	var result DailyRate
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		result = ensureTodayRateLocked(economy, today, s.rng)
+		return nil
+	})
+	return result, err
+}
+
+// ensureTodayRateLocked returns economy's DailyRate for `today`, appending
+// a freshly-generated one (via nextRate) if missing, and trimming history to
+// the most recent 30 entries (設計書). Caller must already hold the Store's
+// lock, which is also what makes reading s.rng here safe — *rand.Rand is not
+// safe for concurrent use.
+func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) DailyRate {
+	if n := len(economy.Rates); n > 0 && economy.Rates[n-1].Date == today {
+		return economy.Rates[n-1]
+	}
+	var prevRate int
+	var prevTrend TrendState
+	hasPrev := len(economy.Rates) > 0
+	if hasPrev {
+		last := economy.Rates[len(economy.Rates)-1]
+		prevRate, prevTrend = last.Rate, last.Trend
+	}
+	rate, trend, event := nextRate(prevRate, prevTrend, hasPrev, rng)
+	result := DailyRate{Date: today, Rate: rate, Trend: trend, Event: event}
+	economy.Rates = append(economy.Rates, result)
+	if len(economy.Rates) > 30 {
+		economy.Rates = economy.Rates[len(economy.Rates)-30:]
+	}
+	return result
+}
+
+// EnsureCasinoAccess commits, as its OWN transaction, the two invariants
+// every casino command depends on: today's DailyRate exists for guildID,
+// and guildID/userID has an account (welcome bonus granted on first ever
+// access). Callers run this BEFORE their own Update so a failing main
+// operation cannot roll the new account and its welcome bonus back — and so
+// that "which command you happened to run first" cannot change the outcome.
+// Idempotent: repeat calls neither re-grant the bonus nor regenerate the
+// rate. All seven commands call it, /rate and /rank included.
+func (s *Store) EnsureCasinoAccess(guildID, userID string, now time.Time) error {
+	today := jstDate(now)
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		ensureTodayRateLocked(economy, today, s.rng)
+		ensureAccountLocked(economy, userID)
+		return nil
+	})
+}
+
+// RankEntry is one row of the total-assets ranking.
+type RankEntry struct {
+	UserID      string
+	TotalAssets int64 // Chips + Coins*rate
+}
+
+// topAssetsLocked ranks economy's users by total assets at `rate`, ties
+// broken by ascending UserID for deterministic output. Caller must already
+// hold the Store's lock.
+//
+// Chips + Coins*rate cannot overflow int64: the store invariants are
+// Chips <= MaxChips (1e12), Coins <= MaxCoins (1e12) and rate <= maxRate
+// (140, the clamp ceiling), so the sum is bounded by
+// 1e12 + 1e12*140 = 1.41e14, about 65,413x below math.MaxInt64
+// (9.223e18). Every credit path enforces those caps.
+func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
+	entries := make([]RankEntry, 0, len(economy.Users))
+	for userID, account := range economy.Users {
+		entries = append(entries, RankEntry{UserID: userID, TotalAssets: account.Chips + account.Coins*int64(rate)})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].TotalAssets != entries[j].TotalAssets {
+			return entries[i].TotalAssets > entries[j].TotalAssets
+		}
+		return entries[i].UserID < entries[j].UserID
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+// TopAssets returns guildID's top `limit` accounts by total assets, using
+// today's rate (generated first if missing, same transaction).
+func (s *Store) TopAssets(guildID string, now time.Time, limit int) ([]RankEntry, error) {
+	today := jstDate(now)
+	var result []RankEntry
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		rate := ensureTodayRateLocked(economy, today, s.rng)
+		result = topAssetsLocked(economy, rate.Rate, limit)
+		return nil
+	})
+	return result, err
+}
+
+// DailyClaimResult is what a successful daily claim paid out.
+type DailyClaimResult struct {
+	Amount       int64 // credited chips
+	NewStreak    int
+	JackpotBonus bool // true iff the +500 "大入り袋" applied (NewStreak%7==0)
+}
+
+// ClaimDaily pays out today's daily bonus to guildID/userID (JST calendar
+// date), auto-creating the account (welcome bonus) on first interaction.
+// Returns ErrAlreadyClaimedToday (no mutation) if already claimed today,
+// or ErrChipCapExceeded (also no mutation) if the payout would break
+// MaxChips.
+func (s *Store) ClaimDaily(guildID, userID string, now time.Time) (DailyClaimResult, error) {
+	today := jstDate(now)
+	yesterday := jstYesterday(now) // NOT jstDate(now.AddDate(0,0,-1)) — see jstYesterday's doc
+	var result DailyClaimResult
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.LastDailyDate == today {
+			return ErrAlreadyClaimedToday
+		}
+		streak := 1
+		if account.LastDailyDate == yesterday {
+			streak = account.StreakDays + 1
+		}
+		amount := dailyBonusAmount(streak)
+		if err := creditChipsLocked(account, amount); err != nil {
+			return err // aborts the transaction: streak/date/balance all stay untouched
+		}
+		account.StreakDays = streak
+		account.LastDailyDate = today
+		result = DailyClaimResult{Amount: amount, NewStreak: streak, JackpotBonus: streak%7 == 0}
+		return nil
+	})
+	if err != nil {
+		return DailyClaimResult{}, err
+	}
+	return result, nil
+}
+
+// ExchangeResult is what a successful exchange moved.
+type ExchangeResult struct {
+	Spent    int64 // debited from source currency
+	Received int64 // credited to destination currency
+	RateUsed int
+}
+
+// ExchangeCoinToChip converts coins to chips for guildID/userID at today's
+// rate (ensured in the same transaction, so no concurrent command can change
+// the rate between reading it and moving the balances). Minimum: coins >= 1.
+func (s *Store) ExchangeCoinToChip(guildID, userID string, coins int64, now time.Time) (ExchangeResult, error) {
+	if coins < 1 {
+		return ExchangeResult{}, ErrInvalidAmount
+	}
+	today := jstDate(now)
+	var result ExchangeResult
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		rate := ensureTodayRateLocked(economy, today, s.rng)
+		account := ensureAccountLocked(economy, userID)
+		if account.Coins < coins {
+			return &ErrInsufficientCoins{Balance: account.Coins}
+		}
+		chips, err := exchangeCoinToChip(coins, rate.Rate)
+		if err != nil {
+			return err
+		}
+		if err := creditChipsLocked(account, chips); err != nil {
+			return err // ErrChipCapExceeded — aborts before the debit is persisted
+		}
+		account.Coins -= coins
+		result = ExchangeResult{Spent: coins, Received: chips, RateUsed: rate.Rate}
+		return nil
+	})
+	return result, err
+}
+
+// ExchangeChipToCoin converts chips to coins for guildID/userID at today's
+// rate. Minimum is on the RESULT (設計書: "結果が1コイン以上になる量"),
+// checked after computing the exchange.
+func (s *Store) ExchangeChipToCoin(guildID, userID string, chips int64, now time.Time) (ExchangeResult, error) {
+	if chips < 1 {
+		return ExchangeResult{}, ErrInvalidAmount
+	}
+	today := jstDate(now)
+	var result ExchangeResult
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		rate := ensureTodayRateLocked(economy, today, s.rng)
+		account := ensureAccountLocked(economy, userID)
+		if account.Chips < chips {
+			return &ErrInsufficientChips{Balance: account.Chips}
+		}
+		coins, err := exchangeChipToCoin(chips, rate.Rate)
+		if err != nil {
+			return err
+		}
+		if coins < 1 {
+			return ErrBelowMinimumExchange
+		}
+		if err := creditCoinsLocked(account, coins); err != nil {
+			return err // ErrCoinCapExceeded — aborts before the debit is persisted
+		}
+		account.Chips -= chips
+		result = ExchangeResult{Spent: chips, Received: coins, RateUsed: rate.Rate}
+		return nil
+	})
+	return result, err
+}
+
+// AccountView is one account plus the totals derived from today's rate.
+type AccountView struct {
+	Account     UserAccount
+	RateUsed    int
+	TotalAssets int64
+}
+
+// ViewAccount ensures guildID/userID's account exists (welcome bonus on
+// first use) and today's rate exists, returning both plus derived total
+// assets.
+func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView, error) {
+	today := jstDate(now)
+	var result AccountView
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		rate := ensureTodayRateLocked(economy, today, s.rng)
+		account := *ensureAccountLocked(economy, userID)
+		result = AccountView{Account: account, RateUsed: rate.Rate, TotalAssets: account.Chips + account.Coins*int64(rate.Rate)}
+		return nil
+	})
+	return result, err
+}
+
+// RecentRates ensures today's rate exists (same transaction) then returns
+// up to the most recent `limit` DailyRate entries (oldest..newest, today
+// included as the last element) for guildID.
+func (s *Store) RecentRates(guildID string, now time.Time, limit int) ([]DailyRate, error) {
+	today := jstDate(now)
+	var result []DailyRate
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		ensureTodayRateLocked(economy, today, s.rng)
+		recent := economy.Rates
+		if len(recent) > limit {
+			recent = recent[len(recent)-limit:]
+		}
+		result = recent
+		return nil
+	})
+	return result, err
 }

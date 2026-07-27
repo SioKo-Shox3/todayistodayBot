@@ -8,7 +8,16 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
+
+// fixedNow is the arbitrary but FIXED JST instant every economy test is
+// anchored to. Nothing in this package may read the wall clock from a test: a
+// test that only passes before 09:00 JST is not evidence.
+var fixedNow = time.Date(2026, 7, 10, 12, 0, 0, 0, jst)
+
+// daysAfter returns fixedNow shifted by n JST calendar days.
+func daysAfter(n int) time.Time { return fixedNow.AddDate(0, 0, n) }
 
 // newTempStore returns a Store backed by a fresh, not-yet-created file in
 // t.TempDir(). New (not Default) is the test-only constructor — production
@@ -437,5 +446,746 @@ func TestCreditCoinsLocked_NegativeDelta(t *testing.T) {
 	}
 	if account.Coins != 100 {
 		t.Fatalf("a rejected credit must leave the balance untouched, got %d", account.Coins)
+	}
+}
+
+// seedRate pins guildID's DailyRate for now's JST calendar date, so exchange,
+// ranking and history tests are deterministic without touching s.rng. It
+// appends, keeping whatever the guild already holds.
+func seedRate(t *testing.T, st *Store, guildID string, now time.Time, rate int) {
+	t.Helper()
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		economy.Rates = append(economy.Rates, DailyRate{Date: jstDate(now), Rate: rate, Trend: TrendFlat, Event: EventNone})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding rate for %s: %v", guildID, err)
+	}
+}
+
+// seedAccounts writes known balances for several users at once, bypassing the
+// credit helpers so cap-boundary tests can start from any balance. Unlike
+// seedAccount it preserves the guild's rate history.
+func seedAccounts(t *testing.T, st *Store, guildID string, users map[string]UserAccount) {
+	t.Helper()
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		for userID, account := range users {
+			seeded := account
+			economy.Users[userID] = &seeded
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding accounts for %s: %v", guildID, err)
+	}
+}
+
+// readGuild reads guildID back through a *fresh* Store, so the assertion is
+// about what actually reached the file.
+func readGuild(t *testing.T, path, guildID string) GuildEconomy {
+	t.Helper()
+	data, err := New(path).Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot returned error: %v", err)
+	}
+	economy := data[guildID]
+	if economy == nil {
+		t.Fatalf("guild %q missing from persisted data: %+v", guildID, data)
+	}
+	return *economy
+}
+
+func TestStore_EnsureTodayRate_FirstDay(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
+
+	rate, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+	if rate.Rate != baseRate || rate.Trend != TrendFlat || rate.Event != EventNone {
+		t.Fatalf("first day rate = %+v, want {Rate:%d Trend:%s Event:%s}", rate, baseRate, TrendFlat, EventNone)
+	}
+	if rate.Date != jstDate(fixedNow) {
+		t.Fatalf("rate.Date = %q, want the JST calendar date %q", rate.Date, jstDate(fixedNow))
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 || economy.Rates[0] != rate {
+		t.Fatalf("persisted rates = %+v, want exactly the returned %+v", economy.Rates, rate)
+	}
+}
+
+func TestStore_EnsureTodayRate_Idempotent(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate already exists, so no new draw may happen"}
+
+	first, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("first EnsureTodayRate returned error: %v", err)
+	}
+	second, err := st.EnsureTodayRate("guild1", fixedNow.Add(6*time.Hour))
+	if err != nil {
+		t.Fatalf("second EnsureTodayRate returned error: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second call on the same JST day returned %+v, want the stored %+v", second, first)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 {
+		t.Fatalf("persisted %d rate entries for one JST day, want 1: %+v", len(economy.Rates), economy.Rates)
+	}
+}
+
+func TestStore_EnsureTodayRate_NextDay(t *testing.T) {
+	st, path := newTempStore(t)
+	seedRate(t, st, "guild1", fixedNow, 100)
+	// No trend flip (0.5 >= 0.15), no event (0.5 >= 0.05), flat drift, noise
+	// = -3 + 0.6*6 = +0.6% -> 100.6 -> 101.
+	st.rng = &cyclicRand{floats: []float64{0.5, 0.5, 0.6}}
+
+	rate, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+	if rate.Date != jstDate(daysAfter(1)) {
+		t.Fatalf("rate.Date = %q, want %q", rate.Date, jstDate(daysAfter(1)))
+	}
+	if rate.Rate != 101 {
+		t.Fatalf("rate.Rate = %d, want 101 (a random-walk step from yesterday's 100)", rate.Rate)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 2 {
+		t.Fatalf("persisted %d rate entries, want yesterday's plus today's: %+v", len(economy.Rates), economy.Rates)
+	}
+}
+
+func TestStore_EnsureTodayRate_TrimsHistoryTo30(t *testing.T) {
+	st, path := newTempStore(t)
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, "guild1")
+		for i := 0; i < 30; i++ {
+			economy.Rates = append(economy.Rates, DailyRate{Date: jstDate(daysAfter(i - 30)), Rate: 100, Trend: TrendFlat, Event: EventNone})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding 30 days of history: %v", err)
+	}
+	st.rng = &cyclicRand{floats: []float64{0.5, 0.5, 0.6}}
+
+	if _, err := st.EnsureTodayRate("guild1", fixedNow); err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 30 {
+		t.Fatalf("persisted %d rate entries, want the history trimmed to 30", len(economy.Rates))
+	}
+	if want := jstDate(daysAfter(-29)); economy.Rates[0].Date != want {
+		t.Fatalf("oldest retained date = %q, want %q (the 31st-oldest entry must be dropped)", economy.Rates[0].Date, want)
+	}
+	if want := jstDate(fixedNow); economy.Rates[29].Date != want {
+		t.Fatalf("newest date = %q, want today's %q", economy.Rates[29].Date, want)
+	}
+}
+
+func TestStore_EnsureTodayRate_PersistsEventKind(t *testing.T) {
+	st, path := newTempStore(t)
+	seedRate(t, st, "guild1", fixedNow, 100)
+	// No trend flip, event hit (0 < 0.05), magnitude 15%, direction 0.4 < 0.5
+	// = surge -> 100 * 1.15 -> 115.
+	st.rng = &cyclicRand{floats: []float64{0.5, 0, 0, 0.4}}
+
+	rate, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+	if rate.Event != EventSurge || rate.Rate != 115 {
+		t.Fatalf("returned rate = %+v, want Rate 115 with Event %q", rate, EventSurge)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	stored := economy.Rates[len(economy.Rates)-1]
+	if stored.Event != EventSurge {
+		t.Fatalf("persisted Event = %q, want %q — the draw must be stored, not re-derived from the day-over-day move", stored.Event, EventSurge)
+	}
+}
+
+func TestStore_EnsureCasinoAccess_FirstAccessGrantsWelcomeBonus(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
+
+	if err := st.EnsureCasinoAccess("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("EnsureCasinoAccess returned error: %v", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips {
+		t.Fatalf("Chips = %d, want the %d-chip welcome bonus", account.Chips, welcomeBonusChips)
+	}
+	if account.Coins != 0 {
+		t.Fatalf("Coins = %d, want a new account to start with no coins", account.Coins)
+	}
+}
+
+func TestStore_EnsureCasinoAccess_Idempotent_NoDoubleBonus(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate already exists after the first call"}
+
+	for i := 0; i < 3; i++ {
+		if err := st.EnsureCasinoAccess("guild1", "user-1", fixedNow); err != nil {
+			t.Fatalf("EnsureCasinoAccess call %d returned error: %v", i+1, err)
+		}
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips {
+		t.Fatalf("Chips = %d after three calls, want the welcome bonus granted exactly once (%d)", account.Chips, welcomeBonusChips)
+	}
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 {
+		t.Fatalf("persisted %d rate entries after three calls on one JST day, want 1", len(economy.Rates))
+	}
+}
+
+func TestStore_EnsureCasinoAccess_GeneratesTodayRate(t *testing.T) {
+	st, path := newTempStore(t)
+
+	if err := st.EnsureCasinoAccess("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("EnsureCasinoAccess returned error: %v", err)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 {
+		t.Fatalf("persisted rates = %+v, want today's rate to have been generated", economy.Rates)
+	}
+	if economy.Rates[0].Date != jstDate(fixedNow) || economy.Rates[0].Rate != baseRate {
+		t.Fatalf("persisted rate = %+v, want today's date %q at the base rate %d", economy.Rates[0], jstDate(fixedNow), baseRate)
+	}
+}
+
+// TestStore_EnsureCasinoAccess_ThenFailingOperation_KeepsAccountAndBonus is
+// the reason EnsureCasinoAccess is its own transaction: if the account were
+// opened inside the caller's Update, a failing main operation would roll the
+// new account and its welcome bonus back, and "which command you happened to
+// run first" would change the outcome.
+func TestStore_EnsureCasinoAccess_ThenFailingOperation_KeepsAccountAndBonus(t *testing.T) {
+	st, path := newTempStore(t)
+
+	if err := st.EnsureCasinoAccess("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("EnsureCasinoAccess returned error: %v", err)
+	}
+
+	_, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow)
+	var insufficient *ErrInsufficientCoins
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("ExchangeCoinToChip on a coinless new account = %v, want *ErrInsufficientCoins", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips {
+		t.Fatalf("Chips = %d after the failing exchange, want the welcome bonus to survive it (%d)", account.Chips, welcomeBonusChips)
+	}
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 {
+		t.Fatalf("persisted rates = %+v, want today's rate to survive the failing exchange", economy.Rates)
+	}
+}
+
+func TestStore_ClaimDaily_FirstClaim(t *testing.T) {
+	st, path := newTempStore(t)
+
+	result, err := st.ClaimDaily("guild1", "user-1", fixedNow)
+	if err != nil {
+		t.Fatalf("ClaimDaily returned error: %v", err)
+	}
+	if result.Amount != 200 || result.NewStreak != 1 || result.JackpotBonus {
+		t.Fatalf("result = %+v, want {Amount:200 NewStreak:1 JackpotBonus:false}", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips+200 {
+		t.Fatalf("Chips = %d, want the welcome bonus plus 200 (%d)", account.Chips, welcomeBonusChips+200)
+	}
+	if account.StreakDays != 1 || account.LastDailyDate != jstDate(fixedNow) {
+		t.Fatalf("account = %+v, want StreakDays 1 and LastDailyDate %q", account, jstDate(fixedNow))
+	}
+}
+
+func TestStore_ClaimDaily_SameDayTwice(t *testing.T) {
+	st, path := newTempStore(t)
+	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("first ClaimDaily returned error: %v", err)
+	}
+
+	// Later the same JST calendar day.
+	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow.Add(8*time.Hour)); !errors.Is(err, ErrAlreadyClaimedToday) {
+		t.Fatalf("second ClaimDaily on the same JST day = %v, want ErrAlreadyClaimedToday", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips+200 || account.StreakDays != 1 {
+		t.Fatalf("a rejected claim must persist nothing, got %+v", account)
+	}
+}
+
+func TestStore_ClaimDaily_ConsecutiveDay(t *testing.T) {
+	st, path := newTempStore(t)
+	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("day 1 ClaimDaily returned error: %v", err)
+	}
+
+	result, err := st.ClaimDaily("guild1", "user-1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("day 2 ClaimDaily returned error: %v", err)
+	}
+	if result.Amount != 250 || result.NewStreak != 2 || result.JackpotBonus {
+		t.Fatalf("result = %+v, want {Amount:250 NewStreak:2 JackpotBonus:false}", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips+200+250 {
+		t.Fatalf("Chips = %d, want %d", account.Chips, welcomeBonusChips+200+250)
+	}
+}
+
+func TestStore_ClaimDaily_GapResetsStreak(t *testing.T) {
+	st, path := newTempStore(t)
+	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+		t.Fatalf("day 1 ClaimDaily returned error: %v", err)
+	}
+	if _, err := st.ClaimDaily("guild1", "user-1", daysAfter(1)); err != nil {
+		t.Fatalf("day 2 ClaimDaily returned error: %v", err)
+	}
+
+	// Day 3 skipped entirely; claim again on day 4.
+	result, err := st.ClaimDaily("guild1", "user-1", daysAfter(3))
+	if err != nil {
+		t.Fatalf("day 4 ClaimDaily returned error: %v", err)
+	}
+	if result.NewStreak != 1 || result.Amount != 200 {
+		t.Fatalf("result = %+v, want the streak reset to 1 (200 chips) after a missed day", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.StreakDays != 1 {
+		t.Fatalf("StreakDays = %d, want 1", account.StreakDays)
+	}
+}
+
+func TestStore_ClaimDaily_SeventhDayJackpot(t *testing.T) {
+	st, path := newTempStore(t)
+
+	want := []int64{200, 250, 300, 350, 400, 450, 1000}
+	var total int64
+	for day := 0; day < 7; day++ {
+		result, err := st.ClaimDaily("guild1", "user-1", daysAfter(day))
+		if err != nil {
+			t.Fatalf("day %d ClaimDaily returned error: %v", day+1, err)
+		}
+		if result.Amount != want[day] || result.NewStreak != day+1 {
+			t.Fatalf("day %d result = %+v, want {Amount:%d NewStreak:%d}", day+1, result, want[day], day+1)
+		}
+		if wantJackpot := day == 6; result.JackpotBonus != wantJackpot {
+			t.Fatalf("day %d JackpotBonus = %v, want %v (the 大入り袋 lands on every 7th day)", day+1, result.JackpotBonus, wantJackpot)
+		}
+		total += want[day]
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips+total {
+		t.Fatalf("Chips = %d, want %d", account.Chips, welcomeBonusChips+total)
+	}
+}
+
+func TestStore_ClaimDaily_ChipCapExceeded_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Chips: MaxChips, Coins: 7}})
+
+	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("ClaimDaily at MaxChips = %v, want ErrChipCapExceeded", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != MaxChips || account.Coins != 7 || account.StreakDays != 0 || account.LastDailyDate != "" {
+		t.Fatalf("a cap-exceeded claim must persist nothing — not the chips, not the streak, not the date: %+v", account)
+	}
+}
+
+// TestStore_ClaimDaily_NonJSTLocation_StreakFollowsJSTCalendar pins the JST
+// calendar-day boundary against a `now` that arrives in a foreign zone. The
+// America/New_York case is the one that actually discriminates: on the
+// 2026-03-08 spring-forward day, subtracting a day in the caller's OWN
+// location (jstDate(now.AddDate(0,0,-1))) yields 2026-03-08 instead of
+// 2026-03-07, which silently breaks the streak.
+func TestStore_ClaimDaily_NonJSTLocation_StreakFollowsJSTCalendar(t *testing.T) {
+	type streakCase struct {
+		name       string
+		first      time.Time
+		second     time.Time
+		wantDate   string
+		wantStreak int
+	}
+
+	// The fixed-offset pair always runs: time.LoadLocation needs a tzdata file,
+	// which a minimal container may not have, and a skipped test proves nothing.
+	est := time.FixedZone("EST", -5*3600)
+	cases := []streakCase{{
+		name:       "fixed -05:00 offset",
+		first:      time.Date(2026, 3, 6, 23, 0, 0, 0, est), // JST 2026-03-07 13:00
+		second:     time.Date(2026, 3, 7, 23, 0, 0, 0, est), // JST 2026-03-08 13:00
+		wantDate:   "2026-03-08",
+		wantStreak: 2,
+	}}
+
+	if ny, err := time.LoadLocation("America/New_York"); err == nil {
+		cases = append(cases, streakCase{
+			name:       "America/New_York across the spring-forward transition",
+			first:      time.Date(2026, 3, 6, 23, 0, 0, 0, ny),  // EST: JST 2026-03-07 13:00
+			second:     time.Date(2026, 3, 8, 10, 30, 0, 0, ny), // EDT: JST 2026-03-08 23:30
+			wantDate:   "2026-03-08",
+			wantStreak: 2,
+		})
+	} else {
+		t.Logf("time.LoadLocation(\"America/New_York\") failed (%v); running only the fixed-offset case", err)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+
+			first, err := st.ClaimDaily("guild1", "user-1", tc.first)
+			if err != nil {
+				t.Fatalf("first ClaimDaily returned error: %v", err)
+			}
+			if first.NewStreak != 1 {
+				t.Fatalf("first claim NewStreak = %d, want 1", first.NewStreak)
+			}
+
+			second, err := st.ClaimDaily("guild1", "user-1", tc.second)
+			if err != nil {
+				t.Fatalf("second ClaimDaily returned error: %v", err)
+			}
+			if second.NewStreak != tc.wantStreak {
+				t.Fatalf("second claim NewStreak = %d, want %d — consecutive JST calendar days must continue the streak whatever zone `now` carries", second.NewStreak, tc.wantStreak)
+			}
+
+			account := readAccount(t, path, "guild1", "user-1")
+			if account.LastDailyDate != tc.wantDate {
+				t.Fatalf("LastDailyDate = %q, want the JST calendar date %q", account.LastDailyDate, tc.wantDate)
+			}
+		})
+	}
+}
+
+func TestStore_ExchangeCoinToChip_Success(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 10, Chips: 0}})
+	seedRate(t, st, "guild1", fixedNow, 101)
+
+	result, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow)
+	if err != nil {
+		t.Fatalf("ExchangeCoinToChip returned error: %v", err)
+	}
+	// 10 * 101 * 97 / 100 = 979, with exactly one truncation.
+	if result != (ExchangeResult{Spent: 10, Received: 979, RateUsed: 101}) {
+		t.Fatalf("result = %+v, want {Spent:10 Received:979 RateUsed:101}", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != 0 || account.Chips != 979 {
+		t.Fatalf("account = %+v, want Coins 0 and Chips 979", account)
+	}
+}
+
+func TestStore_ExchangeCoinToChip_InsufficientCoins_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 5, Chips: 42}})
+	seedRate(t, st, "guild1", fixedNow, 101)
+
+	_, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow)
+	var insufficient *ErrInsufficientCoins
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("ExchangeCoinToChip = %v, want *ErrInsufficientCoins", err)
+	}
+	if insufficient.Balance != 5 {
+		t.Fatalf("ErrInsufficientCoins.Balance = %d, want the current balance 5", insufficient.Balance)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != 5 || account.Chips != 42 {
+		t.Fatalf("a rejected exchange must not move a single coin or chip, got %+v", account)
+	}
+}
+
+func TestStore_ExchangeCoinToChip_BelowMinimumInput(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 500, Chips: 42}})
+	seedRate(t, st, "guild1", fixedNow, 101)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the seeded file: %v", err)
+	}
+
+	for _, coins := range []int64{0, -1} {
+		if _, err := st.ExchangeCoinToChip("guild1", "user-1", coins, fixedNow); !errors.Is(err, ErrInvalidAmount) {
+			t.Fatalf("ExchangeCoinToChip(%d) = %v, want ErrInvalidAmount", coins, err)
+		}
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the file afterwards: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("a rejected exchange must persist nothing.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestStore_ExchangeChipToCoin_Success(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 0, Chips: 1100}})
+	seedRate(t, st, "guild1", fixedNow, 70)
+
+	result, err := st.ExchangeChipToCoin("guild1", "user-1", 1100, fixedNow)
+	if err != nil {
+		t.Fatalf("ExchangeChipToCoin returned error: %v", err)
+	}
+	// 1100 * 97 / (100 * 70) = 15, with exactly one truncation; converting
+	// first and charging the fee afterwards would pay 14.
+	if result != (ExchangeResult{Spent: 1100, Received: 15, RateUsed: 70}) {
+		t.Fatalf("result = %+v, want {Spent:1100 Received:15 RateUsed:70}", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 0 || account.Coins != 15 {
+		t.Fatalf("account = %+v, want Chips 0 and Coins 15", account)
+	}
+}
+
+func TestStore_ExchangeChipToCoin_InsufficientChips_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 3, Chips: 900}})
+	seedRate(t, st, "guild1", fixedNow, 70)
+
+	_, err := st.ExchangeChipToCoin("guild1", "user-1", 1100, fixedNow)
+	var insufficient *ErrInsufficientChips
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("ExchangeChipToCoin = %v, want *ErrInsufficientChips", err)
+	}
+	if insufficient.Balance != 900 {
+		t.Fatalf("ErrInsufficientChips.Balance = %d, want the current balance 900", insufficient.Balance)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 900 || account.Coins != 3 {
+		t.Fatalf("a rejected exchange must not move a single coin or chip, got %+v", account)
+	}
+}
+
+func TestStore_ExchangeChipToCoin_ResultBelowMinimum_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 3, Chips: 900}})
+	seedRate(t, st, "guild1", fixedNow, 140)
+
+	// 100 * 97 / (100 * 140) = 0: the minimum is on the RESULT here, not on
+	// the input, so this is ErrBelowMinimumExchange rather than
+	// ErrInvalidAmount.
+	if _, err := st.ExchangeChipToCoin("guild1", "user-1", 100, fixedNow); !errors.Is(err, ErrBelowMinimumExchange) {
+		t.Fatalf("ExchangeChipToCoin(100) at rate 140 = %v, want ErrBelowMinimumExchange", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 900 || account.Coins != 3 {
+		t.Fatalf("a rejected exchange must not move a single coin or chip, got %+v", account)
+	}
+}
+
+func TestStore_ExchangeCoinToChip_ChipCapExceeded_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 10, Chips: MaxChips - 1}})
+	seedRate(t, st, "guild1", fixedNow, 100)
+
+	// 10 * 100 * 97 / 100 = 970 chips, which does not fit under MaxChips.
+	if _, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("ExchangeCoinToChip = %v, want ErrChipCapExceeded", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != 10 || account.Chips != MaxChips-1 {
+		t.Fatalf("a cap-exceeded exchange must not persist the debit either, got %+v", account)
+	}
+}
+
+func TestStore_ExchangeChipToCoin_CoinCapExceeded_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: MaxCoins - 1, Chips: 1000}})
+	seedRate(t, st, "guild1", fixedNow, 70)
+
+	// 1000 * 97 / (100 * 70) = 13 coins, which does not fit under MaxCoins.
+	if _, err := st.ExchangeChipToCoin("guild1", "user-1", 1000, fixedNow); !errors.Is(err, ErrCoinCapExceeded) {
+		t.Fatalf("ExchangeChipToCoin = %v, want ErrCoinCapExceeded", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Coins != MaxCoins-1 || account.Chips != 1000 {
+		t.Fatalf("a cap-exceeded exchange must not persist the debit either, got %+v", account)
+	}
+}
+
+func TestStore_TopAssets_SortsDescendingTieBrokenByUserID(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{
+		"user-a": {Chips: 100, Coins: 1}, // 100 + 1*100 = 200
+		"user-b": {Chips: 200, Coins: 0}, // 200, tied with user-a
+		"user-c": {Chips: 0, Coins: 5},   // 500
+	})
+	seedRate(t, st, "guild1", fixedNow, 100)
+
+	entries, err := st.TopAssets("guild1", fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+	want := []RankEntry{
+		{UserID: "user-c", TotalAssets: 500},
+		{UserID: "user-a", TotalAssets: 200},
+		{UserID: "user-b", TotalAssets: 200},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d entries, want %d: %+v", len(entries), len(want), entries)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Fatalf("entry %d = %+v, want %+v (descending by assets, ties broken by ascending user ID)", i, entries[i], want[i])
+		}
+	}
+}
+
+func TestStore_TopAssets_LimitsToRequestedCount(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{
+		"user-a": {Chips: 100, Coins: 1},
+		"user-b": {Chips: 200, Coins: 0},
+		"user-c": {Chips: 0, Coins: 5},
+	})
+	seedRate(t, st, "guild1", fixedNow, 100)
+
+	entries, err := st.TopAssets("guild1", fixedNow, 2)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries for limit 2: %+v", len(entries), entries)
+	}
+	if entries[0].UserID != "user-c" || entries[1].UserID != "user-a" {
+		t.Fatalf("entries = %+v, want the top two by assets", entries)
+	}
+}
+
+// TestStore_TopAssets_MaxBalances_DoesNotOverflow is the int64 guard: without
+// MaxChips/MaxCoins, Chips + Coins*rate wraps to a negative total and the
+// ranking silently inverts, with no error or panic to notice.
+func TestStore_TopAssets_MaxBalances_DoesNotOverflow(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{
+		"user-a": {Chips: MaxChips, Coins: MaxCoins},
+		"user-b": {Chips: MaxChips, Coins: MaxCoins},
+	})
+	seedRate(t, st, "guild1", fixedNow, maxRate)
+
+	entries, err := st.TopAssets("guild1", fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+	const want = int64(141_000_000_000_000) // MaxChips + MaxCoins*140
+	for i, entry := range entries {
+		if entry.TotalAssets != want {
+			t.Fatalf("entry %d (%s) TotalAssets = %d, want %d — a negative or wrapped total means the caps stopped containing the arithmetic", i, entry.UserID, entry.TotalAssets, want)
+		}
+	}
+	if len(entries) != 2 || entries[0].UserID != "user-a" {
+		t.Fatalf("entries = %+v, want both users with the tie broken by ascending user ID", entries)
+	}
+}
+
+func TestStore_ViewAccount_FirstAccess_GrantsWelcomeBonus(t *testing.T) {
+	st, path := newTempStore(t)
+
+	view, err := st.ViewAccount("guild1", "user-1", fixedNow)
+	if err != nil {
+		t.Fatalf("ViewAccount returned error: %v", err)
+	}
+	if view.Account.Chips != welcomeBonusChips || view.Account.Coins != 0 {
+		t.Fatalf("view.Account = %+v, want the %d-chip welcome bonus and no coins", view.Account, welcomeBonusChips)
+	}
+	if view.RateUsed != baseRate {
+		t.Fatalf("view.RateUsed = %d, want the first day's %d", view.RateUsed, baseRate)
+	}
+	if view.TotalAssets != welcomeBonusChips {
+		t.Fatalf("view.TotalAssets = %d, want %d", view.TotalAssets, welcomeBonusChips)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips {
+		t.Fatalf("persisted Chips = %d, want the welcome bonus to have been committed", account.Chips)
+	}
+}
+
+func TestStore_RecentRates_GeneratesTodayIfMissing(t *testing.T) {
+	st, _ := newTempStore(t)
+
+	rates, err := st.RecentRates("guild1", fixedNow, 7)
+	if err != nil {
+		t.Fatalf("RecentRates returned error: %v", err)
+	}
+	if len(rates) != 1 {
+		t.Fatalf("got %d entries, want today's freshly generated rate: %+v", len(rates), rates)
+	}
+	if rates[0].Date != jstDate(fixedNow) || rates[0].Rate != baseRate {
+		t.Fatalf("rates[0] = %+v, want today's date %q at the base rate %d", rates[0], jstDate(fixedNow), baseRate)
+	}
+}
+
+func TestStore_RecentRates_LimitsToRequestedCount(t *testing.T) {
+	st, _ := newTempStore(t)
+	for day := -4; day <= 0; day++ {
+		seedRate(t, st, "guild1", daysAfter(day), 100+day)
+	}
+
+	rates, err := st.RecentRates("guild1", fixedNow, 3)
+	if err != nil {
+		t.Fatalf("RecentRates returned error: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("got %d entries for limit 3: %+v", len(rates), rates)
+	}
+	if rates[2].Date != jstDate(fixedNow) {
+		t.Fatalf("newest entry = %+v, want today's %q", rates[2], jstDate(fixedNow))
+	}
+}
+
+func TestStore_RecentRates_ReturnsOldestToNewestOrder(t *testing.T) {
+	st, _ := newTempStore(t)
+	for day := -4; day <= 0; day++ {
+		seedRate(t, st, "guild1", daysAfter(day), 100+day)
+	}
+
+	rates, err := st.RecentRates("guild1", fixedNow, 30)
+	if err != nil {
+		t.Fatalf("RecentRates returned error: %v", err)
+	}
+	if len(rates) != 5 {
+		t.Fatalf("got %d entries, want all 5 seeded days: %+v", len(rates), rates)
+	}
+	for day := -4; day <= 0; day++ {
+		i := day + 4
+		if want := jstDate(daysAfter(day)); rates[i].Date != want {
+			t.Fatalf("rates[%d].Date = %q, want %q — the history must come back oldest first, today last", i, rates[i].Date, want)
+		}
 	}
 }
