@@ -80,7 +80,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// フェーズC-1: 毎朝9:00 JSTのレート掲示スケジューラ(起動直後に1回パスを走らせる)
+	waitScheduler := commands.StartCasinoAnnounceScheduler(ctx, session)
+
 	<-ctx.Done()
+
+	slog.Info("shutdown signal received, waiting for casino scheduler")
+	waitScheduler() // 掲示送信中にセッションを閉じないよう、goroutineの終了を待つ
 
 	slog.Info("shutdown signal received, closing session")
 }
