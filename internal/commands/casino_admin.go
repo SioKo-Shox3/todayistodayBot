@@ -122,9 +122,23 @@ func (c *CasinoAdminCommand) buildResponse(i *discordgo.InteractionCreate, now t
 	}
 }
 
+// buildInteractionResponseData assembles the *discordgo.InteractionResponseData
+// Handle sends back — buildResponse's content plus the ephemeral flag (設計書:
+// /casino-admin の表示は管理者のみ; every branch of buildResponse, success or
+// error, is wrapped ephemeral here). Extracted like buildResponse so tests
+// can assert on Flags without a live *discordgo.Session — discordgo's REST
+// endpoints are resolved once at package-init time and cannot be redirected
+// to a test server (see reminder_test.go's fakeWebhookCreator comment).
+func (c *CasinoAdminCommand) buildInteractionResponseData(i *discordgo.InteractionCreate, now time.Time) *discordgo.InteractionResponseData {
+	return &discordgo.InteractionResponseData{
+		Content: c.buildResponse(i, now),
+		Flags:   discordgo.MessageFlagsEphemeral,
+	}
+}
+
 func (c *CasinoAdminCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{Content: c.buildResponse(i, time.Now())},
+		Data: c.buildInteractionResponseData(i, time.Now()),
 	})
 }

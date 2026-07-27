@@ -163,6 +163,37 @@ func TestBuildResponse_Channel_Success(t *testing.T) {
 	}
 }
 
+func TestCasinoAdminCommand_Handle_ResponseIsEphemeral_OnSuccess(t *testing.T) {
+	store := newTestCasinoStore(t)
+	cmd := &CasinoAdminCommand{store: store}
+	i := adminInteraction("g1", "admin", "channel", []*discordgo.ApplicationCommandInteractionDataOption{
+		{Name: "channel", Type: discordgo.ApplicationCommandOptionChannel, Value: "c9"},
+	})
+	got := cmd.buildInteractionResponseData(i, testNow())
+	if got.Flags != discordgo.MessageFlagsEphemeral {
+		t.Fatalf("expected MessageFlagsEphemeral on a successful response, got flags %d", got.Flags)
+	}
+	if got.Content != "✅ 掲示チャンネルを <#c9> に設定しました。" {
+		t.Fatalf("unexpected content: %q", got.Content)
+	}
+}
+
+func TestCasinoAdminCommand_Handle_ResponseIsEphemeral_OnGuardFailure(t *testing.T) {
+	// Even the ❌ guard-failure branches (non-administrator here) must stay
+	// ephemeral — the design decision applies to every response, not just
+	// the success path.
+	cmd := &CasinoAdminCommand{store: newTestCasinoStore(t)}
+	i := adminInteraction("g1", "u1", "channel", nil)
+	i.Member.Permissions = discordgo.PermissionSendMessages
+	got := cmd.buildInteractionResponseData(i, testNow())
+	if got.Flags != discordgo.MessageFlagsEphemeral {
+		t.Fatalf("expected MessageFlagsEphemeral on a guard-failure response, got flags %d", got.Flags)
+	}
+	if got.Content != "❌ このコマンドはサーバー管理者のみ使用できます" {
+		t.Fatalf("unexpected content: %q", got.Content)
+	}
+}
+
 func TestCasinoAdminCommand_FirstAccess_OpensAccountWithWelcomeBonus(t *testing.T) {
 	store := newTestCasinoStore(t)
 	cmd := &CasinoAdminCommand{store: store}
