@@ -1189,3 +1189,193 @@ func TestStore_RecentRates_ReturnsOldestToNewestOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestStore_Spin_DeductsThenCreditsPayout(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 1000})
+	// Force 🍒🍒🍒 (×7): the deterministic win keeps the arithmetic below
+	// exact instead of merely plausible.
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolCherry)}}
+
+	result, err := st.Spin("guild1", "user-1", 100)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+	if result.Reels != [3]SlotSymbol{SymbolCherry, SymbolCherry, SymbolCherry} {
+		t.Fatalf("Reels = %v, want 🍒🍒🍒 — Spin must draw from s.rng", result.Reels)
+	}
+	if result.Bet != 100 || result.Payout != 700 || result.IsJackpot {
+		t.Fatalf("result = %+v, want Bet 100, Payout 700, IsJackpot false", result)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 1600 {
+		t.Fatalf("persisted Chips = %d, want 1600 (1000 - 100 bet + 700 payout) — the deduction and the credit must land in ONE transaction", account.Chips)
+	}
+}
+
+func TestStore_Spin_InsufficientChips_NoDeduction(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 50})
+	st.rng = forbiddenRand{t: t, reason: "an unaffordable bet is refused before the reels are drawn"}
+
+	_, err := st.Spin("guild1", "user-1", 100)
+	var insufficient *ErrInsufficientChips
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("Spin with a 100 bet on 50 chips = %v, want *ErrInsufficientChips", err)
+	}
+	if insufficient.Balance != 50 {
+		t.Fatalf("ErrInsufficientChips.Balance = %d, want 50 (the command layer renders it without a second round-trip)", insufficient.Balance)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 50 {
+		t.Fatalf("persisted Chips = %d, want 50 — a refused bet must never be eaten", account.Chips)
+	}
+}
+
+func TestStore_Spin_BetOutOfRange(t *testing.T) {
+	for _, bet := range []int64{-1, 0, 9, 1001} {
+		st, path := newTempStore(t)
+		st.rng = forbiddenRand{t: t, reason: "a bet outside [10,1000] is rejected before any draw"}
+
+		if _, err := st.Spin("guild1", "user-1", bet); !errors.Is(err, ErrBetOutOfRange) {
+			t.Fatalf("Spin with bet %d = %v, want ErrBetOutOfRange", bet, err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("bet %d: a rejected bet must persist nothing at all, but os.Stat(%q) = %v", bet, path, err)
+		}
+	}
+}
+
+func TestStore_Spin_BetAtRangeBoundaries_Accepted(t *testing.T) {
+	for _, bet := range []int64{10, 1000} {
+		st, _ := newTempStore(t)
+		seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 5000})
+		st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolLemon), symbolDraw(t, SymbolGrape), symbolDraw(t, SymbolBell)}}
+
+		result, err := st.Spin("guild1", "user-1", bet)
+		if err != nil {
+			t.Fatalf("Spin with the boundary bet %d returned error: %v — [10,1000] is inclusive", bet, err)
+		}
+		if result.Bet != bet {
+			t.Fatalf("result.Bet = %d, want %d", result.Bet, bet)
+		}
+	}
+}
+
+func TestStore_Spin_ChipCapExceeded_NoMutation(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: MaxChips})
+	// 🍒🍒🍒 on a 10 bet pays 70, so the post-bet balance MaxChips-10 plus 70
+	// breaks the cap and the whole transaction must roll back.
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolCherry)}}
+
+	if _, err := st.Spin("guild1", "user-1", 10); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("Spin = %v, want ErrChipCapExceeded", err)
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != MaxChips {
+		t.Fatalf("persisted Chips = %d, want %d — a capped-out win must not eat the bet either", account.Chips, MaxChips)
+	}
+}
+
+// TestStore_Spin_ConcurrentSpinsBySameUser_ConservesExactBalance is the
+// balance-conservation regression for 設計書「同時ベットによる残高競合を構造的に
+// 防ぐ」: with N goroutines betting on the same account, the final balance must
+// equal starting - N*bet + Σpayout EXACTLY. A lost update (two closures reading
+// the same pre-image) shows up here as a surplus.
+func TestStore_Spin_ConcurrentSpinsBySameUser_ConservesExactBalance(t *testing.T) {
+	dir := t.TempDir()
+	st := New(filepath.Join(dir, "casino.json"))
+	const guildID, userID = "guild1", "user1"
+	const startingChips = int64(100000)
+	const bet = int64(100)
+	const n = 50
+
+	if err := st.Update(func(d *Data) error {
+		ensureAccountLocked(ensureGuildLocked(d, guildID), userID).Chips = startingChips
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding balance: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var totalPayout int64
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := st.Spin(guildID, userID, bet)
+			if err != nil {
+				t.Errorf("Spin: %v", err)
+				return
+			}
+			mu.Lock()
+			totalPayout += result.Payout
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	snapshot, err := st.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	economy := snapshot[guildID]
+	if economy == nil || economy.Users[userID] == nil {
+		t.Fatalf("guild %q / user %q missing from persisted data: %+v", guildID, userID, snapshot)
+	}
+	finalChips := economy.Users[userID].Chips
+
+	want := startingChips - n*bet + totalPayout
+	if finalChips != want {
+		t.Fatalf("lost update detected: got Chips=%d, want %d (starting=%d - n*bet=%d + totalPayout=%d) — Store.Update's mutex is not serializing concurrent Spin calls correctly",
+			finalChips, want, startingChips, n*bet, totalPayout)
+	}
+}
+
+// TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption mirrors
+// internal/store/events_test.go's concurrent-Save regression test (proven
+// pattern in this codebase), but exercises the higher-level casino API
+// surface (ClaimDaily/Spin mixed across N different users in the same guild)
+// instead of a single raw write method.
+func TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption(t *testing.T) {
+	dir := t.TempDir()
+	st := New(filepath.Join(dir, "casino.json"))
+	const guildID = "guild1"
+	const n = 30
+	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			userID := fmt.Sprintf("user-%d", i)
+			if _, err := st.ClaimDaily(guildID, userID, now); err != nil {
+				t.Errorf("ClaimDaily(%s): %v", userID, err)
+			}
+			if _, err := st.Spin(guildID, userID, 50); err != nil {
+				t.Errorf("Spin(%s): %v", userID, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	snapshot, err := st.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	economy := snapshot[guildID]
+	if economy == nil {
+		t.Fatalf("guild %q missing from persisted data after %d concurrent goroutines: %+v", guildID, n, snapshot)
+	}
+	userCount := len(economy.Users)
+	if userCount != n {
+		t.Fatalf("expected %d distinct user accounts after %d concurrent goroutines, got %d — a lost update or file corruption dropped an account",
+			n, n, userCount)
+	}
+}

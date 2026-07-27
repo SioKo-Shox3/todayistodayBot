@@ -62,8 +62,8 @@ func Default() *Store {
 // s.mu is a plain, NON-reentrant sync.Mutex. fn therefore must NOT call any
 // method that takes the lock (Update, Snapshot, Mint, SetAnnounceChannel,
 // EnsureTodayRate, EnsureCasinoAccess, ClaimDaily, ExchangeCoinToChip,
-// ExchangeChipToCoin, ViewAccount, TopAssets, RecentRates, and every locking
-// method added by later tasks). Use the unexported *Locked helpers instead
+// ExchangeChipToCoin, Spin, ViewAccount, TopAssets, RecentRates, and every
+// locking method added by later tasks). Use the unexported *Locked helpers instead
 // (ensureGuildLocked, ensureAccountLocked, ensureTodayRateLocked,
 // topAssetsLocked, creditChipsLocked, creditCoinsLocked) — none of those take
 // the lock. fn must also not perform network I/O, Discord API calls, or
@@ -518,6 +518,39 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 		return nil
 	})
 	return result, err
+}
+
+// Spin atomically deducts bet chips, resolves the spin (via the pure `spin`,
+// using s.rng), credits any payout, and persists — all in one Update
+// ("控除→抽選→払い戻しの永続化", 設計書). Reading s.rng is safe only because
+// the draw happens inside the closure, i.e. under the store's lock:
+// *rand.Rand is not safe for concurrent use. Does NOT perform the reveal
+// animation (internal/commands/slot.go's job). Returns ErrBetOutOfRange
+// (defense in depth — the command layer's option bounds are a UX nicety, not
+// a guarantee), *ErrInsufficientChips, or ErrChipCapExceeded — in every error
+// case nothing at all is persisted, so the bet is never silently eaten.
+func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
+	if bet < 10 || bet > 1000 {
+		return SpinResult{}, ErrBetOutOfRange
+	}
+	var result SpinResult
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.Chips < bet {
+			return &ErrInsufficientChips{Balance: account.Chips}
+		}
+		account.Chips -= bet
+		result = spin(bet, s.rng)
+		if err := creditChipsLocked(account, result.Payout); err != nil {
+			return err // aborts: the deduction above is discarded with the transaction
+		}
+		return nil
+	})
+	if err != nil {
+		return SpinResult{}, err
+	}
+	return result, nil
 }
 
 // RecentRates ensures today's rate exists (same transaction) then returns
