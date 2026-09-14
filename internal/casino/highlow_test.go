@@ -118,6 +118,47 @@ func TestHighLow_GuessGrowsThePotByTheOfferedMultiplier(t *testing.T) {
 	}
 }
 
+func TestHighLow_LowGuessGrowsThePotAndAdvancesTheBoard(t *testing.T) {
+	// The mirror of the ハイ case above: remaining 3 and 9 against a 7, so
+	// ロー has one winning card in two and pays 95*2/1 = 190 (1.90x). Both
+	// directions need a fixed deck — a ロー win that advanced the board
+	// wrongly (kept the old current card, or counted the streak on the wrong
+	// side) would be invisible in a ハイ-only test.
+	game := highLowWith(1000, 1000, 0, card(7), deckOf(card(3), card(9)))
+
+	step, err := game.Guess(false)
+	if err != nil {
+		t.Fatalf("Guess returned error: %v", err)
+	}
+	if !step.Won || step.Finished {
+		t.Fatalf("step = %+v, want a win that leaves the game running", step)
+	}
+	if step.Multiplier != 190 {
+		t.Fatalf("Multiplier = %d, want 190", step.Multiplier)
+	}
+	if step.Pot != 1900 || game.Pot() != 1900 {
+		t.Fatalf("pot = %d (step) / %d (game), want 1900", step.Pot, game.Pot())
+	}
+	if step.Previous != card(7) || step.Card != card(3) {
+		t.Fatalf("step cards = %v -> %v, want 7♠ -> 3♠", step.Previous, step.Card)
+	}
+	if game.Current() != card(3) {
+		t.Fatalf("Current() = %v, want 3♠ (the drawn card becomes the current one)", game.Current())
+	}
+	if step.Streak != 1 || game.Streak() != 1 {
+		t.Fatalf("streak = %d (step) / %d (game), want 1", step.Streak, game.Streak())
+	}
+	// The next guess is measured against the 3, so the remaining 9 is high
+	// and nothing is low — ロー must now be the unselectable side.
+	odds := game.Odds()
+	if odds.Remaining != 1 || odds.HighCards != 1 || odds.LowCards != 0 {
+		t.Fatalf("odds after the win = %+v, want Remaining 1 / High 1 / Low 0", odds)
+	}
+	if odds.LowMultiplier != 0 {
+		t.Fatalf("LowMultiplier = %d, want 0 (no card can win ロー against a 3)", odds.LowMultiplier)
+	}
+}
+
 func TestHighLow_PotTruncatesDown(t *testing.T) {
 	// Every remaining card wins, so the multiplier is exactly the house cut:
 	// 1001 * 0.95 = 950.95, and the player is paid 950.
