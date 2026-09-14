@@ -709,3 +709,98 @@ func TestBlackjackDoesNotRefundAStakeItNoLongerOwns(t *testing.T) {
 		t.Errorf("escrow: got %d, want the stake (100) left for its real owner", got)
 	}
 }
+
+// --- 評価者の指摘(反復 7)-------------------------------------------------
+
+// stakeWatchingBank lets a test stop the world at the one moment ⏫ is
+// half-applied: the chips have moved into escrow and the hand has not yet
+// counted them. Nothing else can observe that gap — it lives between two
+// calls in stakeDouble.
+type stakeWatchingBank struct {
+	*flakyBank
+	onAddToEscrow func()
+}
+
+func (b *stakeWatchingBank) AddToEscrow(guildID, userID string, amount int64) error {
+	if err := b.flakyBank.AddToEscrow(guildID, userID, amount); err != nil {
+		return err
+	}
+	if b.onAddToEscrow != nil {
+		b.onAddToEscrow()
+	}
+	return nil
+}
+
+// A failed start reply must not retire a hand somebody is pressing. The order
+// below is the one that loses a raise: the double's chips are in escrow, the
+// hand has not applied them, and the start path decides the hand is dead.
+// Closing it there refunds the original bet only, and the ⏫ that paid the
+// second one finds no session to charge it to.
+func TestBlackjackDoesNotCloseAHandWhileADoubleIsBeingStaked(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a hand that may double", func(g *casino.BlackjackGame) bool {
+		return g.CanDouble()
+	})
+	c, bank := newBlackjackCommandForTest(t, seed)
+	watching := &stakeWatchingBank{flakyBank: bank}
+	c.store = watching
+
+	// What the doubled hand is worth, computed from the same shoe.
+	probe := blackjackProbe(100, seed)
+	if _, err := probe.Double(); err != nil {
+		t.Fatalf("probing the double: %v", err)
+	}
+	wantPayout := probe.Settle()
+
+	var (
+		boardSent = make(chan string, 1)
+		staked    = make(chan struct{})
+		closed    = make(chan struct{})
+		pressed   = make(chan error, 1)
+	)
+
+	watching.onAddToEscrow = func() {
+		close(staked)
+		// Give the start path every chance to close the session here. It
+		// can only take it by ignoring this board's lock; holding the lock
+		// it waits for the press, and this wait ends on the timeout.
+		select {
+		case <-closed:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	starter := &fakeCasinoResponder{respondErr: errors.New("the reply never arrived")}
+	starter.onRespond = func(resp *discordgo.InteractionResponse) {
+		_, sessionID, _, ok := ParseCustomID(blackjackButtonsOf(t, resp)[0].CustomID)
+		if !ok {
+			t.Fatal("the hand's first button does not carry a parsable custom_id")
+		}
+		boardSent <- sessionID
+		<-staked // the reply fails only once the raise is in escrow
+	}
+
+	go func() {
+		sessionID := <-boardSent
+		presser := &fakeCasinoResponder{}
+		pressed <- c.handleComponent(presser, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, blackjackActionDouble), "u1"), sessionID, blackjackActionDouble)
+	}()
+
+	err := c.handle(starter, blackjackSlashInteraction(100))
+	close(closed)
+	if err == nil {
+		t.Fatal("/blackjack reported success although the reply failed")
+	}
+	if pressErr := <-pressed; pressErr != nil {
+		t.Fatalf("⏫ ダブル: %v", pressErr)
+	}
+
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow: got %d, want 0 — the doubled hand settled, nothing stays staked", got)
+	}
+	if got, want := highLowChipsOf(t, bank), 1000-2*int64(100)+wantPayout; got != want {
+		t.Errorf("chips: got %d, want %d (1000 - ダブルで 200 + 配当 %d)", got, want, wantPayout)
+	}
+	if bank.settles != 1 {
+		t.Errorf("SettleGame was called %d times, want 1: the hand pays once and the start path refunds nothing it no longer owns", bank.settles)
+	}
+}

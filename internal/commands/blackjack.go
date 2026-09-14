@@ -375,14 +375,8 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 		},
 	}); err != nil {
 		// The hand never reached Discord, so there is nothing to press and
-		// nothing will ever settle it — but only refund if Close says the
-		// session was still ours. Discord can create the message and still
-		// fail this call, and by the time the error lands the hand may have
-		// been played out and replaced, in which case the escrow on the
-		// account belongs to the game that came after it.
-		if c.sessions.Close(session.ID) {
-			c.refundUnplayableHand(i.GuildID, userID, bet)
-		}
+		// nothing will ever settle it.
+		c.closeUndeliveredHand(session.ID, i.GuildID, userID, bet)
 		return err
 	}
 
@@ -401,6 +395,30 @@ func (c *BlackjackCommand) settleDealtHand(r interactionResponder, i *discordgo.
 	pending := &blackjackPending{GuildID: i.GuildID, UserID: resolveUserID(i), Payout: payout, Board: board}
 	lock.pending = pending
 	return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseChannelMessageWithSource)
+}
+
+// closeUndeliveredHand retires a hand whose board never reached the player,
+// and gives the stake back only when Close says the session was still ours:
+// Discord can create the message and still fail the call, so by the time the
+// error lands the hand may have been played out and replaced, in which case
+// the escrow on the account belongs to the game that came after it.
+//
+// It takes THIS BOARD'S LOCK FIRST, for the same reason every press does. ⏫
+// moves its second stake outside the manager's lock (disk I/O never runs
+// inside WithSession), so an unlocked close can land between that stake and
+// the hand that would count it: the refund would return the original bet
+// alone, the raise would sit in an escrow nothing can settle, and the press
+// would then find its session gone. Under the lock the press is over before
+// the decision — a double always finishes the hand, so the session is already
+// gone and Close reports false, and a hit leaves an escrow that is still
+// exactly the bet.
+func (c *BlackjackCommand) closeUndeliveredHand(sessionID, guildID, userID string, bet int64) {
+	lock := c.locks.acquire(sessionID)
+	defer c.locks.release(sessionID, lock)
+
+	if c.sessions.Close(sessionID) {
+		c.refundUnplayableHand(guildID, userID, bet)
+	}
 }
 
 // refundUnplayableHand returns a stake whose hand never became playable.
