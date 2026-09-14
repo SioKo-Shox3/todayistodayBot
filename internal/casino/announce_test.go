@@ -1545,6 +1545,12 @@ func TestCollectDailyAnnouncements_NoChannelKeepsTheClosedSeasonPending(t *testi
 // received. 7/31 closes nothing, but 8/1 closes July right on top of June —
 // and with LastSeason as the only slot, June's podium was overwritten and
 // never announced by any later pass.
+//
+// This covers the COLLECTION half only: it never fails a send and never
+// moves LastAnnounced. The wiring half — a real 7/31 send failure carried
+// across the boundary by startAnnounceScheduler — is
+// TestStartAnnounceScheduler_AFailedSeasonResultSurvivesTheMonthBoundary in
+// internal/commands (C3B-10).
 func TestCollectDailyAnnouncements_AMonthRolloverDoesNotDropAnUnannouncedSeason(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAnnounceGuild(t, st, "guild1", "chan1", "")

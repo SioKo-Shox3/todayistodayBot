@@ -376,3 +376,29 @@
 - **開始儀式(2026-09-14、`feat/casino-c1` = 92594d9)**: `go build ./... && go vet ./... && go test ./...` → 8 パッケージ ok。`-race` は cgo 無しで不可(既知)。Git Bash に `make` と `go` が無い — `go` は `C:/Program Files/Go/bin/go`、`make build` の代わりは `go build -o bin/todayistodaybot ./cmd/bot`。
 - `main` は .NET 時代(go.mod 無し)。`feat/casino-c1` はフェーズ A/B/C-1 を全部持ち、`main` へ ff 可能。
 - `config.json` / `DISCORD_TOKEN` は未設定(稼働時にユーザーが置く。エージェントは触らない)。
+
+## 反復 6(C3B-10) — 2026-09-15
+
+- **Done**: C3B-10。`internal/commands` 側に月末の送信失敗を配線ごと通す回帰テスト
+  `TestStartAnnounceScheduler_AFailedSeasonResultSurvivesTheMonthBoundary` を足した。
+  7/31(embed 成功・結果送信失敗)→ 8/1(7 月が 6 月の上に閉じる)→ 8/2 の 3 巡回を
+  `startAnnounceScheduler` で駆動する。ゲート 3 本とも exit=0・全 8 パッケージ ok
+  (`.harness/runs/20260915-064206/verify-C3B-10-1..3.txt`)。
+- **Next**: C3B-11(duel のゼロサムと全口座を触る経路の説明を実装に合わせる。`TASKS.md` で唯一の未完)。
+- **収集側のテストだけでは月末の失敗を押さえられない(反復 4 の所見 1)**: `internal/casino` 側の
+  `TestCollectDailyAnnouncements_AMonthRolloverDoesNotDropAnUnannouncedSeason` は
+  `collectDailyAnnouncements` を呼ぶだけなので、**送信の失敗**も、**embed の成功が `LastAnnounced` を
+  進めること**も通っていない。この 2 つが同時に効く経路 — 7/31 に embed だけ着いて `LastAnnounced` が
+  月末に進み、8/1 に `rolloverSeasonLocked` が 7 月を 6 月の上に閉じる — は配線側でしか再現できない。
+  収集側のテストにはその旨の相互参照コメントを足した(どちらが何を見ているか、次に読む人が迷わないように)。
+- **月替わりを commands 側から起こせる理由**: シーズンの切り替えは `ensureTodayRateLocked(economy, now, ...)`
+  → `rolloverSeasonLocked(economy, jstMonth(now))` で、`now` は巡回が渡す時計。`Store` の非公開 `clock` は
+  要らない(R-001 の制約に当たらない)ので、`startAnnounceScheduler` に 7/31 → 8/1 を渡すだけで境界を越える。
+- **空振りしないことを `LastSeason` で確かめる**: 「6 月の結果が送られた」だけの主張は、配線が境界を
+  一度も越えなくても通ってしまう。`SeasonStatus("g1", "observer", 8/1)` の `Last.Month == "2026-07"` を
+  足して、7 月が実際に閉じた(= `LastSeason` が上書きされた)ことを同じテストで押さえた。
+  `SeasonStatus` が開く観測用の口座は純利 0 なので `SeasonRanks` から除かれ、どの表彰台も汚さない。
+- **効き目の確認(mutation)**: `rolloverSeasonLocked` の `queueClosedSeasonLocked` の直前に
+  `economy.UnannouncedSeasons = nil`(= C3B-08 以前の「枠は 1 つ」)を入れると、このテストは
+  `8/1 delivered [], want the June result` で落ちる(`verify-C3B-10-mutation.txt`)。緑なだけでは
+  待ち行列が効いている証拠にならない。

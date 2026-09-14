@@ -453,7 +453,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 評価者(反復 2)の所見 2。C3B-08 と同じ経路を触るので、C3B-08 を先に閉じる。
 
 ## C3B-10: 月末に結果送信だけ失敗した場合の再送を回帰テストで押さえる(反復 4 の所見 1、P2)
-- status: todo
+- status: done
 - done-when: C3B-08 の done-when が名指しした経路(送信の失敗を実際に起こし、embed 成功による `LastAnnounced` 更新も通す)を掲示側のテストで再現する。7/31 の巡回で結果送信だけ失敗 → 8/1 の巡回で `LastSeason` が 7 月へ移っても 6 月の結果が送られ、成功後は再送されない。既存の送信失敗テストにケースを足す形でよい。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`

@@ -798,6 +798,88 @@ func TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass(t *testin
 	}
 }
 
+// 月末に結果送信だけ失敗しても月替わりで失われない (C3B-10, 反復 4 の所見 1).
+// C3B-08 の回帰を配線ごと通す版: internal/casino 側のテストは収集関数だけを
+// 呼ぶので、送信の失敗も、embed の成功が LastAnnounced を進めることも通って
+// いない。ここは startAnnounceScheduler を 3 日ぶん駆動して、その両方を実際に
+// 起こす。
+//
+// 7/31 は何も閉じない(6 月の結果は既に待ち行列にある)。8/1 の巡回が 7 月を
+// 6 月の上に閉じ、LastSeason は 7 月へ移る — 待ち行列が無かった頃はここで
+// 6 月の表彰台が上書きされ、どの巡回も二度と送らなかった。
+func TestStartAnnounceScheduler_AFailedSeasonResultSurvivesTheMonthBoundary(t *testing.T) {
+	store := seededCasinoStore(t, closedJuneSeasonFile)
+
+	var embeds int
+	var texts []string
+	fail := true
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { embeds++; return nil }
+	sendText := func(channelID, content string) error {
+		if fail {
+			return errors.New("discord is down")
+		}
+		texts = append(texts, content)
+		return nil
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+	}
+
+	jst := time.FixedZone("JST", 9*3600)
+	july31 := time.Date(2026, 7, 31, 10, 0, 0, 0, jst)
+	august1 := time.Date(2026, 8, 1, 10, 0, 0, 0, jst)
+	august2 := time.Date(2026, 8, 2, 10, 0, 0, 0, jst)
+
+	// 7/31: the embed lands — which is what moves LastAnnounced to the last
+	// day of the month — and only the June result fails.
+	pass(july31)
+	if embeds != 1 || len(texts) != 0 {
+		t.Fatalf("7/31: %d embeds / %d results delivered, want 1/0", embeds, len(texts))
+	}
+
+	// 8/1: the pass closes July on top of June. Sending is back, and the
+	// June result is still owed.
+	fail = false
+	pass(august1)
+	if embeds != 2 {
+		t.Fatalf("8/1: %d embeds in total, want 2 (one per day)", embeds)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "2026-06") {
+		t.Fatalf("8/1 delivered %q, want the June result", texts)
+	}
+
+	// The rollover really did run: LastSeason names July, so June survived
+	// only because the queue held it. Without this the test would pass just
+	// as happily on a wiring that never crossed the boundary at all.
+	//
+	// SeasonStatus is the read: it opens an account for the observer it is
+	// asked about, which lands on 純利 0 and is therefore excluded from every
+	// ranking — and it runs after the sends under test.
+	view, err := store.SeasonStatus("g1", "observer", august1)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+	if view.Month != "2026-08" {
+		t.Errorf("running season = %q, want the month the rollover opened", view.Month)
+	}
+	if view.Last == nil || view.Last.Month != "2026-07" {
+		t.Fatalf("LastSeason = %+v, want the July result the rollover wrote over June", view.Last)
+	}
+
+	// Delivered, so the new month's passes do not owe it again.
+	pass(august2)
+	if len(texts) != 1 {
+		t.Fatalf("8/2 posted the delivered June result again: %q", texts)
+	}
+	if embeds != 3 {
+		t.Fatalf("8/2: %d embeds in total, want 3 (one per day)", embeds)
+	}
+}
+
 // twoClosedSeasonsFile is the C3B-08 state a month boundary produces while
 // the channel is unreachable: June was never posted and July closed on top
 // of it. LastSeason holds only the newer one — the queue is what still owes
