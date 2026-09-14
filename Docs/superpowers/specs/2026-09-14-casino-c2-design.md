@@ -84,6 +84,7 @@ EscrowOpenedAt string `json:"escrow_opened_at,omitempty"` // RFC3339(JST)
 - キャッシュアウトはポットを支払う(`SettleGame(payout = pot)`)。**未プレイ(0 連勝)のキャッシュアウトは全額返金**。
   外したら `SettleGame(payout = 0)`。
 - 期待値: 1 手あたり RTP 95 %(統計テストで確認)。
+- RTP 95 % はポットが大きいときの値。倍率もポットも切り捨て(丸め損はハウス側)なので、ベット 10 台では丸めで 93〜94 %。
 
 ## 7. ブラックジャック(`/blackjack <bet>`、`internal/casino/blackjack.go`)
 

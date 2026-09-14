@@ -160,7 +160,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: C2-10 の再試行で精算が後から成功したときも同じ結果描画で編集する。
 
 ## C2-13: README の総資産式に預かりを含め、小額ベットの RTP を文書化する(non-blocking 1・3)
-- status: todo
+- status: done
 - done-when: `README.md` の総資産の説明を `コイン × レート + チップ + 預かり中のチップ` に直す(`/rank` の実装 `TopAssets` と一致)。ハイ&ローの倍率は x100 整数の切り捨てなので小額ベット(10〜20)では 1 手の RTP が 95 % を下回る(丸め損はハウス側という C-1 の規則どおり) — `highlow_test.go` に「ベット 11 で初手の全ランク・有効な方向を等確率で選んだときの期待 RTP が 93 %以上 95 %以下」を固定する期待値テストを足し、`Docs/superpowers/specs/2026-09-14-casino-c2-design.md` §6 に「RTP 95 % はポットが大きいときの値。ベット 10 台では丸めで 93〜94 %」と 1 行書く。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestHighLow" -count=1`

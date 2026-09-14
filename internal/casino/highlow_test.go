@@ -426,3 +426,85 @@ func TestHighLow_PerStepReturnIsNinetyFivePercent(t *testing.T) {
 	}
 	t.Logf("per-step RTP = %.4f over %d hands (staked %d, returned %d)", rtp, hands, staked, returned)
 }
+
+// deckMinus builds a full 52-card deck without `removed`: the exact 51-card
+// remainder a board faces once its opening card has been dealt.
+func deckMinus(removed Card) []Card {
+	cards := make([]Card, 0, 51)
+	for _, suit := range suits {
+		for rank := MinRank; rank <= MaxRank; rank++ {
+			c := Card{Rank: rank, Suit: suit}
+			if c == removed {
+				continue
+			}
+			cards = append(cards, c)
+		}
+	}
+	return cards
+}
+
+// drawnFirst reorders `cards` so that cards[i] is the next one off the deck.
+// The order of the rest carries no meaning: one guess turns over exactly one
+// card, and Odds counts the deck rather than reading it as a sequence.
+func drawnFirst(cards []Card, i int) []Card {
+	out := make([]Card, 0, len(cards))
+	out = append(out, cards[i])
+	out = append(out, cards[:i]...)
+	return append(out, cards[i+1:]...)
+}
+
+// TestHighLow_SmallBetReturnIsCutByRounding pins the OTHER end of the payout
+// contract: 95 % is what a large pot returns. Both steps of the money
+// arithmetic truncate — the multiplier (95*remaining/winning) and the grown
+// pot (pot*m/100) — and truncation always falls to the house (C-1 の切り捨て
+// 規則), so a bet of ten-odd chips gives up whole percentage points to
+// rounding. 設計書 §6 states that; this test fixes the number.
+//
+// It is an expected-value test, not a statistical one: every opening rank
+// and every legal direction is enumerated against the exact 51-card
+// remainder, each equally likely, so the result below is the true
+// expectation of one guess at bet 11 and a failure means the arithmetic
+// moved — never variance.
+func TestHighLow_SmallBetReturnIsCutByRounding(t *testing.T) {
+	const bet = int64(11)
+
+	var rankSum float64
+	for rank := MinRank; rank <= MaxRank; rank++ {
+		opening := card(rank)
+		rest := deckMinus(opening)
+
+		var directionSum float64
+		directions := 0
+		for _, high := range []bool{true, false} {
+			odds := highLowWith(bet, bet, 0, opening, deckOf(rest...)).Odds()
+			// An ace has no higher card and a two has no lower one: those
+			// buttons are disabled, so a player never faces them and they
+			// must not be averaged in as a zero-return choice.
+			if (high && odds.HighCards == 0) || (!high && odds.LowCards == 0) {
+				continue
+			}
+
+			var returned int64
+			for i := range rest {
+				game := highLowWith(bet, bet, 0, opening, deckOf(drawnFirst(rest, i)...))
+				step, err := game.Guess(high)
+				if err != nil {
+					t.Fatalf("rank %d high=%v draw %d: Guess returned error: %v", rank, high, i, err)
+				}
+				returned += step.Pot // 0 on a loss, including a tie
+			}
+			directionSum += float64(returned) / float64(int64(len(rest))*bet)
+			directions++
+		}
+		if directions == 0 {
+			t.Fatalf("rank %d offered no legal direction", rank)
+		}
+		rankSum += directionSum / float64(directions)
+	}
+
+	rtp := rankSum / float64(MaxRank-MinRank+1)
+	if rtp < 0.93 || rtp > 0.95 {
+		t.Fatalf("expected RTP at bet %d = %.4f, want 0.93..0.95 (rounding costs the player more than the 5 %% cut)", bet, rtp)
+	}
+	t.Logf("expected RTP at bet %d = %.4f over every opening rank and legal direction", bet, rtp)
+}
