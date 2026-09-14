@@ -4,6 +4,12 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-18(旧形式が残した未掲示の当選を待ち行列へ移行する = 2 周目 blocking 1)= コミット `056ad7b`。`NEXT_FINDINGS.md` の反復 1 の節(設計書 §8 の契約の矛盾)は先に処理して削除し、その文言直しは別コミット `3447f50` に分けた。
+  **穴**: `collectDailyAnnouncements` は `Unannounced` だけを読むので、C3-12 より前の形式(`unannounced` キーが無く、未掲示の当選が `LastDraw` にだけある)のファイルを読むと、その回の掲示と祝いが**誰からも上がらない**。再現は `last_announced="2026-09-13"` / `last_draw.date="2026-09-14"`(当選者あり)/ `unannounced` 無しで 9/14 10 時。
+  **直し方**: 読み取り点(`normalizeLotteryLocked`)に `migrateUnannouncedLocked` を足した。条件は「待ち行列が空」かつ「`LastDraw` が非 nil・当選者あり・`LastDraw.Date > LastAnnounced`」で、写しを 1 件だけ入れる。`LastAnnounced` はギルド側にあるので `normalizeLotteryLocked` の引数を `*Lottery` → `*GuildEconomy` に変えた(既存の表テストは `GuildEconomy{Lottery: tc.in}` に包み替えただけで、ケースも期待値も不変)。**空の待ち行列という条件そのものが冪等性**で、移行した 1 件が次の巡回で自分を止める。位置が要件 — 正規化点は `drawLotteryLocked` より**前**に走るので、その日の抽選が `LastDraw` を上書きする前に写しが取れる(`TestCollectDailyAnnouncements_MigratesBeforeTodaysDrawOverwritesLastDraw` が 2 件・古い順を固定)。
+  **掲示チャンネルが無いギルドは移行しない** — ここは既存テストに教わった点で、最初の実装はチャンネルの有無を見ずに移行し、`TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult`(掲示設定の無いギルドに古い `LastDraw` を置いて閑散日を回すテスト)を落とした。**テストの期待値ではなく条件の方を絞った**: 待ち行列は掲示を養うためだけに在り、宛先が無いギルドは `collectDailyAnnouncements` 自身が飛ばすので、書いても誰も読まない。取りこぼしでもない — 移行は読み取り点なので、後からチャンネルを設定した時点で同じ条件が成立する(`TestMigrateUnannounced_WaitsForAnAnnouncementChannel` が両方を固定)。`drawLotteryLocked` がチャンネルを見ずに追記するのは正しいまま — あちらは**起きた出来事の記録**で、こちらは**古いファイルの修復**。
+  **効き目の確認**: `migrateUnannouncedLocked` の呼び出しを外すと新テスト 3 件が落ちる(`mutation-C3-18-no-migration.txt`: job が空 / 9/13 の当選者が消えて 1 件だけ / チャンネル設定後も空)。既存テストは 1 件も期待値を変えていない。
+  検証出力: `.harness/runs/20260915-025434/verify-C3-18-{1,2,3}.txt`(build+vet exit=0 / casino ok exit=0 / `go test ./...` 8 パッケージ ok exit=0。いずれも mutation を戻したあとの最終ツリーで取り直し済み)。
 - C3-17(実装自身が作った繰り越しを上限で消さない = 2 周目 blocking 2 + non-blocking 1)= このコミット。
   **(1) 繰り越しの上限**: `drawLotteryLocked` の当選者不在の経路が賞金全額を `Carryover` に入れていたので、`Carryover` が `MaxChips` に座った状態で売上があると `prize = MaxChips + 90` が**上限を超えたまま永続化**され、次の読み取りの `normalizeLotteryLocked` がそれを `MaxChips` へ切り詰めて 90 チップが消えた(入力は全部正常範囲 — 手編集ファイルの修復ではなく、**実装が作った値を実装の正規化点が消す**形)。親の決定どおり**入り切らない分はプールへ送る**(ハウス分と同じ行き先): `overflow, prize = prize-MaxChips, MaxChips` を切り出して `creditJackpotCappedLocked(economy, house+overflow)` に合流させ、`Carryover <= MaxChips` を**書き込み時点で**保証した。正規化点のクランプは残す — ただし役割が変わったので、`normalizeLotteryLocked` のコメントに**「上限側の切り詰めが直すのはファイルが持ち込んだ値だけ。ここに自分の書いた値が届いたらそれは writer のバグ」**と書いた。
   **(2) `JackpotAccum` の正規化**(2 周目の non-blocking): `seedJackpotLocked` は負値しか直していなかったので、手編集の `math.MaxInt64` が `JackpotAccum += bet*2` を**負へ折り返し**、以後の積立が何回かプールに 1 チップも入らない。`[0, jackpotAccumScale)` へ丸めるようにした(0 代入ではなく `%=` — 端数は壊れていないので残す)。併せて `accrueJackpotLocked` の順序を変え、**加算する前に**端数を切り出すようにした(`creditJackpotCappedLocked` が内部で `seedJackpotLocked` を呼ぶので、後から `%=` すると結果が入れ子の正規化に依存する)。
@@ -124,6 +130,9 @@
 - (なし)
 
 ## Next
+- **`TASKS.md` に未完のタスクは無い**(38 件すべて done。C3-18 が最後の 1 件)。`NEXT_FINDINGS.md` も見出しだけ。先へ進むには M1 へ戻って項目を足す。
+- **次の区切りは評価者(Astra, `codex exec -m gpt-6-astra -s read-only`)の 2 周目の確認**。2 周目レビューの blocking 2 件(C3-17 / C3-18)がこれで両方落ちたので、**この差分のレビューはこれが最後**(1 差分 2 周まで)。2 周目は前回指摘への対応差分だけを見る — 見るのは `225be4c`(C3-17)・`3447f50`(設計書の文言)・`056ad7b`(C3-18)の 3 コミット。
+- **「移行は読み取り点に置く」が今回の一般則**: 古い形式のファイルが持ち込む欠落は、消費する側(掲示)ではなく**読み取り点**で埋める。消費側に置くと、その回の抽選が `LastDraw` を上書きしたあとでは手遅れになる。同時に、**修復は宛先のあるギルドだけに限る** — 誰も読まない書き込みは足さない(移行は読み取り点なので、宛先が後からできればそのとき効く)。
 - **`TASKS.md` の未完は C3-18(2 周目 blocking 1: 旧形式の未掲示結果が待ち行列へ移行されない)1 件**。`NEXT_FINDINGS.md` は見出しだけ。C3-17 と C3-18 を閉じたら 2 周目の blocking は全部落ちるので、次の区切りで評価者(Astra)の**2 周目の確認**へ回す(レビューは 1 差分 2 周までなので、これが最後)。
 - **「正規化点は切り詰めてよい/よくない」の線引きが今回の一般則**: 正規化点のクランプは**ファイルが持ち込んだ値の修復**であって、実装が作った値の後始末ではない。上限を超えうる値を**作る側**(抽選の繰り越し、上限に座った当選者への支払い)が、書き込みの時点で超過分の行き先(= プール)を決める。新しい永続フィールドを足すときは、正規化点を通すことに加えて「そのフィールドの writer は上限を超える値を作りうるか」を確かめる — 作りうるなら行き先を writer 側に書く。
 - **`TASKS.md` に未完のタスクは無い**(C3-16 が最後の 1 件)。先へ進むには M1 へ戻って項目を足す。`NEXT_FINDINGS.md` も見出しだけで、残課題は無い。次の区切りは**評価者(Astra)を通すところ** — C3-14 / C3-15 / C3-16 は 3 件とも危険地帯(資金の保存則)なので、段階が探索期でも評価は必須。
