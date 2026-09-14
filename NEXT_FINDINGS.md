@@ -3,33 +3,6 @@
 評価者(Astra, `codex exec -m gpt-6-astra -s read-only`)の `NEEDS_WORK` を落とす場所。
 処理したら該当節を消す。
 
-## 反復 2 — 評価者(codex)の判定: NEEDS_WORK
-
-対象: C3B-06 9 時掲示のシーズン欄と結果の祝い(§4 掲示)
-
-### 2. [P2] 同日中の次の巡回では結果を再送できない
-
-「送信失敗なら次の巡回でまた送られる」を満たしません。結果送信失敗時の [return nil](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/commands/casino_announce.go:272) により `LastAnnounced` が進み、次回は [日次掲示の除外条件](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce.go:85) で結果ごと除外されます。
-
-- **再現手順:** 7月10日10時に embed 成功・結果送信失敗→送信を復旧→同日11時に再起動する。起動時巡回で結果が再送されません。
-- **修正案:** 日次掲示済みでも未掲示結果だけを処理できるよう、収集・送信条件を分離する。同日再巡回で「embed 累計1件、結果1件」を検証してください。
-
-### paths 確認
-
-前回所見対応の `c79bad2` は除外しました。ただし対象コミット `2910ca0` にも、範囲外の `internal/casino/store.go` の空白整形4行が含まれます。機能への影響はありませんが、対象差分から分離が必要です。
-
-### 検証証拠・制約
-
-`verify-C3B-06-{1,2,3,4}.txt` と `recheck-C3B-06-2-{1,2,3,4}.txt` を開き、指定コマンドの終了コード0とテスト出力を確認しました。上記2件はコードから導いた再現手順で、追加実行による確認はできていません。
-
-**再実行できなかったコマンド:** 以下はすべて Go の作業ディレクトリ作成時に `Access is denied` となり、未実行扱いです。
-
-- `go build ./...`
-- `go vet ./...`
-- `go test ./internal/casino/... -count=1`
-- `go test ./internal/commands/... -count=1`
-- `go test ./... -count=1`
-
 ## 反復 3 — 評価者(codex)の判定: NEEDS_WORK
 
 対象: C3B-07 README・設計書の実測・architecture の追記案
@@ -58,3 +31,22 @@
 指定ディレクトリのC3B-07用verify 4本・recheck 3本を開き、終了コード0、全8パッケージの `ok`、実測の根拠となる5テストの成功を確認しました。対象変更は許可範囲内で、architecture展開コピー・`cmd/bot/main.go`・テストの変更はありません。
 
 **再実行できなかったコマンド:** `go build ./... && go vet ./...`、`go test ./... -count=1`。どちらも作業ディレクトリ作成時に `Access is denied` となりました。`go vet` は前段失敗で未実行です。バイナリ生成コマンドは保存済み証拠のみで確認しました。
+
+## 反復 4 — 評価者(codex)の判定: NEEDS_WORK
+
+対象: C3B-08 未掲示のシーズン結果を月替わりで失わない(所見 1、P1)
+
+### 1. [P2] 指定された月末の送信失敗を回帰テストで再現していない
+
+`done-when` の「7/31に結果送信だけ失敗→8/1に6月の結果を再送」の検証が不足しています。
+
+- [追加された月替わりテスト](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce_test.go:1548) は収集関数だけを呼びます。送信失敗を発生させず、embed成功による `LastAnnounced` 更新も通りません。
+- [送信失敗を再現する既存テスト](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/commands/casino_announce_test.go:778) は7/10→7/11で、月替わりを通りません。
+
+**最小修正:** 既存の送信失敗テストに7/31開始ケースを追加してください。8/1に `LastSeason` が7月へ更新されても6月の結果が送られ、成功後は再送されないことを確認します。
+
+### 確認できた証拠
+
+指定ディレクトリの C3B-08 用 verify 4本・recheck 4本・mutation を開きました。保存出力は指定ゲートすべて `exit=0`、全8パッケージ `ok`。変更は許可範囲内で、テストの削除・無効化はありません。待ち行列の保持・上限・移行・送信処理に、今回の確認で具体的な実装不具合は見つかりませんでした。
+
+**再実行できなかったコマンド:** `go build ./... && go vet ./...`、`go test ./... -count=1`。どちらも作業ディレクトリ作成時に `Access is denied`。`go vet` は前段失敗で未実行です。
