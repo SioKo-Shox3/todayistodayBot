@@ -4,6 +4,13 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-02(`SeasonNet` を全ゲームの決着へ配線)= コミット `0a775b6` + `292b86a`。証拠 `.harness/runs/20260915-033205/verify-C3B-02-{4,5,6}.txt`(3 本とも exit=0)。
+  **計上点は 5 つ**: `Spin`(`result.Payout - bet`)・`SettleGame`(`payout - staked`)・`BuyLotteryTickets`(`-cost`)・`drawLotteryLocked`(`+paid`)・`AcceptDuel`(C3B-01 で既出)。どれも**入金が成功したあと**に呼ぶ。`Spin` と `SettleGame` は `creditChipsLocked` が全か無かなので「入った額」と「払うはずの額」が一致するが、宝くじと duel は `creditChipsCappedLocked` なので一致しない — 上限に座った当選者は入る分しか取れず、**計上するのは `paid` であって `prize` ではない**(§2)。ここを `prize` にする変異はテストが落とす。
+  **`SettleGame` が「賭けた額」を知る唯一の手段は `Escrow`**。`clearEscrowLocked` の**前**に `staked := account.Escrow` を読む。この値は bet + ダブルの総額なので、ダブルした手は `bet` ではなく総額が引かれる — 200 賭けて 400 戻る行(`+200`)が、bet だけを引く実装で落ちる行。
+  **宝くじだけ賭けと受けが別の日に起きる**。購入は `BuyLotteryTickets` で即計上する — 券には返金経路が無く、抽選が走らなくても(bot が落ちたまま等)チップは戻らないため。預かり(`Escrow`)を持つ他のゲームと非対称なのはこの一点。結果として、単独購入者が自分の壺を当てても**ハウスの 10% だけ負けている**のが盤に出る(2 枚 100 → 当選 90 → 純利 -10)。
+  **返金は結果ではない**: `DeclineDuel` と `RefundStaleEscrows` は `SeasonNet` に触らない。掛け金は `SettleGame` を通らなかったので損として計上されておらず、返金側で足すと逆に得になる。
+  **正規化は `normalizeAccountLocked`**(`ensureAccountLocked` 経由)。`Chips`/`Coins` と違い**両端クランプ**(`[-MaxChips, MaxChips]`)で、0 で床を張らない — 負けている人の負の値が正しい読みだから。ファイルの `math.MaxInt64` は次の加算でラップし、**最下位の人が盤の首位に来る**。
+  **反証**: 変異 7 件すべてをテストが検出(計上の削除 ×3、賭け額の引き忘れ、`paid`→`prize`、購入代金の未計上、正規化の削除)。評価者 Astra は `PASS`、非 blocking の指摘 1 件(除外系テストがゼロ始まりで「既存の純利をゼロに戻す」誤実装を見逃す)を `292b86a` で解消 — `ClaimDaily` に `account.SeasonNet = 0` を挿す変異で検出を確認した。
 - C3B-01(duel の純粋ロジックと 1 トランザクションのゼロサム精算)= コミット `e6a6f8f`。C-3b の最初の 1 件。
   **`duel.go`(純粋)**: `GameDuel`(`GameKind`)・`DuelStage`(`DuelPending` / `DuelSettled`)・`DuelState{ChallengerID, OpponentID, Bet, Stage}`・`FlipDuel(rng) bool`(`rng.Intn(2) == 0`)・`DuelPayout(bet, challengerWins) (challenger, opponent int64)`(勝者 `2*bet`・敗者 0)。`DuelState` に `OpponentID` を持たせたのは**所有者検査が他の全ゲームと逆向き**だから — `Session.UserID` は挑戦者なのに、ボタンを押してよいのは受け手だけ(§4.5)。盤面にこのフィールドが無いと C3B-04 は誰も弾けない。`DuelPayout` は `bet` が `[1, MaxChips]` の外なら **(0, 0)** を返す(`AcceptDuel` が先に弾くので観測不能。`2*bet` が wrap して**負の配当**になるのを構造的に断つだけの防御)。
   **`AcceptDuel(guild, challenger, opponent, bet, challengerWins) (DuelSettlement, error)` は 1 回の `Update`**。2 回に割ると、受け手を預かってから精算するまでの間に**その預かりを解放できる盤面が存在しない**窓ができる(落ちれば起動時返金まで塩漬け、並行受諾ならその窓に滑り込んで壺を二度払う)。`challengerWins` は呼び出し側が `FlipDuel` で引いて渡す(注入。store は日次レート以外の乱数を持たない)。
@@ -145,6 +152,8 @@
 - (なし)
 
 ## Next
+- **次は C3B-03**(`TASKS.md` の未完の先頭)。C3B-02 までで `SeasonNet` は**書き込み側も読み取り点も閉じた** — 残るのはシーズンの境界(月替わりで全口座の `SeasonNet` を 0 に戻し、賞与を配る)と、それを見せるコマンド層。C3B-03 は全口座を触るので C3B-02 と同じ危険地帯。
+- **`SeasonNet` を新しい経路から動かすときの規律**(C3B-03 以降がここを踏む): (a) 計上は**入金が成功したあと**、(b) 入金が `creditChipsCappedLocked` 経由なら**戻り値**を計上する(`prize`/`payout` ではない)、(c) 掛け金を持つゲームは `Escrow` を消す**前**に読む、(d) チップを配るだけ・両替するだけの経路は触らない。`store.go` の `addSeasonNetLocked` の直前コメントが (b) の理由を持っている。
 - **次は C3B-02(`SeasonNet` を全ゲームの決着に配線する)**。`UserAccount.SeasonNet` と `addSeasonNetLocked` は C3B-01 で**既に置いてある** — C3B-02 が足すのは (a) スロット / H&L・BJ の `SettleGame` / 宝くじの各決着からの呼び出しと、(b) **読み取り点(`ensureAccountLocked` → `normalizeAccountLocked`)での `[-MaxChips, MaxChips]` 正規化**。(b) はまだ無い(C3B-01 は書き込み側だけを閉じた)。`SettleGame` は「賭けた額」を知らないので、`clearEscrowLocked` の**前に** `account.Escrow` を読んで使う(ダブル込みの総額)。
 - **C-3b の残り**: C3B-02〜C3B-07。仕様 `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`、ブランチ `feat/casino-c3b`。`--evaluate every` で回す(最後のタスクも評価させる)。これでフェーズ C が閉じる。
 - **C3B-01 は危険地帯(資金の保存則)なので、段階が探索期でも評価者(Astra, `codex exec -m gpt-6-astra -s read-only`)を通す**。C3B-02 / C3B-03 も同じ危険地帯(C3B-03 は全口座を触る)なので、**3 件まとめて 1 つの差分として**回すのが 1 差分 2 周の枠を無駄にしない。
@@ -229,6 +238,8 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **「除外」のテストは非ゼロから始める**(今回の一般則)。「この操作は X を動かさない」を 0 始まりで書くと、X を**ゼロに戻す**誤実装が素通りする(0 のまま 0 なので合格に見える)。デイリー・両替・mint が `SeasonNet` を消さないことは、`-777` を置いてから各操作を通し `-777` のままであることで初めて示せる。同じ形の主張(「触らない」「保つ」「冪等」)を書くときは、まず始点を動かす。
+- **口座の正規化点は両端を見る**。`normalizeAccountLocked` はこれまで「0 で床、上限で天井」だけだったが、`SeasonNet` は**符号付き**なので 0 で床を張ると負けている人が全員イーブンに繰り上がる。新しい永続フィールドをここへ足すときは、そのフィールドが符号付きかどうかを先に決め、床を 0 にしてよいかを確かめる。
 - **掲示済み境界 `LastAnnounced` は high-water mark**(前進のみ)。収集側も `today > LastAnnounced` で揃える — 片側だけ単調にすると、時計が巻き戻った日を毎回掲示し続ける(境界が下がらないので追いつけない)。回帰は `TestMarkAnnounced_DoesNotLetAClockRollbackRepostADraw` と `TestCollectDailyAnnouncements_StaysQuietWhileTheClockIsBehindTheMark` の 2 本で挟んである。
 - **ループの穴**: `ALL_DONE` を返す反復(一覧の最後のタスク)は `--evaluate feature` だと評価者が回らない。最後の 1 件を確実に見せたいときは `--evaluate every` で回すか、着地後に単発でレビューする(C-3a では単発レビューが blocking 2 件を拾った)。MyWorkflow 側に所見として記録済み。
 - **正規化点は「読み取り経路」ではなく「口座に触る経路」に要る(C3-16)**: C3-13 / C3-14 で「読み取り点に正規化を置く」と決めたあとも、map を直接引く経路が 2 つ残っていた。見落としの形はどちらも同じ — `ensureAccountLocked(economy, userID)` ではなく `range economy.Users` で回しているので、正規化点の存在そのものが視界に入らない。**探すときは `grep -n "economy.Users" internal/casino/store.go` を使う**(`ensureAccountLocked` の grep では見つからない)。書き込み経路には `ensureAccountLocked`、口座を作りたくない表示経路には `normalizeAccountLocked` — 表示経路に前者を使うと初回ボーナスが湧くので、2 つを使い分ける。
