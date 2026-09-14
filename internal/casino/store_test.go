@@ -3743,18 +3743,30 @@ func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
 	const guildID, userID = "guild1", "u1"
 	justBeforeNine := time.Date(2026, 7, 11, 8, 59, 59, 0, jst) // fixedNow is 12:00 on the 10th
 	today, tomorrow := time.Date(2026, 7, 11, 9, 0, 0, 0, jst), time.Date(2026, 7, 12, 9, 0, 0, 0, jst)
+	// The third case needs its own clock: a guild that has never drawn is on
+	// the "" branch of nextLotteryDrawAt, and 08:59:59 is the instant where
+	// the two clocks can disagree.
+	neverDrawnNow := time.Date(2026, 9, 14, 8, 59, 59, 0, jst)
+	neverDrawnWant := time.Date(2026, 9, 14, 9, 0, 0, 0, jst) // nextRunAt(neverDrawnNow)
 
 	tests := []struct {
 		name         string
+		now          time.Time
 		lastDrawDate string
 		want         time.Time
 	}{
 		// The bug: the 11th's 09:00 draw ran while this request was in
 		// flight, so the tickets are in the 12th's.
-		{name: "the 09:00 draw ran while the request was in flight", lastDrawDate: "2026-07-11", want: tomorrow},
+		{name: "the 09:00 draw ran while the request was in flight", now: justBeforeNine, lastDrawDate: "2026-07-11", want: tomorrow},
 		// The ordinary path, which must not move: the last draw was
 		// yesterday's, so today's 09:00 is still ahead.
-		{name: "the last draw was yesterday", lastDrawDate: "2026-07-10", want: today},
+		{name: "the last draw was yesterday", now: justBeforeNine, lastDrawDate: "2026-07-10", want: today},
+		// A guild nobody has ever bought into: DrawDate is "" and the
+		// purchase's OWN rollover stamps it — with the 13th, because at
+		// 08:59:59 the draw day has not turned over yet. Reading DrawDate
+		// after that write must still answer this morning's 09:00, not push
+		// the buyer to the 15th.
+		{name: "the guild has never drawn", now: neverDrawnNow, lastDrawDate: "", want: neverDrawnWant},
 	}
 
 	for _, tc := range tests {
@@ -3769,7 +3781,7 @@ func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
 				t.Fatalf("seeding DrawDate: %v", err)
 			}
 
-			purchase, err := st.BuyLotteryTickets(guildID, userID, 2, justBeforeNine)
+			purchase, err := st.BuyLotteryTickets(guildID, userID, 2, tc.now)
 			if err != nil {
 				t.Fatalf("BuyLotteryTickets: %v", err)
 			}
@@ -3783,7 +3795,7 @@ func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
 				t.Fatalf("purchase = %+v, want 2 tickets held and 2 sold into the open pot", purchase)
 			}
 
-			view, err := st.LotteryStatus(guildID, userID, justBeforeNine)
+			view, err := st.LotteryStatus(guildID, userID, tc.now)
 			if err != nil {
 				t.Fatalf("LotteryStatus: %v", err)
 			}

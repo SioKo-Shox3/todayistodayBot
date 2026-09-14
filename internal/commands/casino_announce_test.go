@@ -321,8 +321,9 @@ func TestLotteryAnnounceCelebration_OnlyForAnActualWinner(t *testing.T) {
 		{"nobody entered", nil, ""},
 		{"no winner named", &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "", Prize: 900}, ""},
 		// A winner already at MaxChips is credited nothing by
-		// creditChipsCappedLocked and the pot rolls forward, but the draw
-		// still named them: the ping is owed either way.
+		// creditChipsCappedLocked and the remainder goes to the jackpot pool,
+		// not to the next draw, but the draw still named them: the ping is
+		// owed either way.
 		{
 			"winner credited nothing",
 			&casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 0},
@@ -472,9 +473,10 @@ func TestStartAnnounceScheduler_CelebrationFailureStillMarksTheDayAnnounced(t *t
 
 func TestStartAnnounceScheduler_CelebratesAWinnerWhoWasCreditedNothing(t *testing.T) {
 	// The draw pays through creditChipsCappedLocked, so a winner sitting at
-	// MaxChips is recorded with Prize 0 and the pot rolls forward. The draw
-	// still named them, so the @mentioning message is still posted — the
-	// amount it prints is the 0 that was actually credited.
+	// MaxChips is recorded with Prize 0 and the unpaid prize goes to the
+	// jackpot pool, not to the next draw. The draw still named them, so the
+	// @mentioning message is still posted — the amount it prints is the 0
+	// that was actually credited.
 	store := newTestCasinoStore(t)
 	if err := store.SetAnnounceChannel("g1", "c1"); err != nil {
 		t.Fatalf("SetAnnounceChannel: %v", err)

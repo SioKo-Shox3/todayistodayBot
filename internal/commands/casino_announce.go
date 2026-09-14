@@ -131,7 +131,9 @@ func lotteryDrawDateLabel(date string) string {
 // no draw, or the draw named nobody. A named winner is always celebrated,
 // including one recorded with Prize 0 — drawLotteryLocked pays through
 // creditChipsCappedLocked, so a winner already at MaxChips keeps the win but
-// receives nothing and the pot rolls forward. Suppressing that message would
+// receives nothing — the unpaid remainder follows the house's cut into the
+// jackpot pool rather than forward to the next draw, which would hand it to
+// somebody else. Suppressing that message would
 // drop the ping for a real winner; the amount is printed as recorded, so the
 // message stays honest about what actually landed in the account.
 func lotteryAnnounceCelebration(draw *casino.LotteryDraw) string {

@@ -318,13 +318,13 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(資金の保存則)。(2) は C3-13 と同じ「正規化点を 1 つ決める」規律の口座版 — 加算側に個別ガードを足さない。閉じたら `NEXT_FINDINGS.md` の当該節の所見 2・3 を消す。
 
 ## C3-15: 未抽選の「次回抽選」テストを足し、旧挙動のコメントを消す
-- status: todo
+- status: done
 - done-when: (1) C3-09 の差し戻し(`NEXT_FINDINGS.md` の「反復 3 — C3-09」の節)を閉じる — `internal/casino/store_test.go` 3604 付近の表駆動テストに **未抽選(`lastDrawDate: ""`)** のケースを足し、`now = 2026-09-14 08:59:59 JST` で購入・status の `NextDrawAt` がどちらも同日 09:00(`nextRunAt(now)`)になることを固定する。(2) `NEXT_FINDINGS.md`「C3-07 の区切り評価」の所見 4 を閉じる — `internal/commands/casino_announce.go` 108 付近の「the pot rolls forward」という**旧挙動の説明コメント**と、`internal/casino/announce_test.go` 457 付近の同じ趣旨のコメントを現在の挙動(当選者がいた回は繰り越さない。上限で入り切らなかった分と、当選者がいない回の賞金だけが次回へ)に直す。**コメントだけを直し、テストの中身は触らない**。(3) 閉じた節を `NEXT_FINDINGS.md` から消し、paths 違反の節(反復 3 — C3-12、親の判断で処理不要)も消して、ファイルを見出しだけに戻す。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestBuyLotteryTickets|TestLotteryStatus|TestAnnounce" -count=1`
 - verify: `go test ./... -count=1`
-- paths: internal/casino/store_test.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, NEXT_FINDINGS.md
-- notes: どちらも小さい。テストの追加はケース 1 行と期待値だけで、既存の表の形を変えない。
+- paths: internal/casino/store_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, NEXT_FINDINGS.md
+- notes: 旧挙動のコメントは `internal/casino/announce_test.go` ではなく `internal/commands/casino_announce_test.go`(324・475 行)にあったので `paths:` を実態へ直した。表には `now` の列を足した — 追加ケースだけ別の日付の時計を要るため(既存 2 行の値と期待値は不変)。
 
 ## C3-16: 正規化点を通らずに口座を触る経路(`RefundStaleEscrows`)を塞ぐ
 - status: todo
