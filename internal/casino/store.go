@@ -248,13 +248,26 @@ func ensureAccountLocked(economy *GuildEconomy, userID string) *UserAccount {
 	return economy.Users[userID]
 }
 
-// creditChipsLocked adds delta to account.Chips, refusing to exceed
-// MaxChips. Caller must already hold the Store's lock. Every chip credit in
-// this package goes through here — do NOT write `account.Chips += x`
-// anywhere else. The bound is written as `Chips > MaxChips-delta` rather
-// than `Chips+delta > MaxChips` because the latter can itself wrap.
+// creditChipsLocked adds delta to account.Chips, refusing to push the
+// account's HELD chips — Chips + Escrow — past MaxChips. Caller must already
+// hold the Store's lock. Every chip credit in this package goes through here
+// — do NOT write `account.Chips += x` anywhere else (moveToEscrowLocked and
+// moveFromEscrowLocked are the two exceptions, and they move chips between
+// the account's own two fields rather than creating any).
+//
+// Escrow counts against the cap because it is chips the account still owns:
+// leaving it out let a credit fill Chips to MaxChips while a stake was in
+// flight, and the refund that followed then had nowhere to put the stake.
+// Every comparison is written in "headroom" form (subtract from MaxChips)
+// rather than as a sum, because the sums can wrap on a hand-edited file.
 func creditChipsLocked(account *UserAccount, delta int64) error {
-	if delta < 0 || account.Chips > MaxChips-delta {
+	if delta < 0 || account.Chips < 0 || account.Escrow < 0 {
+		return ErrChipCapExceeded
+	}
+	if account.Chips > MaxChips-account.Escrow {
+		return ErrChipCapExceeded // already over the cap (hand-edited file)
+	}
+	if delta > MaxChips-account.Escrow-account.Chips {
 		return ErrChipCapExceeded
 	}
 	account.Chips += delta
@@ -768,6 +781,21 @@ func moveToEscrowLocked(account *UserAccount, amount int64) error {
 	return nil
 }
 
+// moveFromEscrowLocked is the exact inverse of moveToEscrowLocked: the whole
+// escrow goes back to Chips and the escrow trio is cleared. It returns the
+// stake it moved. Like the forward move it does NOT go through
+// creditChipsLocked and cannot fail — the chips were already the account's,
+// counted against MaxChips the whole time they sat in escrow, so handing
+// them back creates no currency and can break no cap. Capping (or refusing)
+// a refund would DESTROY chips, which is exactly what the conservation law
+// above forbids. Caller must already hold the Store's lock.
+func moveFromEscrowLocked(account *UserAccount) int64 {
+	stake := account.Escrow
+	account.Chips += stake
+	clearEscrowLocked(account)
+	return stake
+}
+
 // clearEscrowLocked zeroes the whole escrow trio. The two string fields are
 // cleared alongside the amount so `Escrow == 0` and "no game in progress"
 // can never disagree — a leftover EscrowGame would make a settled account
@@ -883,11 +911,12 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 // symmetry with OpenGame and to pin the call to the same startup instant the
 // rest of the boot sequence uses; no decision here reads it.
 //
-// A hand-edited file whose Chips + Escrow already exceeds MaxChips is
-// refunded up to MaxChips and has its escrow cleared regardless. Aborting
-// instead would leave every account in every guild staked forever — none of
-// them could ever open another game — which is a far worse outcome than one
-// hand-broken balance being capped.
+// The refund moves the stake back rather than crediting it, so it never
+// fails and never truncates: an account whose Chips + Escrow already exceeds
+// MaxChips (a hand-edited file) keeps that whole sum, now all in Chips. Both
+// alternatives are worse — capping would destroy the difference, and
+// aborting would leave every account in every guild staked forever, unable
+// to open another game.
 func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 	refunded := 0
 	err := s.Update(func(d *Data) error {
@@ -900,11 +929,7 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 				if account == nil || account.Escrow <= 0 {
 					continue // hand-edited {"users":{"someone":null}}; see topAssetsLocked
 				}
-				stake := account.Escrow
-				clearEscrowLocked(account)
-				if err := creditChipsLocked(account, stake); err != nil {
-					account.Chips = MaxChips
-				}
+				moveFromEscrowLocked(account)
 				refunded++
 			}
 		}

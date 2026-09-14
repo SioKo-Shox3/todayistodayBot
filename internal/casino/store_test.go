@@ -2300,3 +2300,82 @@ func TestTotalAssets_CountEscrowAsTheUsersOwnMoney(t *testing.T) {
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, 600, 400, "highlow")
 }
+
+// --- the cap counts escrow (評価者の指摘 C2-02 P1) -------------------------
+//
+// Chips and Escrow are both the player's money, so a credit must see their
+// SUM against MaxChips. When the cap looked at Chips alone, a stake in
+// flight opened exactly as much room as it had vacated: a daily bonus or an
+// exchange could fill Chips back to MaxChips, and the refund that followed
+// then had nowhere to put the stake — chips vanished.
+
+func TestClaimDaily_WhileStaked_CannotMintChipsOverTheCap(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips})
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	// Holdings are already MaxChips (MaxChips-1000 free + 1000 staked), so
+	// the bonus has no room even though Chips alone looks 1000 short.
+	if _, err := st.ClaimDaily(escrowGuild, escrowUser); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("ClaimDaily = %v, want ErrChipCapExceeded", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips-1000, 1000, "highlow")
+
+	// And the stake still comes back whole at the next startup.
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refunded %d accounts, want 1", count)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips, 0, "")
+}
+
+func TestExchangeCoinToChip_WhileStaked_CannotMintChipsOverTheCap(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips, Coins: 10})
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	if _, err := st.ExchangeCoinToChip(escrowGuild, escrowUser, 10, fixedNow); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("ExchangeCoinToChip = %v, want ErrChipCapExceeded", err)
+	}
+	// The refusal persists nothing: the coins are not spent either.
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips-1000, 1000, "highlow")
+	if account := readAccount(t, path, escrowGuild, escrowUser); account.Coins != 10 {
+		t.Fatalf("Coins = %d, want 10 (a refused exchange must not debit)", account.Coins)
+	}
+
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refunded %d accounts, want 1", count)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips, 0, "")
+}
+
+func TestRefundStaleEscrows_HandEditedOverTheCapKeepsEveryChip(t *testing.T) {
+	st, path := newTempStore(t)
+	// Only a hand edit can reach Chips + Escrow > MaxChips now. The refund
+	// still hands back the whole stake: capping here would destroy chips,
+	// and the refund is a move between the account's own two fields, not a
+	// credit — it creates nothing the cap needs to police.
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{
+		Chips: MaxChips, Escrow: 500, EscrowGame: "blackjack", EscrowOpenedAt: "2026-09-14T12:00:00+09:00",
+	})
+
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refunded %d accounts, want 1", count)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips+500, 0, "")
+}
