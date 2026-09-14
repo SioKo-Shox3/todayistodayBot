@@ -4687,7 +4687,10 @@ func TestLottery_SeasonNetCountsWhatTheWinnerCouldActuallyTake(t *testing.T) {
 func TestSeasonNet_HandoutsAndExchangesAreExcluded(t *testing.T) {
 	st, path := newTempStore(t)
 	seedRate(t, st, "guild1", fixedNow, 100)
-	seedAccounts(t, st, "guild1", map[string]UserAccount{"u1": {Coins: 1000, Chips: 1000}})
+	// u1 starts with a 純利 already on the board, not at 0: "excluded" means
+	// LEAVES IT ALONE, and a handout that RESET the figure would pass an
+	// all-zero fixture while wiping out a month of play.
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"u1": {Coins: 1000, Chips: 1000, SeasonNet: -777}})
 	st.rng = forbiddenRand{t: t, reason: "today's rate is already seeded, so no draw may happen"}
 
 	// The welcome bonus, on an account that has never played.
@@ -4710,8 +4713,8 @@ func TestSeasonNet_HandoutsAndExchangesAreExcluded(t *testing.T) {
 	}
 
 	account := readAccount(t, path, "guild1", "u1")
-	if account.SeasonNet != 0 {
-		t.Fatalf("SeasonNet = %d, want 0 — the daily bonus, both exchanges and mint are excluded from 純利 (§3)", account.SeasonNet)
+	if account.SeasonNet != -777 {
+		t.Fatalf("SeasonNet = %d, want -777 unchanged — the daily bonus, both exchanges and mint are excluded from 純利 (§3)", account.SeasonNet)
 	}
 	if account.Chips == 1000 && account.Coins == 1000 {
 		t.Fatal("no balance moved at all — the test proved nothing about exclusion")
