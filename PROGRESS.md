@@ -31,10 +31,15 @@
 
 - 反復 4 の評価者指摘(C2-04)はコード変更なしで解消。機能条件への違反は「見つかりませんでした」で、残る 1 件は**評価依頼の比較基点**の問題(`8408e2f..HEAD` を渡したため C2-03 修正コミット `8446bbc` と進捗文書が混ざった)。正しい基点は `375c178^..375c178`。以後、評価依頼は**そのタスクのコミット 1 つの差分**を基点にし、`PROGRESS.md` / `TASKS.md` / `.harness/` は範囲検査の例外として渡す。
 
+- 反復 5 の評価者指摘(`WithSession` が `done=true` とエラーの同時返しでセッションを残す)= 064b1e7。削除は `done` だけで決める — 終了した盤面が map に残ると二度目の押下が同じ手を決済でき、`Sweep` の対象にも残る。エラーは削除後にそのまま返す。テストは契約を 2 件に分けた(`false, err` は保持 / `true, err` は削除・`Sweep` からも消える・同じ人が次のゲームを開ける)。修正前に新テストが落ちることを確認した: `.harness/runs/20260914-121315/verify-C2-06-0-finding-mutation.txt`。検証出力: 同 `verify-C2-06-0-finding-{build,test}.txt`(build+vet exit=0 / `TestSession` 11 件 PASS・exit=0)。
+
+- C2-06(`/highlow` コマンド・ボタン・表示)= 490d972。`internal/commands/highlow.go` の `HighLowCommand` は `Command` と `ComponentHandler` の両方(`RegisterComponent` の最初の利用者)。盤面は公開 embed + 3 ボタン、決着でボタン全無効化。`casino_shared.go` に `interactionResponder` / `respondVia` / `messageResponse` を足し、`respond` はそれを呼ぶだけにした。`/balance` はゲーム中だけ「ゲーム中の預かり」行を出す。検証出力: `.harness/runs/20260914-121315/verify-C2-06-{1,2,3,4,5-gofmt,6-balance}.txt`(build+vet exit=0 / 対象 22 PASS・FAIL 0 / commands ok / `go test ./...` 8 パッケージ ok / gofmt 差分なし / `/balance` 2 件 PASS)。
+
 ## In progress
 - (なし)
 
 ## Next
+- **次は C2-07**(`/blackjack` コマンド・ボタン・表示)。C2-06 と同じ骨格をなぞれる: `interactionResponder` + `respondVia`(`casino_shared.go`)、`snapshotHighLow` に相当する盤面スナップショット、`highLowButtonsOf` などのテスト補助(`highlow_test.go`。流用するなら共有ファイルへ出す)。ダブルは `CanDouble` を見てから `AddToEscrow`(C2-04 の Notes)。
 - **次は C2-06**(`/highlow` コマンド・ボタン・表示)。材料は揃った: `HighLowGame`(C2-03)・`BuildCustomID`/`RegisterComponent`/`requireSessionOwner`(C2-01)・`OpenGame`/`SettleGame`(C2-02)・`SessionManager`(C2-05、`RegisterComponent` はまだ登録者ゼロ)。順序の規律は Notes の「預け入れと Open の順序」を守る。
 - (済)~~次は C2-05~~(セッション管理と放置の自動決着)。`internal/casino` の純粋ロジック 2 つ(`HighLowGame` / `BlackjackGame`)は揃った — どちらも `AutoResolve() int64` を持つので、セッション管理はこの 1 メソッドだけを知っていればよい。`internal/commands` 側の配線は C2-06 以降。
 - (済)~~次は C2-04~~(ブラックジャックの純粋ロジック)。`cards.go` の `Deck`/`Card` はそのまま使える(`Draw` は末尾から引く。テストの `deckOf` が引く順で並べ替える)。`internal/commands` 側の配線は C2-06 以降。
@@ -45,6 +50,13 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **開始の順序は「セッション → 預け入れ」(C2-06 で確定)**: `TASKS.md` の done-when は `OpenGame → Open` と書いてあるが、C2-05 の Notes の決定(セッションが先)を採った。逆順だと 2 つ目のゲームを断るときに預けたチップを戻す経路が要る。セッションを先に開けば、`OpenGame` が断ったときは `Close` するだけで済む(チップは動いていない)。
+- **盤面が Discord に届かなかったときは即返金(C2-06)**: 応答が失敗した `/highlow` は押せるボタンが存在しないので、その預かりは二度と決着しない。`Close` + `SettleGame(payout = bet)` でその場で返す(起動時の `RefundStaleEscrows` を待たない)。
+- **`MessageRef` は応答後に埋める(C2-06)**: メッセージ ID はこの応答そのものなので `Open` の時点では知りえない。`rememberBoardMessage` が `InteractionResponse` で引き、`WithSession` の中(= ロック内)で `Ref` に書く。「`Ref` は Open 後に不変」の唯一の例外。失敗しても C2-08 の掃除人が編集できなくなるだけなのでログのみ。
+- **盤面の読み取りは必ずスナップショット越し(C2-06)**: `Get` が返すコピーの `State` は共有の盤面を指す。`snapshotHighLow` を `WithSession` の中で撮り、表示関数は全部その値型 (`highLowBoard`) だけを受ける — 描画のためにロック外でゲームを触る道を残さない。
+- **ボタン応答は `InteractionResponseUpdateMessage`(C2-06)**: 元メッセージの編集を別 API 呼び出しにしない。1 回の応答で embed とボタンを差し替えるので、「精算 → 編集」の順序が 2 つの Discord 呼び出しに割れない。
+- **`respondVia` と `interactionResponder`(C2-06)**: `respond` は `*discordgo.Session` を取るので、順序を記録する fake を挿せない。`casino_shared.go` にインターフェース版を置き、`respond` はその薄い包みにした。`respond_test.go` のソース走査(`s.InteractionRespond(` 禁止)はそのまま効く。
+- **上限の定数は commands 側にも写しがある(C2-06)**: 連勝 10 とポット 100 倍は `internal/casino` の非公開定数。結果メッセージの文言のためだけに `highLowStreakLimit` / `highLowPotCapMultiple` を commands 側に置いた(規則の所有者は casino のまま)。§6 を変えるときは 2 箇所。
 - **セッションの二重決着を止める 3 枚(C2-05)**: (1) `WithSession` が `done` を返した瞬間に両マップから消す、(2) `Sweep` が削除と期限判定を同じクリティカルセクションでやるので同じ盤面は 1 度しか返らない、(3) それでも漏れたら `SettleGame` の `ErrNoGameInProgress`。`Close` が bool を返すのも同じ理由 — 「自分が閉じた」と「既に誰かが閉じていた」を呼び出し側が区別できないと二重に払う。
 - **`WithSession` の再入禁止(危険地帯)**: `SessionManager.mu` は非再入で、`fn` の実行中ずっと握られる。`fn` からマネージャのメソッドを呼ばない・Discord も disk I/O も sleep もしない(プロセス内の全ボタン押下が待つ)。永続化(`Store.SettleGame`)は `WithSession` を**抜けてから**。`Store.Update` の同名契約と 2 つのロックが入れ子になるので、順序は常に「セッション → 抜ける → ストア」。
 - **`Get` はコピーを返す(C2-05)**: 所有者検査が `GuildID`/`UserID` を読むためだけにマネージャのロックを取らずに済ませるため。ただしコピーの `State` は**共有の盤面を指す**ので、盤面の読み書きは `WithSession` の中だけ。
