@@ -174,3 +174,62 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/commands/... -run "TestHighLow|TestBlackjack|TestSweepIdleBoards" -count=1`
 - paths: Docs/superpowers/specs/2026-09-14-casino-c2-design.md, internal/commands/highlow_test.go, internal/commands/blackjack_test.go
 - notes: 評価者の 2 点目(`casinoPayoutLine` を `casino_sessions.go` へ移す)は採らない — この関数は `highlow.go` / `blackjack.go` / `casino_sessions.go` の 3 か所から呼ばれる共有ヘルパで、`casino_shared.go` が置き場として正しい。C2-12 が `paths:` の外へ 1 関数はみ出した事実は記録として残す。
+
+# フェーズ C-3a(ジャックポット+宝くじ)
+
+仕様は `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md`(ユーザー承認済み 2026-09-14)。§ 番号はその文書。
+反復の中で設計を再検討せず、矛盾を見つけたら `blocked/<task>.md` に書いて止まる。C2 系は完了済み。
+
+## C3-01: ジャックポットのプール — 積立・7️⃣7️⃣7️⃣ で全額・種(§2)
+- status: todo
+- done-when: `internal/casino/types.go` の `GuildEconomy` に `Jackpot int64` と `JackpotAccum int64`(`json:"jackpot"` / `json:"jackpot_accum"`)を足す。`store.go` の `Spin` の `Update` の中で、①プールが 0 なら `JackpotSeed`(1,000)で初期化、②`JackpotAccum += bet*2; contrib = JackpotAccum/100; JackpotAccum %= 100; Jackpot += contrib`、③リールが 7️⃣7️⃣7️⃣ なら `payout += Jackpot; JackpotWon = Jackpot; Jackpot = JackpotSeed`、の順に行う(配当表 `slot.go` は変えない)。`SpinResult` に `JackpotWon` と `JackpotPool` を足す。レート生成(`ensureTodayRateLocked`)でもプールが 0 なら種で初期化する(掲示で 0 を見せない)。`store_test.go`: ベット 10 を 5 回で `Jackpot` が +1・`JackpotAccum` が 0、7️⃣7️⃣7️⃣(注入乱数)で `payout == bet*196 + pool` かつプールが 1,000 へ戻る、💎💎💎 ではプールが動かない、既存 JSON(フィールド無し)を読んで初回スピンで種が入る、通貨の保存則(`Chips` の増減 = 配当 − ベット、プールの増減 = 積立 − 発火)。既存の RTP 統計テストと並行テストが通る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestSpin|TestStore|TestJackpot|TestPayout" -count=1`
+- verify: `go test ./internal/casino/... -count=1`
+- paths: internal/casino/types.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/slot.go, internal/casino/slot_test.go, internal/casino/errors.go
+- notes: 危険地帯(資金の保存則)。`JackpotSeed` / `JackpotContributionPercent` は `internal/casino` の定数。`slot.go` の `IsJackpot` は 💎💎💎 / 7️⃣7️⃣7️⃣ の祝い判定のまま。
+
+## C3-02: `/slot` の結果と 7️⃣7️⃣7️⃣ の祝い・9 時掲示にジャックポットを出す(§2 表示)
+- status: todo
+- done-when: `internal/commands/slot.go` の結果メッセージに「🎰 ジャックポット: N チップ」(発火時は「🎰 JACKPOT!! +N チップ」)の 1 行を足し、7️⃣7️⃣7️⃣ の公開の祝いにプール額(獲得額)を入れる。`internal/casino/announce.go` の `AnnouncementJob` に `JackpotPool int64` を足し(ロールオーバーで種を入れた後の値)、`internal/commands/casino_announce.go` の embed に「🎰 ジャックポット」フィールドを足す。`slot_test.go` / `casino_announce_test.go`(commands 側): 文言の純粋関数テスト(発火あり/なし、掲示のフィールド)。`announce_test.go`(casino 側): `AnnouncementJob.JackpotPool` が入る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestSlot|TestAnnounce|TestBuildAnnouncement" -count=1`
+- verify: `go test ./internal/casino/... -run "TestAnnounce|TestCollect" -count=1`
+- paths: internal/commands/slot.go, internal/commands/slot_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, internal/casino/announce.go, internal/casino/announce_test.go
+- notes: 精算 → 表示の順序は変えない(表示は `SpinResult` の値を写すだけ)。
+
+## C3-03: 宝くじの永続化・購入・抽選(§3)
+- status: todo
+- done-when: `types.go` に `Lottery` / `LotteryDraw`(§3 の形。`GuildEconomy.Lottery` は値型で `json:"lottery"`)。`internal/casino/lottery.go`(純粋): `LotteryPrize(sales, carryover) (prize, house int64)`(`prize = floor(sales*90/100) + carryover`、`house = sales − floor(sales*90/100)`)、`PickLotteryWinner(tickets map[string]int, rng) string`(枚数で重み付け。決定的な順序 = userID 昇順で累積)。`store.go`: `BuyLotteryTickets(guild, user string, count int, now) (LotteryPurchase, error)`(1〜10、1 人 1 抽選 10 枚まで → `ErrLotteryLimit`、残高不足 → `ErrInsufficientChips`。`Update` 1 回)、`LotteryStatus(guild, user, now) (LotteryView, error)`(次回賞金・枚数・購入者数・自分の枚数・次の 9:00 JST・前回の結果)、日次ロールオーバー(`ensureTodayRateLocked` と同じ `Update` の内側)に `drawLotteryLocked(economy, today, rng)`: `DrawDate < today` のとき、購入者がいれば当選者に `prize` を加算・ハウス分を `Jackpot` へ・`LastDraw` 更新、いなければ `Carryover = prize`。抽選後は `Tickets`/`Sales` を空に、`DrawDate = today`。`AnnouncementJob` に `LotteryDraw`(前回結果)と次回の賞金・枚数を足す。`store_test.go` / `lottery_test.go`: 上限・残高不足・賞金とハウス分の計算・重み付き抽選が決定的・購入者 0 の繰り越し・同じ日に二度抽選しない・`EnsureTodayRate` の起動時フォールバックで抽選される・並行購入 50 本で枚数と売上が合う・保存則(`Chips` の減少 = 売上、当選者の増加 = 賞金、`Jackpot` の増加 = ハウス分)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestLottery|TestStore|TestEnsureTodayRate|TestCollect" -count=1`
+- verify: `go test ./internal/casino/... -count=1`
+- paths: internal/casino/types.go, internal/casino/errors.go, internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/announce.go, internal/casino/announce_test.go
+- notes: 危険地帯。抽選は「今日のレートが無ければ生成」と同じトランザクションで行い、掲示チャンネルの有無に依存しない(§3 取りこぼし防止)。`randSource` は `Store` の既存の `rng` を使う。
+
+## C3-04: `/lottery buy|status` コマンド(§4・§5)
+- status: todo
+- done-when: `internal/commands/lottery.go`: `/lottery buy <枚数>`(ギルド専用宣言 + 実行時ガード、`EnsureCasinoAccess` → `BuyLotteryTickets`)と `/lottery status`(`LotteryStatus`)。表示は公開。文言は §3・§5。`lottery_test.go`: `Handle()` から切り出した純粋関数(引数の検証、購入結果の文言、status の文言)、上限超過と残高不足の文言。`/help` の一覧に `/lottery` を足す(あれば)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestLottery|TestHelp" -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- paths: internal/commands/lottery.go, internal/commands/lottery_test.go, internal/commands/help.go, internal/commands/help_test.go
+- notes: サブコマンド構成は `/casino-admin` と `/exchange` の既存実装に倣う。
+
+## C3-05: 9 時掲示の宝くじフィールドと当選者の祝い(§3 掲示)
+- status: todo
+- done-when: `internal/commands/casino_announce.go` の embed に「🎟️ 宝くじ」フィールド(昨日の当選者と賞金 / 今日の賞金プールと購入枚数)を足し、`LotteryDraw` に当選者がいれば**別メッセージ**で公開の祝い(`<@id>` メンション、賞金額。スロットの大当たりと同じ流儀)を送る。送信失敗はログのみで掲示と抽選には影響しない(既存の掲示と同じ)。`casino_announce_test.go`: フィールドの文言(当選あり/なし/購入者 0 の繰り越し)、祝いメッセージが当選者のいるときだけ送られる(fake sender で記録)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement|TestStartAnnounce" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, internal/casino/announce.go, internal/casino/announce_test.go
+- notes: 祝いは掲示チャンネルへ。掲示チャンネル未設定なら祝いも送らない(結果は `/lottery status` で見える)。
+
+## C3-06: README・設計書の実測・architecture の追記案(§4・§7)
+- status: todo
+- done-when: `README.md` のコマンド一覧に `/lottery buy` / `/lottery status` と、`/slot` のジャックポットの説明を足す(公開物 — 過程を書かない)。設計書 §2・§3 の「実測」として、積立の端数の例と賞金の計算例を 1 段落ずつ書く。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3-06.md` に正本へ写す追記(レイヤー表の「宝くじ」、日次ロールオーバーで動くもの = レート生成・ジャックポットの種・宝くじの抽選、危険地帯 6 点目 = プールと賞金の保存則)を書く。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./... -count=1`
+- verify: `go build -o bin/todayistodaybot ./cmd/bot`
+- paths: README.md, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md, blocked/C3-06.md
+- notes: `cmd/bot/main.go` は C-3a で変更しない(§7)。変更が要ると分かったら `blocked/C3-06.md` に理由を書いて止まる。

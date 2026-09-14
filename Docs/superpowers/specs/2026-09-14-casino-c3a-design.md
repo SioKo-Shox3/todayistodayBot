@@ -1,0 +1,95 @@
+# フェーズC-3a設計: ジャックポット+宝くじ
+
+**状態: ユーザー承認済み(2026-09-14)。** 承認された判断 — (1) C-3 は C-3a(ジャックポット+宝くじ)→ C-3b(/duel+シーズン制)に分ける、
+(2) ジャックポットはスロットのベット 2 % を積み立て、7️⃣7️⃣7️⃣ で全額、(3) 宝くじは毎日 9 時抽選・1 枚 50 チップ・売上の 90 % を 1 人へ
+(ハウス 10 % はジャックポットのプールへ)。C-1(`2026-07-10-casino-c1-design.md`)・C-2(`2026-09-14-casino-c2-design.md`)の規則は
+そのまま引き継ぐ(通貨は `int64` 切り捨て、ギルドごと独立、単一ライター、永続化 → 表示の順)。ループ(`TASKS.md` の C3 系)は
+この文書を仕様として読み、反復の中で設計を再検討しない。
+
+## 1. 目的と範囲
+
+「育つのが見える」プール(ジャックポット)と、デイリーループに乗る宝くじで、9 時掲示を「見に来る理由」にする。
+
+| 入るもの | 入らないもの(C-3b 以降) |
+|---|---|
+| ギルドごとのジャックポットプール(スロットの積立・7️⃣7️⃣7️⃣ で全額・掲示と結果に表示) | /duel(PvP)、シーズン制リーダーボード |
+| `/lottery buy <枚数>` / `/lottery status`、9 時の抽選と当選者の祝い | 数字選択式・等級制の宝くじ |
+| 起動時・初回アクセス時の「抽選の取りこぼし防止」(レートと同じフォールバック) | H&L / BJ の負け分の積立 |
+
+## 2. ジャックポット(`internal/casino/slot.go` + `store.go`)
+
+- データ: `GuildEconomy` に `Jackpot int64`(プール。`omitempty` は使わず 0 と種を区別する — 下記)、`JackpotAccum int64`(積立の端数、1/100 チップ単位)。
+  **種(seed)は 1,000 チップ**: プールが 0 のギルドは、最初のスピンかレート生成のときに `JackpotSeed` で初期化する(既存データにも効く)。
+- 積立: 毎スピンで `JackpotAccum += bet × 2`(1/100 チップ単位 = ベットの 2 %)。`contrib = JackpotAccum / 100; JackpotAccum %= 100`、
+  `Jackpot += contrib`。小額ベット(10〜49)でも端数が積み上がって取りこぼさない。積立はハウスの取り分から出る(配当表は変えない。
+  プレイヤーの控除はベット額のまま)。
+- 発火: リールが **7️⃣7️⃣7️⃣** のとき、通常配当(196 倍)に加えて **プール全額**を支払い、プールを種(1,000)に戻す。💎💎💎 は従来どおり
+  配当と祝いのみ(プールは動かない)。積立 → 抽選 → 配当(プール込み)→ 保存 は `Spin` の `Update` 1 回の中(既存の順序と同じ)。
+- 表示: `/slot` の結果に「🎰 ジャックポット: N チップ」を 1 行(発火時は「🎰 JACKPOT!! +N チップ」)。7️⃣7️⃣7️⃣ の公開の祝いにプール額を入れる。
+  9 時掲示の embed に「🎰 ジャックポット: N チップ」のフィールドを足す。
+- `SpinResult` に `JackpotWon int64`(0 なら未発火)と `JackpotPool int64`(スピン後の残高)を足す。
+
+## 3. 宝くじ(`internal/casino/lottery.go` + `store.go`)
+
+- データ: `GuildEconomy.Lottery`:
+  ```go
+  type Lottery struct {
+      DrawDate  string           `json:"draw_date"`  // 最後に抽選した JST 日付("" = 未抽選)
+      Tickets   map[string]int   `json:"tickets"`    // 次回抽選ぶんの購入枚数(userID → 枚数)
+      Sales     int64            `json:"sales"`      // 次回抽選ぶんの売上(チップ)
+      Carryover int64            `json:"carryover"`  // 前回、誰も買わなかったときの繰り越し
+      LastDraw  *LotteryDraw     `json:"last_draw,omitempty"`
+  }
+  type LotteryDraw struct { Date string; WinnerID string; Prize int64; TicketsSold int; Buyers int }
+  ```
+- 購入: `/lottery buy <枚数>`(1〜10)。**1 枚 50 チップ**、**1 人 1 抽選あたり 10 枚まで**(累計)。`Chips -= 50 × 枚数; Tickets[user] += 枚数; Sales += 50 × 枚数`
+  を `Update` 1 回で。残高不足・上限超過は C-1 の文言に揃える(「❌ チップが足りません(現在: N枚)」「❌ 1 回の抽選で買えるのは 10 枚までです(あと N 枚)」)。
+- 抽選(毎日 9:00 JST): 賞金 `prize = floor(Sales × 90 / 100) + Carryover`、ハウス分 `Sales − floor(Sales × 90 / 100)` は**ジャックポットのプールへ**。
+  当選者は枚数で重み付けした 1 人(乱数源は注入可能。既存の `randSource`)。`Chips += prize`。購入者が 0 なら抽選せず `Carryover = prize`(= 前回の繰り越しのまま)。
+  抽選後 `Tickets` / `Sales` を空にし、`DrawDate = today`、`LastDraw` を更新。
+- **取りこぼし防止**: 抽選は「今日のレートが無ければ生成する」と同じ場所(日次ロールオーバー、`ensureTodayRateLocked` と同じ `Update` の内側)で
+  `DrawDate < today` のときに行う。9 時に Bot が落ちていても、起動時・初回アクセス時に抽選される。掲示チャンネル未設定なら掲示だけスキップし、
+  結果は `LastDraw` に残る(`/lottery status` で見える)。
+- 掲示: 9 時の embed に「🎟️ 宝くじ: 昨日の当選 <@id> +N チップ / 今日の賞金プール N チップ(購入 N 枚)」のフィールド。当選者がいれば
+  **別メッセージで公開の祝い**(スロットの大当たりと同じ流儀、@メンション)。
+- `/lottery status`: 次回抽選の賞金(= `floor(Sales×0.9) + Carryover`)、売れた枚数と購入者数、自分の枚数、次回抽選時刻(次の 9:00 JST)、前回の結果。
+
+## 4. コマンドと表示
+
+| コマンド | 内容 | 表示 |
+|---|---|---|
+| `/lottery buy <枚数>` | 宝くじを買う(1〜10 枚、1 人 10 枚/抽選) | 公開 |
+| `/lottery status` | 次回の賞金・売上・自分の枚数・前回の結果 | 公開 |
+
+- `/slot` と 9 時掲示にジャックポットの行を足す。`/help` と README の一覧に `/lottery` を足す。
+
+## 5. エラーハンドリング
+
+- ギルド外: 「❌ サーバー内で使用してください」/ 残高不足・上限超過: §3 の文言 / 枚数が 1〜10 の外: 「❌ 枚数は1〜10です」。
+- 通信エラーのログは秘匿ヘルパーを通す。
+
+## 6. テスト方針
+
+- ジャックポット: 積立の端数(ベット 10 を 5 回で 1 チップ)、7️⃣7️⃣7️⃣ でプール全額 + 196 倍・プールが種へ戻る、💎💎💎 は動かない、
+  既存データ(プール無し)の初期化、既存の RTP 統計テストは配当表不変で通る。
+- 宝くじ: 上限(10 枚)・残高不足・賞金の計算(90 %・ハウス分がプールへ)・重み付き抽選(注入乱数で決定的)・購入者 0 の繰り越し・
+  同じ日に二度抽選しない・起動時フォールバックで抽選される・並行購入で枚数と売上が合う。
+- 掲示: embed のフィールドと祝いメッセージの純粋関数テスト。コマンドは `Handle()` から切り出した純粋関数のテスト。
+
+## 7. アーキテクチャ
+
+```
+internal/casino/types.go       Jackpot / JackpotAccum / Lottery / LotteryDraw
+internal/casino/slot.go        変更なし(配当表)。積立と発火は store.Spin の中
+internal/casino/lottery.go     賞金計算・重み付き抽選(純粋)
+internal/casino/store.go       Spin の積立/発火、BuyLotteryTickets、LotteryStatus、日次ロールオーバーでの抽選
+internal/commands/lottery.go   /lottery buy|status
+internal/commands/slot.go / casino_announce.go   ジャックポット行・宝くじフィールド・当選の祝い
+```
+
+`cmd/bot/main.go` は**変更しない**(抽選は既存の日次ロールオーバーと 9 時掲示の経路に乗る)。
+
+## 8. 危険地帯
+
+- `Spin` と日次ロールオーバー(`Update` の内側で複数の口座とプールを動かす)— 資金の保存則: プールへの積立と賞金の支払い以外で通貨が湧かない。
+  別文脈の評価者を通す(`--evaluate feature`)。
