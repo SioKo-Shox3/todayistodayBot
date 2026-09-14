@@ -39,13 +39,50 @@ type Data map[string]*GuildEconomy
 // omitempty that erased a genuine 0 would be indistinguishable from a pool
 // that had just been won and reset (also JackpotSeed, never 0).
 type GuildEconomy struct {
-	AnnounceChannelID string                  `json:"announce_channel_id"`
-	Rates             []DailyRate             `json:"rates"`          // oldest..newest, capped at 30 entries
-	LastAnnounced     string                  `json:"last_announced"` // JST calendar date "2026-07-10"
-	Jackpot           int64                   `json:"jackpot"`        // slot jackpot pool in chips; >= JackpotSeed once seeded
-	JackpotAccum      int64                   `json:"jackpot_accum"`  // carry of the 2% accrual, in 1/100 chips; always [0, 100)
-	Lottery           Lottery                 `json:"lottery"`        // the daily 9:00 JST draw's pot (設計書 C-3a §3)
-	Users             map[string]*UserAccount `json:"users"`
+	AnnounceChannelID string      `json:"announce_channel_id"`
+	Rates             []DailyRate `json:"rates"`          // oldest..newest, capped at 30 entries
+	LastAnnounced     string      `json:"last_announced"` // JST calendar date "2026-07-10"
+	Jackpot           int64       `json:"jackpot"`        // slot jackpot pool in chips; >= JackpotSeed once seeded
+	JackpotAccum      int64       `json:"jackpot_accum"`  // carry of the 2% accrual, in 1/100 chips; always [0, 100)
+	Lottery           Lottery     `json:"lottery"`        // the daily 9:00 JST draw's pot (設計書 C-3a §3)
+	// SeasonMonth is the JST month "2006-01" the running season belongs to;
+	// "" means no season has been opened in this guild yet, which is exactly
+	// what a pre-C-3b data/casino.json unmarshals to. It is NOT omitempty for
+	// the same reason the jackpot pair is not: the zero value carries the
+	// meaning "never started", and the rollover treats it specially (open the
+	// month without paying a prize — there was nothing to rank).
+	SeasonMonth string `json:"season_month"`
+	// LastSeason is the single most recently CLOSED season, kept so /season
+	// and the 9am posting can show last month's winners. Only one is retained
+	// — the file is a live state snapshot, not a history — and omitempty plus
+	// the nil zero is what makes a pre-C-3b file read back as "nothing closed
+	// yet" rather than as an empty result with a blank month.
+	LastSeason *SeasonResult           `json:"last_season,omitempty"`
+	Users      map[string]*UserAccount `json:"users"`
+}
+
+// SeasonResult is one closed month: who finished on the podium and how many
+// accounts were actually in the running.
+//
+// Players counts every account whose 純利 was non-zero, NOT len(Ranks): the
+// podium is capped at three, so the two numbers differ in any guild where
+// more than three people played, and 「N 人が参加」 is the one of the two that
+// answers that question.
+type SeasonResult struct {
+	Month   string       `json:"month"` // the JST month that closed, "2006-01"
+	Ranks   []SeasonRank `json:"ranks,omitempty"`
+	Players int          `json:"players"`
+}
+
+// SeasonRank is one podium row. Bonus is what the account was ACTUALLY
+// CREDITED, not what SeasonBonus offers: a winner already sitting at
+// MaxChips takes only the chips that fit and the rest is dropped (設計書
+// C-3b §2), so rendering the table value would promise chips the balance
+// never received — the same rule LotteryDraw.Prize follows.
+type SeasonRank struct {
+	UserID string `json:"user_id"`
+	Net    int64  `json:"net"`
+	Bonus  int64  `json:"bonus"`
 }
 
 // Lottery is one guild's daily-draw state: the pot being sold into right

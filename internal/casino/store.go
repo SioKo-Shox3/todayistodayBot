@@ -216,6 +216,13 @@ func (s *Store) nowLocked() time.Time {
 // yields 一昨日 or 今日 in JST terms, breaking /daily streaks.
 func jstYesterday(t time.Time) string { return t.In(jst).AddDate(0, 0, -1).Format("2006-01-02") }
 
+// jstMonth formats t's JST calendar month as "2006-01", the key the monthly
+// season is identified by. The layout is chosen so that string order is
+// calendar order — the same property jstDate relies on — which is what lets
+// rolloverSeasonLocked decide "has the month moved FORWARD" with a plain <
+// rather than by parsing two months back into time.Time.
+func jstMonth(t time.Time) string { return t.In(jst).Format("2006-01") }
+
 // ensureGuildLocked returns d's entry for guildID, creating an empty one if
 // absent. Also repairs a nil Users map and a nil *GuildEconomy value (which
 // a hand-edited or partially-written file can contain as `{"g": null}`).
@@ -431,6 +438,14 @@ func ensureTodayRateIndexLocked(economy *GuildEconomy, now time.Time, rng randSo
 	// JST and whether or not the guild has an announcement channel configured.
 	// Hanging it off the scheduler instead would silently skip the draw for a
 	// guild that never set a channel, and lose a day entirely after a restart.
+	// Close the month BEFORE the lottery draw, not after. The switch zeroes
+	// every account's SeasonNet, and drawLotteryLocked CREDITS SeasonNet to
+	// the winner it names — so the other order would silently erase the
+	// 純利 of the one draw that shares a call with a month boundary, on the
+	// 1st of every month. Running first instead books that payout into the
+	// month that has just opened, which is a defensible reading (the chips
+	// land in the new month) and, unlike the erasure, is not a loss.
+	rolloverSeasonLocked(economy, jstMonth(now))
 	drawLotteryLocked(economy, lotteryDrawDate(now), rng)
 	// Drop unusable today records rather than appending after them, so the
 	// history never ends up holding two entries for the same date, and so the
@@ -1145,6 +1160,100 @@ func addSeasonNetLocked(account *UserAccount, delta int64) {
 		net = -MaxChips
 	}
 	account.SeasonNet = net
+}
+
+// rolloverSeasonLocked closes the running season when the JST month has
+// moved on, and opens `month` (設計書 C-3b §4). It is called from
+// ensureTodayRateIndexLocked, i.e. from inside every caller's own Update, so
+// the prizes, the zeroed 純利 and the new SeasonMonth are committed by a
+// single write — a crash cannot leave a guild that has paid out last month's
+// podium and still thinks it is last month, which on the next command would
+// pay the same three people again.
+//
+// Hanging it off the daily rollover rather than off the 9am scheduler is
+// what makes it unmissable: every command reaches it, so a bot that was down
+// through the whole of the 1st still switches on the first command after it
+// comes back, and a guild that never configured an announcement channel
+// switches at all. The boundary is midnight rather than 09:00 for the same
+// reason the rate's is — 「月初の 0 時から新シーズン」 is the rule a player
+// can predict.
+//
+// The comparison is `SeasonMonth < month`, FORWARD ONLY, the discipline
+// C3-19 settled for LastAnnounced and drawLotteryLocked's DrawDate: a clock
+// that moves backwards (an NTP correction, a hand-set host clock, a host
+// whose zone data is fixed at boot) must not be able to close a month that
+// has already paid out. With a `!=` the sequence Oct→Sep→Oct closes the
+// season three times and mints three sets of prizes, and the second of those
+// closes a September whose 純利 was zeroed by the first — i.e. pays the
+// podium to whoever happened to play in the gap. Months are "2006-01", so
+// string order is calendar order.
+//
+// An unopened guild (SeasonMonth "" — every guild in a pre-C-3b
+// data/casino.json) only OPENS the month: there is no previous season to
+// rank, and paying out here would hand prizes for 純利 accumulated before
+// any season existed.
+//
+// Caller must already hold the Store's lock.
+func rolloverSeasonLocked(economy *GuildEconomy, month string) {
+	if month == "" || economy.SeasonMonth >= month {
+		return
+	}
+	if economy.SeasonMonth == "" {
+		economy.SeasonMonth = month
+		return
+	}
+	// Normalise BEFORE ranking, not after: the Net values are copied straight
+	// into the persisted SeasonResult, and this loop reads the map directly
+	// rather than through ensureAccountLocked, so a hand-edited 純利 of
+	// math.MaxInt64 would otherwise be written back into the file as the
+	// podium's record of the month. normalizeAccountLocked rather than
+	// ensureAccountLocked, and nil skipped rather than repaired, for
+	// topAssetsLocked's reason — opening an account here would mint the
+	// welcome bonus for someone who never played.
+	for _, account := range economy.Users {
+		if account == nil {
+			continue
+		}
+		normalizeAccountLocked(account)
+	}
+	ranks := SeasonRanks(economy.Users, len(economy.Users))
+	// Players is counted from the FULL ranking, before the podium truncates
+	// it: 「何人が遊んだか」 is not 「表彰台は何人か」, and the podium caps at
+	// three (types.go).
+	players := len(ranks)
+	if len(ranks) > seasonRankLimit {
+		ranks = ranks[:seasonRankLimit]
+	}
+	for i := range ranks {
+		account := economy.Users[ranks[i].UserID]
+		if account == nil {
+			continue // unreachable: SeasonRanks skips nil entries
+		}
+		// The prize is capped, not refused, and Bonus records what actually
+		// landed (設計書 C-3b §2). A winner already at MaxChips takes only what
+		// fits and the remainder is DESTROYED rather than sent to the jackpot
+		// pool the way a lottery overflow is: the lottery's prize was somebody
+		// else's chips and has to go somewhere, while this one was minted a
+		// line ago and never existed until it was credited.
+		//
+		// The credit deliberately does NOT go through addSeasonNetLocked: §3
+		// excludes the season's own prize from 純利, so that winning a month
+		// cannot, by itself, win the next one. The zeroing below would hide a
+		// mistake here — which is why the exclusion is stated rather than left
+		// to that accident.
+		ranks[i].Bonus = creditChipsCappedLocked(account, SeasonBonus(i+1))
+	}
+	economy.LastSeason = &SeasonResult{Month: economy.SeasonMonth, Ranks: ranks, Players: players}
+	// Zero EVERY account, not just the ones that ranked: a new season starts
+	// from a clean board for everybody, and leaving a non-ranked account's
+	// 純利 behind would carry last month's losses into this month's ranking.
+	for _, account := range economy.Users {
+		if account == nil {
+			continue
+		}
+		account.SeasonNet = 0
+	}
+	economy.SeasonMonth = month
 }
 
 // DuelSettlement is what AcceptDuel left behind — everything

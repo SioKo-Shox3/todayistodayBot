@@ -4776,3 +4776,399 @@ func TestSeasonNet_HandEditedExtremesAreNormalisedAtTheReadPoint(t *testing.T) {
 		})
 	}
 }
+
+// --- 月次シーズンの切り替え (設計書 C-3b §4) ---------------------------------
+
+const seasonGuild = "season-guild"
+
+// The two instants every season test crosses: the last day of July and the
+// first half-hour of August. The pair is chosen on purpose — the switch is a
+// MIDNIGHT boundary, not the 09:00 one the lottery and the announcement use,
+// so a rollover wired to 09:00 instead would still be sitting in July at
+// 00:30 on the 1st.
+var (
+	seasonJuly   = time.Date(2026, 7, 31, 12, 0, 0, 0, jst)
+	seasonAugust = time.Date(2026, 8, 1, 0, 30, 0, 0, jst)
+)
+
+// openSeason runs the rollover once so the guild's season is OPEN at
+// seasonJuly, and asserts that this first pass paid nobody: an unstarted
+// guild has no previous month to rank.
+func openSeason(t *testing.T, st *Store, path string) {
+	t.Helper()
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonJuly); err != nil {
+		t.Fatalf("EnsureTodayRate (opening the season) returned error: %v", err)
+	}
+	economy := readGuild(t, path, seasonGuild)
+	if economy.SeasonMonth != "2026-07" {
+		t.Fatalf("SeasonMonth = %q after the first pass, want %q", economy.SeasonMonth, "2026-07")
+	}
+	if economy.LastSeason != nil {
+		t.Fatalf("LastSeason = %+v after merely OPENING the first season, want nil", economy.LastSeason)
+	}
+}
+
+// assertSeason checks the whole closed-season record at once: which month
+// closed, how many players it counted, and the exact podium including the
+// bonus each row was actually credited.
+func assertSeason(t *testing.T, path, wantMonth string, wantPlayers int, wantRanks []SeasonRank) {
+	t.Helper()
+	last := readGuild(t, path, seasonGuild).LastSeason
+	if last == nil {
+		t.Fatalf("LastSeason = nil, want the closed season %q", wantMonth)
+	}
+	if last.Month != wantMonth {
+		t.Fatalf("LastSeason.Month = %q, want %q", last.Month, wantMonth)
+	}
+	if last.Players != wantPlayers {
+		t.Fatalf("LastSeason.Players = %d, want %d: %+v", last.Players, wantPlayers, last.Ranks)
+	}
+	if len(last.Ranks) != len(wantRanks) {
+		t.Fatalf("len(LastSeason.Ranks) = %d, want %d: %+v", len(last.Ranks), len(wantRanks), last.Ranks)
+	}
+	for i := range wantRanks {
+		if last.Ranks[i] != wantRanks[i] {
+			t.Fatalf("LastSeason.Ranks[%d] = %+v, want %+v (full: %+v)", i, last.Ranks[i], wantRanks[i], last.Ranks)
+		}
+	}
+}
+
+// assertChips reads the balances back through a fresh Store and checks every
+// one named.
+func assertChips(t *testing.T, path string, want map[string]int64) {
+	t.Helper()
+	for userID, wantChips := range want {
+		if got := readAccount(t, path, seasonGuild, userID).Chips; got != wantChips {
+			t.Fatalf("%s Chips = %d, want %d", userID, got, wantChips)
+		}
+	}
+}
+
+// The whole switch in one pass: the podium is paid in rank order, the tie is
+// broken on UserID, the 純利 0 account is neither ranked nor counted, and
+// EVERY account — ranked, unranked, idle — comes out of the boundary at 0.
+//
+// The last of those is the one that is easy to get wrong by only zeroing the
+// rows the ranking returned: last month's losses would then be carried into
+// this month's board, and a player who ended July at -300 would need to win
+// 300 chips in August just to reach even.
+func TestStore_SeasonRollover_ClosesMonthPaysPodiumAndZeroesEveryAccount(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+		// "second" and "third" are tied on 純利; the podium order between them
+		// is decided by UserID ascending, and 5,000 vs 2,500 chips rides on it.
+		"second": {Chips: 1_000, SeasonNet: 500},
+		"third":  {Chips: 1_000, SeasonNet: 500},
+		"fourth": {Chips: 1_000, SeasonNet: 100},
+		"loser":  {Chips: 1_000, SeasonNet: -300},
+		"idle":   {Chips: 1_000, SeasonNet: 0},
+	})
+	openSeason(t, st, path)
+
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 5, []SeasonRank{
+		{UserID: "winner", Net: 1_000, Bonus: 10_000},
+		{UserID: "second", Net: 500, Bonus: 5_000},
+		{UserID: "third", Net: 500, Bonus: 2_500},
+	})
+	assertChips(t, path, map[string]int64{
+		"winner": 11_000, "second": 6_000, "third": 3_500,
+		// Off the podium: 4th place and the loser are ranked but unpaid, and
+		// the idle account is not even counted.
+		"fourth": 1_000, "loser": 1_000, "idle": 1_000,
+	})
+	economy := readGuild(t, path, seasonGuild)
+	if economy.SeasonMonth != "2026-08" {
+		t.Fatalf("SeasonMonth = %q after the switch, want %q", economy.SeasonMonth, "2026-08")
+	}
+	for userID, account := range economy.Users {
+		if account.SeasonNet != 0 {
+			t.Fatalf("%s SeasonNet = %d after the switch, want 0 for every account", userID, account.SeasonNet)
+		}
+	}
+}
+
+// A month closes ONCE. Every command in the guild reaches the rollover, so
+// the second, third and hundredth pass of the same month must find nothing
+// to do — a switch keyed on "is LastSeason older than today" rather than on
+// SeasonMonth would mint a fresh podium on every single command.
+func TestStore_SeasonRollover_SecondPassInTheSameMonth_DoesNothing(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+	})
+	openSeason(t, st, path)
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	// Somebody plays in the new month, then the day turns over again — still
+	// August, so still the same season.
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 11_000, SeasonNet: 777},
+	})
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust.AddDate(0, 0, 1)); err != nil {
+		t.Fatalf("EnsureTodayRate (next day, same month) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "winner", Net: 1_000, Bonus: 10_000}})
+	assertChips(t, path, map[string]int64{"winner": 11_000})
+	assertSeasonNet(t, path, seasonGuild, "winner", 777)
+}
+
+// The clock going BACKWARDS must not re-close a month that has already paid
+// out — the discipline C3-19 settled for the announcement boundary and
+// drawLotteryLocked's DrawDate. An NTP correction or a hand-set host clock
+// makes August -> July -> August, and a != comparison mints the podium
+// twice: on the way back it closes an AUGUST whose 純利 belongs to whoever
+// happened to play in between.
+func TestStore_SeasonRollover_ClockGoingBackwards_DoesNotCloseAgain(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+	})
+	openSeason(t, st, path)
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+	// A non-zero 純利 in the new month is what a wrongly-closing rewind would
+	// pay a second prize for. Starting from 0 here would let the bug through:
+	// the ranking would be empty and only SeasonMonth would move.
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 11_000, SeasonNet: 999},
+	})
+
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonJuly); err != nil {
+		t.Fatalf("EnsureTodayRate (clock rewound to July) returned error: %v", err)
+	}
+
+	economy := readGuild(t, path, seasonGuild)
+	if economy.SeasonMonth != "2026-08" {
+		t.Fatalf("SeasonMonth = %q after the rewind, want it to stay at %q", economy.SeasonMonth, "2026-08")
+	}
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "winner", Net: 1_000, Bonus: 10_000}})
+	assertChips(t, path, map[string]int64{"winner": 11_000})
+	assertSeasonNet(t, path, seasonGuild, "winner", 999)
+}
+
+// A bot that was down through the whole of August comes back in September:
+// the season that closes is the one that was RUNNING (July), not the month
+// in between, and it closes exactly once.
+func TestStore_SeasonRollover_SkippedMonth_ClosesTheRunningSeasonOnce(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+	})
+	openSeason(t, st, path)
+
+	september := time.Date(2026, 9, 3, 12, 0, 0, 0, jst)
+	if _, err := st.EnsureTodayRate(seasonGuild, september); err != nil {
+		t.Fatalf("EnsureTodayRate (jumping to September) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "winner", Net: 1_000, Bonus: 10_000}})
+	assertChips(t, path, map[string]int64{"winner": 11_000})
+	if got := readGuild(t, path, seasonGuild).SeasonMonth; got != "2026-09" {
+		t.Fatalf("SeasonMonth = %q, want %q", got, "2026-09")
+	}
+}
+
+// An unstarted guild (SeasonMonth "" — every guild in a pre-C-3b file) only
+// OPENS the month. Paying here would hand prizes for 純利 accumulated before
+// any season existed, and the running total is NOT zeroed either: the month
+// it belongs to is the one just opened.
+func TestStore_SeasonRollover_UnstartedGuild_OpensWithoutPayingOrZeroing(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"veteran": {Chips: 1_000, SeasonNet: 5_000},
+	})
+
+	openSeason(t, st, path) // asserts LastSeason stays nil
+
+	assertChips(t, path, map[string]int64{"veteran": 1_000})
+	assertSeasonNet(t, path, seasonGuild, "veteran", 5_000)
+}
+
+// The prize obeys MaxChips like every other payout, and SeasonRank.Bonus
+// records what LANDED rather than what the table offers (設計書 C-3b §2) —
+// otherwise the season table would announce chips the winner's balance never
+// received. Escrow counts against the headroom because it is chips the
+// account still owns.
+func TestStore_SeasonRollover_BonusCappedAtMaxChips_RecordsWhatLanded(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"a-partly-full": {Chips: MaxChips - 3_000, SeasonNet: 1_000}, // 10,000 offered, 3,000 fits
+		"b-at-the-cap":  {Chips: MaxChips, SeasonNet: 500},           // 5,000 offered, nothing fits
+		"c-escrowed":    {Chips: MaxChips - 5_000, Escrow: 4_000, SeasonNet: 100},
+	})
+	openSeason(t, st, path)
+
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 3, []SeasonRank{
+		{UserID: "a-partly-full", Net: 1_000, Bonus: 3_000},
+		{UserID: "b-at-the-cap", Net: 500, Bonus: 0},
+		// 2,500 offered; headroom is MaxChips - 4,000 escrowed - (MaxChips
+		// - 5,000) = 1,000.
+		{UserID: "c-escrowed", Net: 100, Bonus: 1_000},
+	})
+	assertChips(t, path, map[string]int64{
+		"a-partly-full": MaxChips,
+		"b-at-the-cap":  MaxChips,
+		"c-escrowed":    MaxChips - 4_000,
+	})
+}
+
+// A hand-edited {"users":{"someone":null}} reaches the rollover's loops the
+// same way it reaches topAssetsLocked's: ensureAccountLocked repairs only the
+// ONE user a write path touches. A nil dereference here panics inside a
+// discordgo handler goroutine (no recover), killing the bot and leaving the
+// bad file on disk — a permanent crash loop on the 1st of the month.
+func TestStore_SeasonRollover_NilAccountDoesNotPanic(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"real": {Chips: 1_000, SeasonNet: 400},
+	})
+	openSeason(t, st, path)
+	if err := st.Update(func(d *Data) error {
+		ensureGuildLocked(d, seasonGuild).Users["ghost"] = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the null account: %v", err)
+	}
+
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "real", Net: 400, Bonus: 10_000}})
+	assertChips(t, path, map[string]int64{"real": 11_000})
+}
+
+// A 純利 outside the cap can only come from a hand edit or a partial write,
+// and it is copied STRAIGHT into the persisted SeasonResult — so without a
+// normalisation pass before the ranking, math.MaxInt64 would be written back
+// into the file as that month's record.
+func TestStore_SeasonRollover_HandEditedNetIsClampedBeforeItIsRecorded(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"inflated": {Chips: 1_000, SeasonNet: math.MaxInt64},
+		"deflated": {Chips: 1_000, SeasonNet: math.MinInt64},
+	})
+	openSeason(t, st, path)
+
+	if _, err := st.EnsureTodayRate(seasonGuild, seasonAugust); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 2, []SeasonRank{
+		{UserID: "inflated", Net: MaxChips, Bonus: 10_000},
+		{UserID: "deflated", Net: -MaxChips, Bonus: 5_000},
+	})
+}
+
+// A data/casino.json written before C-3b has no "season_month" key at all.
+// It must read back as an UNSTARTED guild — the month opens, nothing is paid,
+// no balance moves — rather than as a season whose month is "" closing into
+// one that is not.
+func TestStore_SeasonRollover_PreC3bFile_OpensCurrentMonthAndPaysNothing(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate is already in the file, so no draw may happen"}
+	writeHandEditedFile(t, path, fmt.Sprintf(
+		`{"guild1":{"rates":[{"date":%q,"rate":100,"trend":"flat","event":"none"}],`+
+			`"users":{"user-a":{"chips":100,"coins":1}}}}`,
+		jstDate(fixedNow)))
+
+	if _, err := st.EnsureTodayRate("guild1", fixedNow); err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if economy.SeasonMonth != jstMonth(fixedNow) {
+		t.Fatalf("SeasonMonth = %q, want the current month %q", economy.SeasonMonth, jstMonth(fixedNow))
+	}
+	if economy.LastSeason != nil {
+		t.Fatalf("LastSeason = %+v on a file that never had a season, want nil", economy.LastSeason)
+	}
+	account := readAccount(t, path, "guild1", "user-a")
+	if account.Chips != 100 || account.Coins != 1 || account.SeasonNet != 0 {
+		t.Fatalf("user-a = %+v, want the file's balances untouched and SeasonNet 0", account)
+	}
+	// LastSeason is omitempty: a guild that has closed nothing must not start
+	// writing an empty result into every file.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the data file: %v", err)
+	}
+	if strings.Contains(string(raw), "last_season") {
+		t.Fatalf("data file carries a last_season key with nothing closed: %s", raw)
+	}
+}
+
+// The boundary is MIDNIGHT JST and it is computed in JST regardless of the
+// host's zone. A rollover that read the host clock's own month would switch a
+// day early or a day late on any machine west of Japan, which on the 1st is
+// the difference between paying the podium and not.
+func TestStore_SeasonRollover_MonthBoundaryIsJSTMidnight(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+	})
+	openSeason(t, st, path)
+
+	// 2026-08-01 00:00:00 JST is 2026-07-31 15:00 UTC: still July everywhere
+	// west of Japan, but a new season here.
+	midnight := time.Date(2026, 8, 1, 0, 0, 0, 0, jst).UTC()
+	if got := jstMonth(midnight); got != "2026-08" {
+		t.Fatalf("jstMonth(%s) = %q, want %q", midnight, got, "2026-08")
+	}
+	if _, err := st.EnsureTodayRate(seasonGuild, midnight); err != nil {
+		t.Fatalf("EnsureTodayRate at the boundary returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "winner", Net: 1_000, Bonus: 10_000}})
+	if got := readGuild(t, path, seasonGuild).SeasonMonth; got != "2026-08" {
+		t.Fatalf("SeasonMonth = %q, want %q", got, "2026-08")
+	}
+}
+
+// The season switch runs BEFORE the lottery draw inside the same rollover.
+// Both live in ensureTodayRateIndexLocked, the switch zeroes every SeasonNet
+// and the draw CREDITS one — so the other order silently erases the 純利 of
+// whichever draw shares a call with a month boundary, i.e. one draw every
+// month, forever. Running first books that payout into the month that has
+// just opened, which is a reading the player can see on the board.
+func TestStore_SeasonRollover_RunsBeforeTheLotteryDraw(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"buyer": {Chips: 1_000, SeasonNet: -100},
+	})
+	openSeason(t, st, path) // also stamps the lottery's DrawDate at 2026-07-31
+
+	// One ticket holder waiting for the next draw.
+	if err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, seasonGuild)
+		economy.Lottery.Tickets = map[string]int{"buyer": 1}
+		economy.Lottery.Sales = 1_000
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the lottery pot: %v", err)
+	}
+
+	// 2026-08-01 after 09:00 JST: the season closes and the draw for that day
+	// runs, in one transaction.
+	if _, err := st.EnsureTodayRate(seasonGuild, time.Date(2026, 8, 1, 12, 0, 0, 0, jst)); err != nil {
+		t.Fatalf("EnsureTodayRate (crossing into August) returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "buyer", Net: -100, Bonus: 10_000}})
+	prize, _ := LotteryPrize(1_000, 0)
+	assertSeasonNet(t, path, seasonGuild, "buyer", prize)
+	assertChips(t, path, map[string]int64{"buyer": 1_000 + 10_000 + prize})
+}
