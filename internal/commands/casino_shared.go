@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/SioKo-Shox3/todayistodayBot/internal/casino" // required by rateRankCommentary/marketCommentary below
 	"github.com/bwmarrin/discordgo"
@@ -222,4 +224,110 @@ func messageResponse(content string) *discordgo.InteractionResponse {
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: content},
 	}
+}
+
+// --- one board at a time (per-board serialization) --------------------------
+//
+// casino.SessionManager's lock guards EVERY board, so it must never be held
+// across a Discord call (危険地帯). That leaves a window a button game cannot
+// live with: two presses on the SAME board can apply their moves in order and
+// then answer Discord out of order, repainting a finished hand with a playable
+// one. boardLocks closes it with one lock PER BOARD, held from the move all
+// the way through the reply. Boards are independent, so a slow reply on one
+// never blocks another.
+//
+// The same lock is where a board parks a settlement it still owes. When
+// casino.Store.SettleGame refuses the payout (a chip cap, a write failure) the
+// session is already gone, and without a record the stake would sit in escrow
+// until the next restart and every later press would answer "この盤面はもう
+// 終了しています". pending keeps the computed payout so the next press retries
+// the PAYMENT ONLY — the hand is never replayed.
+
+// casinoActionSettle is the action of the 🔁 button a board grows while it
+// owes a settlement. It takes no game action, so the handler routes it — like
+// every other press on such a board — straight into the retry.
+const casinoActionSettle = "settle"
+
+// casinoSettleFailedMessage is what the board says while the chips have not
+// landed. The 🔁 button under it is the retry.
+const casinoSettleFailedMessage = "❌ 精算に失敗しました。もう一度お試しください。"
+
+// boardLocks is the process-wide registry of per-board locks. The zero value
+// is usable, so a command can hold one as a plain field.
+type boardLocks struct {
+	mu    sync.Mutex
+	locks map[string]*boardLock
+}
+
+// boardLock is one board's turnstile plus the settlement it still owes.
+// pending is read and written only by the goroutine holding mu.
+type boardLock struct {
+	mu      sync.Mutex
+	waiting int
+	pending any
+}
+
+// acquire returns the board's lock, ALREADY HELD. Every caller must pair it
+// with release(id, lock), normally via defer.
+func (b *boardLocks) acquire(id string) *boardLock {
+	b.mu.Lock()
+	if b.locks == nil {
+		b.locks = make(map[string]*boardLock)
+	}
+	lock, ok := b.locks[id]
+	if !ok {
+		lock = &boardLock{}
+		b.locks[id] = lock
+	}
+	lock.waiting++
+	b.mu.Unlock()
+
+	lock.mu.Lock()
+	return lock
+}
+
+// release hands the board on and forgets it once nobody else wants it AND it
+// owes nothing: an unpaid settlement is the retry, so its record outlives the
+// press that created it.
+//
+// b.mu is taken while lock.mu is still held (that is what makes reading
+// pending safe here). acquire takes them the other way round but RELEASES b.mu
+// before it blocks on lock.mu, so the two orders cannot deadlock.
+func (b *boardLocks) release(id string, lock *boardLock) {
+	b.mu.Lock()
+	lock.waiting--
+	if lock.waiting == 0 && lock.pending == nil {
+		delete(b.locks, id)
+	}
+	b.mu.Unlock()
+
+	lock.mu.Unlock()
+}
+
+// settleRetryButtons is the one live button a board keeps while it owes a
+// settlement — the only way back to the chips once the session is gone.
+func settleRetryButtons(game, sessionID string) []discordgo.MessageComponent {
+	return []discordgo.MessageComponent{
+		discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+			discordgo.Button{
+				Label:    "🔁 精算をやり直す",
+				Style:    discordgo.DangerButton,
+				CustomID: BuildCustomID(game, sessionID, casinoActionSettle),
+			},
+		}},
+	}
+}
+
+// casinoBank is the casino.Store surface the two button games use. Taking it
+// as an interface is the same seam as interactionResponder: a settlement that
+// the Store REFUSES (a chip cap, a write that failed) is a state the games
+// must handle, and it cannot be reached from the outside by playing the
+// economy — the payouts that would breach a cap are not the ones a fixed deck
+// deals. *casino.Store satisfies it; only the tests supply anything else.
+type casinoBank interface {
+	EnsureCasinoAccess(guildID, userID string, now time.Time) error
+	OpenGame(guildID, userID, game string, bet int64, now time.Time) error
+	AddToEscrow(guildID, userID string, amount int64) error
+	SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error)
+	ViewAccount(guildID, userID string, now time.Time) (casino.AccountView, error)
 }

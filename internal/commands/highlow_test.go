@@ -754,3 +754,206 @@ func TestHighLowComponentRejectsAnUnknownAction(t *testing.T) {
 		t.Error("an unknown action closed the board")
 	}
 }
+
+// --- 評価者の指摘(反復 6)-------------------------------------------------
+
+// flakyBank is a real store that can be told to refuse SettleGame, and that
+// counts the settlements it was asked for. Refusing is not reachable from the
+// outside — a fixed deck deals no payout big enough to breach the chip cap —
+// but "the payout is decided and the chips did not move" is exactly the state
+// the retry exists for.
+type flakyBank struct {
+	*casino.Store
+	settleErr error
+	settles   int
+}
+
+func (b *flakyBank) SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error) {
+	b.settles++
+	if b.settleErr != nil {
+		return casino.SettleResult{}, b.settleErr
+	}
+	return b.Store.SettleGame(guildID, userID, payout)
+}
+
+// newHighLowCommandOnBank is newHighLowCommandForTest with a store the test
+// can make fail.
+func newHighLowCommandOnBank(t *testing.T) (*HighLowCommand, *flakyBank) {
+	t.Helper()
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	return &HighLowCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(time.Now, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.HighLowGame { return casino.NewHighLow(bet, zeroRng{}) },
+	}, bank
+}
+
+// highLowEscrowOf reports what the account has staked right now.
+func highLowEscrowOf(t *testing.T, bank *flakyBank) int64 {
+	t.Helper()
+	view, err := bank.ViewAccount("g1", "u1", time.Now())
+	if err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+	return view.Account.Escrow
+}
+
+func highLowChipsOf(t *testing.T, bank *flakyBank) int64 {
+	t.Helper()
+	view, err := bank.ViewAccount("g1", "u1", time.Now())
+	if err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+	return view.Account.Chips
+}
+
+// A refused payout must leave something to press. The board is gone from the
+// manager, so without a record the stake would sit in escrow until the next
+// restart and every later press would answer the ⌛ "already finished" line.
+func TestHighLowRetriesOnlyTheSettlementAfterARefusedPayout(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+	before := highLowChipsOf(t, bank)
+
+	bank.settleErr = errors.New("the store refused this payout")
+	resp := c.press(t, r, sessionID, highLowActionCashOut)
+
+	if resp.Data.Content != casinoSettleFailedMessage {
+		t.Errorf("a refused payout says %q, want %q", resp.Data.Content, casinoSettleFailedMessage)
+	}
+	retry := highLowRetryButtonOf(t, resp)
+	if _, _, action, ok := ParseCustomID(retry.CustomID); !ok || action != casinoActionSettle {
+		t.Fatalf("the button under a refused payout is %q, want the %q action", retry.CustomID, casinoActionSettle)
+	}
+	if retry.Disabled {
+		t.Error("the retry button is disabled, so the stake can never be recovered")
+	}
+	if got := highLowEscrowOf(t, bank); got != 100 {
+		t.Errorf("escrow after a refused payout: got %d, want the stake (100) still held", got)
+	}
+
+	// The press that follows pays the SAME payout: the board is not replayed.
+	bank.settleErr = nil
+	resp = c.press(t, r, sessionID, casinoActionSettle)
+	if bank.settles != 2 {
+		t.Errorf("SettleGame was called %d times, want 2 (one refusal, one retry)", bank.settles)
+	}
+	if got, want := highLowChipsOf(t, bank), before+100; got != want {
+		t.Errorf("chips after the retry: got %d, want the stake back (%d)", got, want)
+	}
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow after the retry: got %d, want 0", got)
+	}
+	if body := highLowBodyOf(t, resp); !strings.Contains(body, "配当: 100枚") {
+		t.Errorf("the retry's result does not report the payout: %q", body)
+	}
+	for _, button := range highLowButtonsOf(t, resp) {
+		if !button.Disabled {
+			t.Errorf("button %q is still live after the board was paid", button.Label)
+		}
+	}
+}
+
+// highLowRetryButtonOf pulls the single 🔁 button off a refused settlement.
+func highLowRetryButtonOf(t *testing.T, resp *discordgo.InteractionResponse) discordgo.Button {
+	t.Helper()
+	if resp.Data == nil || len(resp.Data.Components) != 1 {
+		t.Fatal("the refusal carries no component row")
+	}
+	row, ok := resp.Data.Components[0].(discordgo.ActionsRow)
+	if !ok || len(row.Components) != 1 {
+		t.Fatalf("the refusal carries %T, want one row holding one button", resp.Data.Components[0])
+	}
+	button, ok := row.Components[0].(discordgo.Button)
+	if !ok {
+		t.Fatalf("the refusal's component is %T, want discordgo.Button", row.Components[0])
+	}
+	return button
+}
+
+// Discord can create the message and still fail this call. By the time the
+// error arrives the board may have been played, settled and replaced by the
+// next game — whose stake is what sits in escrow now. Refunding then would
+// pay the new game's chips out for the old game's bet.
+func TestHighLowDoesNotRefundAStakeItNoLongerOwns(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{respondErr: errors.New("the reply never arrived")}
+	r.onRespond = func(resp *discordgo.InteractionResponse) {
+		// Stand in for "somebody settled this board while the reply was in
+		// flight": the session is no longer ours to close.
+		if _, sessionID, _, ok := ParseCustomID(highLowButtonsOf(t, resp)[0].CustomID); ok {
+			c.sessions.Close(sessionID)
+		}
+	}
+
+	if err := c.handle(r, highLowSlashInteraction(100)); err == nil {
+		t.Fatal("/highlow reported success although the reply failed")
+	}
+	if bank.settles != 0 {
+		t.Errorf("SettleGame was called %d times, want 0: the escrow belongs to whoever closed the session", bank.settles)
+	}
+	if got := highLowEscrowOf(t, bank); got != 100 {
+		t.Errorf("escrow: got %d, want the stake (100) left for its real owner", got)
+	}
+}
+
+// Two presses on one board must not interleave their replies: a reply that
+// overtakes a later one repaints a finished board as a playable one.
+func TestHighLowSerializesThePressesOfOneBoard(t *testing.T) {
+	c, _ := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+
+	second := make(chan struct{})
+	presses := 0
+	r.onRespond = func(*discordgo.InteractionResponse) {
+		presses++
+		if presses != 1 { // onRespond was hung on AFTER the board itself went out
+			return
+		}
+		go func() {
+			defer close(second)
+			_ = c.handleComponent(&fakeHighLowResponder{}, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, highLowActionCashOut), "u1"), sessionID, highLowActionCashOut)
+		}()
+		select {
+		case <-second:
+			t.Error("a second press ran the board while the first press was still replying")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	c.press(t, r, sessionID, highLowActionHigh)
+	<-second // the second press may only finish once the first has let go
+}
+
+// 完了条件の順序: EnsureCasinoAccess → Store.OpenGame → DefaultSessions().Open.
+// The persisted half of "one game per person" is the half that survives a
+// restart, so it takes the stake first — and a board that cannot be opened
+// after that gives it straight back.
+func TestHighLowStakesBeforeTheBoardAndRefundsWhenTheBoardCannotOpen(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	before := highLowChipsOf(t, bank)
+
+	// A board this user already has: sessions.Open will refuse the new one.
+	if _, err := c.sessions.Open("g1", "u1", casino.GameHighLow, casino.NewHighLow(10, zeroRng{}), casino.MessageRef{}); err != nil {
+		t.Fatalf("seeding a live board: %v", err)
+	}
+
+	if err := c.handle(r, highLowSlashInteraction(100)); err != nil {
+		t.Fatalf("/highlow: %v", err)
+	}
+	if got, want := r.last(t).Data.Content, highLowInProgressMessage; got != want {
+		t.Errorf("refusal: got %q, want %q", got, want)
+	}
+	if bank.settles != 1 {
+		t.Fatalf("SettleGame was called %d times, want 1: the stake moved before the board was opened and must come back", bank.settles)
+	}
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow after the refusal: got %d, want 0", got)
+	}
+	if got := highLowChipsOf(t, bank); got != before {
+		t.Errorf("chips after the refusal: got %d, want %d", got, before)
+	}
+}

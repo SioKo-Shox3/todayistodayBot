@@ -53,7 +53,6 @@ const (
 	highLowChoiceBlockedMessage = "❌ その選択肢は残りの山では当たりません"
 	highLowStartFailedMessage   = "❌ ハイ&ローの開始に失敗しました。"
 	highLowActionFailedMessage  = "❌ 操作に失敗しました。"
-	highLowSettleFailedMessage  = "❌ 精算に失敗しました。もう一度お試しください。"
 )
 
 // errHighLowBadState means the session is carrying something that is not a
@@ -70,11 +69,14 @@ var errHighLowUnknownAction = errors.New("commands: unknown high&low action")
 // carries. One value serves as both Command and ComponentHandler: the slash
 // command opens the session, the buttons drive it.
 type HighLowCommand struct {
-	store    *casino.Store
+	store    casinoBank
 	sessions *casino.SessionManager
 	// newGame is the deal, injected so tests can hand the board a fixed deck
 	// instead of chasing a seed.
 	newGame func(bet int64) *casino.HighLowGame
+	// locks serializes the presses on ONE board (and parks the settlement a
+	// finished board still owes). The zero value is ready to use.
+	locks boardLocks
 }
 
 // newHighLowGame is the production deal: one *rand.Rand per game, never the
@@ -329,18 +331,21 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		return respondVia(r, i.Interaction, messageResponse("❌ カジノの初期化に失敗しました。"))
 	}
 
+	// Stake BEFORE the board (C2-06 の完了条件: EnsureCasinoAccess → OpenGame
+	// → Open). Store.OpenGame is the PERSISTED half of "one game per person",
+	// and it is the half that survives a restart, so it is the one that must
+	// refuse a second bet. The in-memory manager can then only fail on an
+	// exhausted crypto/rand, and that failure refunds.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), bet, now); err != nil {
+		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
+	}
+
 	game := c.newGame(bet)
 	board := snapshotHighLow(game) // safe without the lock: nobody can reach this board until Open publishes its ID
 
-	// Session BEFORE escrow (設計書 §5 / C2-05 の決定): refusing a second game
-	// after the chips moved would need a refund path, while closing a session
-	// that never got its stake costs nothing.
 	session, err := c.sessions.Open(i.GuildID, userID, casino.GameHighLow, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
-	}
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), bet, now); err != nil {
-		c.sessions.Close(session.ID) // no chips moved yet: nothing to refund
+		c.refundUnplayableBoard(i.GuildID, userID, bet) // the chips already moved: hand them straight back
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -354,15 +359,30 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		// The board never reached Discord, so there is nothing to press and
 		// nothing will ever settle it: give the stake back now instead of
 		// leaving the account stuck "in a game" until the next restart.
-		c.sessions.Close(session.ID)
-		if _, refundErr := c.store.SettleGame(i.GuildID, userID, bet); refundErr != nil {
-			slog.Error("casino: refunding an undelivered high&low board failed", "error", redactInteractionError(refundErr))
+		//
+		// ONLY if Close says the session was still ours. Discord can create
+		// the message and still fail this call, and the board can then be
+		// played and settled while the error is in flight — at which point
+		// the escrow on the account belongs to whatever game came next, and
+		// refunding "our" bet would pay it out of somebody else's stake.
+		if c.sessions.Close(session.ID) {
+			c.refundUnplayableBoard(i.GuildID, userID, bet)
 		}
 		return err
 	}
 
 	c.rememberBoardMessage(r, i.Interaction, session.ID)
 	return nil
+}
+
+// refundUnplayableBoard returns a stake whose board never became playable.
+// Failing only means the chips stay in escrow until the next restart returns
+// them (RefundStaleEscrows), so it is logged rather than shown to the player,
+// who already has a refusal in front of them.
+func (c *HighLowCommand) refundUnplayableBoard(guildID, userID string, bet int64) {
+	if _, err := c.store.SettleGame(guildID, userID, bet); err != nil {
+		slog.Error("casino: refunding an undelivered high&low board failed", "error", redactInteractionError(err))
+	}
 }
 
 // rememberBoardMessage fills in the session's MessageRef once Discord has
@@ -393,6 +413,21 @@ func (c *HighLowCommand) HandleComponent(s *discordgo.Session, i *discordgo.Inte
 }
 
 func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.InteractionCreate, sessionID, action string) error {
+	// One press at a time on THIS board, from the move to the reply. Without
+	// it two presses can apply in order and answer out of order, and the
+	// slower answer repaints a finished board as a playable one.
+	lock := c.locks.acquire(sessionID)
+	defer c.locks.release(sessionID, lock)
+
+	// Chips the board already owes outrank any new press: the hand is over,
+	// only the payment is missing, so every button on it retries the payment.
+	if pending, owed := lock.pending.(*highLowPending); owed {
+		if msg := requireSessionOwner(i, pending.UserID); msg != "" {
+			return respondVia(r, i.Interaction, ephemeralResponse(msg))
+		}
+		return c.settle(r, i, sessionID, lock, pending)
+	}
+
 	session, ok := c.sessions.Get(sessionID)
 	if !ok {
 		return respondVia(r, i.Interaction, ephemeralResponse(highLowSessionOverMessage))
@@ -448,32 +483,67 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		})
 	}
 
-	// Settle FIRST, edit second: the chips are the part that must survive a
-	// crash, and the session is already gone (WithSession removed it), so a
-	// failed edit cannot be retried into a second payout.
-	settled, err := c.store.SettleGame(session.GuildID, session.UserID, payout)
+	// The board is gone from the manager, so what it owes now lives here.
+	// Recording it BEFORE the store call is the whole point: a refused
+	// payout must leave something for the next press to retry.
+	pending := &highLowPending{
+		GuildID: session.GuildID, UserID: session.UserID, Payout: payout, Board: board,
+		Result: highLowResult{
+			Ending:  highLowEndingOf(step, guessed, board),
+			Guessed: guessed, GuessHigh: action == highLowActionHigh,
+			Previous: step.Previous, Drawn: step.Card,
+			Bet: board.Bet, Streak: board.Streak,
+		},
+	}
+	lock.pending = pending
+	return c.settle(r, i, sessionID, lock, pending)
+}
+
+// highLowPending is a finished board's unpaid settlement: everything needed
+// to pay it and to draw the closing message, minus the two numbers only
+// Store.SettleGame can supply (Payout and Balance).
+type highLowPending struct {
+	GuildID string
+	UserID  string
+	Payout  int64
+	Board   highLowBoard
+	Result  highLowResult
+}
+
+// settle persists the payout and shows the result, in that order: the chips
+// are the part that must survive a crash, and a failed edit must never be
+// retried into a second payout.
+//
+// It is the only writer of lock.pending — cleared the moment the chips land,
+// kept (under a 🔁 button) when they do not. The caller holds lock.
+func (c *HighLowCommand) settle(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, lock *boardLock, pending *highLowPending) error {
+	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, pending.Payout)
 	if err != nil {
 		slog.Error("casino: SettleGame failed for high&low", "error", redactInteractionError(err))
-		return respondVia(r, i.Interaction, ephemeralResponse(highLowSettleFailedMessage))
+		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds:     []*discordgo.MessageEmbed{highLowResultEmbed(pending.Result)},
+				Content:    casinoSettleFailedMessage,
+				Components: settleRetryButtons(string(casino.GameHighLow), sessionID),
+			},
+		})
 	}
+	lock.pending = nil
 
-	result := highLowResult{
-		Ending:  highLowEndingOf(step, guessed, board),
-		Guessed: guessed, GuessHigh: action == highLowActionHigh,
-		Previous: step.Previous, Drawn: step.Card,
-		Bet: board.Bet, Payout: settled.Payout, Streak: board.Streak, Balance: settled.Chips,
-	}
+	result := pending.Result
+	result.Payout, result.Balance = settled.Payout, settled.Chips
 	if err := respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
 			Embeds:     []*discordgo.MessageEmbed{highLowResultEmbed(result)},
-			Components: highLowButtons(sessionID, board, true),
+			Components: highLowButtons(sessionID, pending.Board, true),
 		},
 	}); err != nil {
 		return err
 	}
 
-	if celebration := highLowCelebration(session.UserID, result); celebration != "" {
+	if celebration := highLowCelebration(pending.UserID, result); celebration != "" {
 		if _, sendErr := r.ChannelMessageSend(i.ChannelID, celebration); sendErr != nil {
 			slog.Error("discord: ChannelMessageSend failed for a high&low celebration", "error", redactInteractionError(sendErr))
 		}
