@@ -280,3 +280,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build ./... && go vet ./...`
 - paths: Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: C3-08 の `paths:` の外だったので切り出した。README には該当の文言は無い(`grep 昨日の当選` は設計書と PROGRESS.md だけに当たる)。
+
+## C3-11: ジャックポットのプールに上限を敷き、桁あふれを構造的に不可能にする(C3-07 の差し戻し)
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の 2 節(「C3-07 の区切り評価」と「反復 1 — 評価者の判定」。同じ 1 件)を閉じる。親の決定(2026-09-14): 口座の `MaxChips`(1e12)と同じ規約をプールにも敷く。(1) `internal/casino/types.go` に `MaxJackpot int64 = MaxChips` を足し、同ファイルの桁あふれ余裕の説明(126 行付近)にプールの行を加える。(2) `seedJackpotLocked` を正規化点にする — 既存の「`< JackpotSeed` なら引き上げ」「`JackpotAccum < 0` なら 0」に加えて **`> MaxJackpot` なら `MaxJackpot` へ切り下げ**(手編集・破損ファイルの値をここで必ず正常範囲に入れる)。(3) プールへの加算は `creditJackpotCappedLocked(economy, amount) int64`(実際に入った額を返す)を通し、ハウス分・上限超過の賞金・スロットの積立の 3 経路すべてを差し替える。入り切らない分は**捨てる** — `creditChipsCappedLocked` が `MaxChips` で超過分を捨てるのと同じ契約で、事故ではなく仕様。(4) 保存則の言い方を「通貨は消えない」から「**プールの上限で入り切らない分だけが消え、それ以外では消えない**」へ直す(`store_test.go` の保存則テスト・設計書 §8・`blocked/C3-06.md` の記述を揃える)。(5) 回帰テスト: `Jackpot = MaxJackpot - 10` で抽選とスピンを通しても負にならず `MaxJackpot` を超えない / 手編集で `math.MaxInt64` 相当が入っていても読み取り点で正規化される / 通常範囲では既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestJackpot|TestStore|TestLottery|TestSpin" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/types.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/slot.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md, blocked/C3-06.md
+- notes: 危険地帯(資金の保存則)。プール ≤ 1e12・加算 ≤ 1e12 なので、正規化点を通れば `int64` に対して十分な余裕がある(`types.go` の既存の分析と同じ論法で書く)。閉じたら `NEXT_FINDINGS.md` の当該 2 節を消す。
