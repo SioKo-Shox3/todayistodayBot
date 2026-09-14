@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1866,4 +1867,436 @@ func TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption(t *testing.T) 
 		t.Fatalf("expected %d distinct user accounts after %d concurrent goroutines, got %d — a lost update or file corruption dropped an account",
 			n, n, userCount)
 	}
+}
+
+// --- escrow (設計書 §3) ---------------------------------------------------
+//
+// The property under test in most of these is the CONSERVATION LAW: an
+// account's Chips + Escrow may move only by the payout a settlement is
+// handed. Staking, raising and refunding are moves between two fields of
+// one account and must leave the sum untouched. assertHoldings checks the
+// sum against the FILE, not against the in-memory store, so a path that
+// forgets to persist half of a move fails here.
+
+// escrowGuild / escrowUser are the fixed identifiers the escrow tests use.
+const (
+	escrowGuild = "guild1"
+	escrowUser  = "user1"
+)
+
+// assertHoldings reads guildID/userID back through a fresh Store and checks
+// the escrow trio and the conserved sum in one place.
+func assertHoldings(t *testing.T, path, guildID, userID string, wantChips, wantEscrow int64, wantGame string) {
+	t.Helper()
+	account := readAccount(t, path, guildID, userID)
+	if account.Chips != wantChips || account.Escrow != wantEscrow {
+		t.Fatalf("holdings = Chips %d / Escrow %d, want Chips %d / Escrow %d", account.Chips, account.Escrow, wantChips, wantEscrow)
+	}
+	if account.Chips+account.Escrow != wantChips+wantEscrow {
+		t.Fatalf("Chips+Escrow = %d, want %d", account.Chips+account.Escrow, wantChips+wantEscrow)
+	}
+	if account.EscrowGame != wantGame {
+		t.Fatalf("EscrowGame = %q, want %q", account.EscrowGame, wantGame)
+	}
+	// EscrowOpenedAt must agree with the amount: a stamp left behind on a
+	// settled account would make it look in-flight to anything reading it.
+	if (account.EscrowOpenedAt != "") != (wantEscrow > 0) {
+		t.Fatalf("EscrowOpenedAt = %q with Escrow %d — the two disagree", account.EscrowOpenedAt, account.Escrow)
+	}
+}
+
+func TestOpenGame_StakesTheBetWithoutChangingHoldings(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 250, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	// 1000 chips became 750 free + 250 staked: the bet left the spendable
+	// balance but not the player's holdings.
+	assertHoldings(t, path, escrowGuild, escrowUser, 750, 250, "highlow")
+
+	account := readAccount(t, path, escrowGuild, escrowUser)
+	want := fixedNow.In(jst).Format(time.RFC3339)
+	if account.EscrowOpenedAt != want {
+		t.Fatalf("EscrowOpenedAt = %q, want %q (RFC3339 in JST)", account.EscrowOpenedAt, want)
+	}
+}
+
+func TestOpenGame_SecondGameIsRefusedAndPersistsNothing(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 250, fixedNow); err != nil {
+		t.Fatalf("first OpenGame returned error: %v", err)
+	}
+	err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow)
+	if !errors.Is(err, ErrGameInProgress) {
+		t.Fatalf("second OpenGame error = %v, want ErrGameInProgress", err)
+	}
+
+	// The refusal must not have touched the first game's stake — overwriting
+	// it would strand 250 chips with no settlement able to return them.
+	assertHoldings(t, path, escrowGuild, escrowUser, 750, 250, "highlow")
+}
+
+func TestOpenGame_RejectsBetsTheBalanceOrTheRulesDoNotAllow(t *testing.T) {
+	tests := []struct {
+		name    string
+		chips   int64
+		bet     int64
+		wantErr error
+	}{
+		{name: "bet above balance", chips: 100, bet: 101, wantErr: &ErrInsufficientChips{Balance: 100}},
+		{name: "zero bet", chips: 100, bet: 0, wantErr: ErrInvalidAmount},
+		{name: "negative bet", chips: 100, bet: -50, wantErr: ErrInvalidAmount},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: tt.chips})
+
+			err := st.OpenGame(escrowGuild, escrowUser, "highlow", tt.bet, fixedNow)
+			if err == nil {
+				t.Fatalf("OpenGame(%d) succeeded, want %v", tt.bet, tt.wantErr)
+			}
+			var insufficient *ErrInsufficientChips
+			switch {
+			case errors.As(tt.wantErr, &insufficient):
+				var got *ErrInsufficientChips
+				if !errors.As(err, &got) {
+					t.Fatalf("OpenGame error = %v, want *ErrInsufficientChips", err)
+				}
+				if got.Balance != insufficient.Balance {
+					t.Fatalf("reported balance = %d, want %d", got.Balance, insufficient.Balance)
+				}
+			default:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("OpenGame error = %v, want %v", err, tt.wantErr)
+				}
+			}
+			// A refused open must not eat the bet.
+			assertHoldings(t, path, escrowGuild, escrowUser, tt.chips, 0, "")
+		})
+	}
+}
+
+func TestAddToEscrow_RaisesTheStakeWithoutChangingHoldings(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+	if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	if err := st.AddToEscrow(escrowGuild, escrowUser, 100); err != nil {
+		t.Fatalf("AddToEscrow returned error: %v", err)
+	}
+
+	// The double moved another 100 across; holdings are still 1000.
+	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, "blackjack")
+}
+
+func TestAddToEscrow_RefusalsPersistNothing(t *testing.T) {
+	t.Run("no game in progress", func(t *testing.T) {
+		st, path := newTempStore(t)
+		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+		err := st.AddToEscrow(escrowGuild, escrowUser, 100)
+		if !errors.Is(err, ErrNoGameInProgress) {
+			t.Fatalf("AddToEscrow error = %v, want ErrNoGameInProgress", err)
+		}
+		assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
+	})
+
+	t.Run("raise above the free balance", func(t *testing.T) {
+		st, path := newTempStore(t)
+		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 150})
+		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow); err != nil {
+			t.Fatalf("OpenGame returned error: %v", err)
+		}
+
+		// 50 chips are free; the escrowed 100 is not available to raise with.
+		var insufficient *ErrInsufficientChips
+		err := st.AddToEscrow(escrowGuild, escrowUser, 100)
+		if !errors.As(err, &insufficient) {
+			t.Fatalf("AddToEscrow error = %v, want *ErrInsufficientChips", err)
+		}
+		if insufficient.Balance != 50 {
+			t.Fatalf("reported balance = %d, want 50 (the free chips, not the holdings)", insufficient.Balance)
+		}
+		assertHoldings(t, path, escrowGuild, escrowUser, 50, 100, "blackjack")
+	})
+}
+
+func TestSettleGame_PaysTheStakeAndWinningsAndClosesTheGame(t *testing.T) {
+	tests := []struct {
+		name      string
+		bet       int64
+		payout    int64
+		wantChips int64
+	}{
+		// Holdings start at 1000 in every row, so wantChips is also the new
+		// holdings: the sum moved by exactly (payout - bet).
+		{name: "loss pays nothing", bet: 200, payout: 0, wantChips: 800},
+		{name: "push returns the stake", bet: 200, payout: 200, wantChips: 1000},
+		{name: "win pays stake plus winnings", bet: 200, payout: 400, wantChips: 1200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+			if err := st.OpenGame(escrowGuild, escrowUser, "highlow", tt.bet, fixedNow); err != nil {
+				t.Fatalf("OpenGame returned error: %v", err)
+			}
+
+			result, err := st.SettleGame(escrowGuild, escrowUser, tt.payout)
+			if err != nil {
+				t.Fatalf("SettleGame returned error: %v", err)
+			}
+			if result.Chips != tt.wantChips || result.Payout != tt.payout {
+				t.Fatalf("SettleResult = %+v, want Chips %d / Payout %d", result, tt.wantChips, tt.payout)
+			}
+			assertHoldings(t, path, escrowGuild, escrowUser, tt.wantChips, 0, "")
+		})
+	}
+}
+
+func TestSettleGame_SecondSettlementIsRefused(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 200, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+	if _, err := st.SettleGame(escrowGuild, escrowUser, 400); err != nil {
+		t.Fatalf("first SettleGame returned error: %v", err)
+	}
+
+	// Paying 400 again would mint 400 chips out of nothing.
+	_, err := st.SettleGame(escrowGuild, escrowUser, 400)
+	if !errors.Is(err, ErrNoGameInProgress) {
+		t.Fatalf("second SettleGame error = %v, want ErrNoGameInProgress", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1200, 0, "")
+}
+
+func TestSettleGame_NegativePayoutIsRefusedAndKeepsTheEscrow(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 200, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	_, err := st.SettleGame(escrowGuild, escrowUser, -1)
+	if !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("SettleGame(-1) error = %v, want ErrInvalidAmount", err)
+	}
+	// The stake must survive a refused settlement so it can be retried or
+	// refunded — releasing it here would lose the chips entirely.
+	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, "highlow")
+}
+
+func TestSettleGame_PayoutOverTheChipCapPersistsNothing(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips})
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	// Free chips are MaxChips-1000; a payout of 2000 would land at
+	// MaxChips+1000.
+	_, err := st.SettleGame(escrowGuild, escrowUser, 2000)
+	if !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("SettleGame error = %v, want ErrChipCapExceeded", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips-1000, 1000, "highlow")
+}
+
+func TestRefundStaleEscrows_ReturnsEveryStakeInEveryGuild(t *testing.T) {
+	st, path := newTempStore(t)
+	err := st.Update(func(d *Data) error {
+		(*d)["guildA"] = &GuildEconomy{Users: map[string]*UserAccount{
+			"u1": {Chips: 800, Escrow: 200, EscrowGame: "highlow", EscrowOpenedAt: "2026-09-14T12:00:00+09:00"},
+			"u2": {Chips: 500}, // no game in flight
+		}}
+		(*d)["guildB"] = &GuildEconomy{Users: map[string]*UserAccount{
+			"u3": {Chips: 0, Escrow: 1000, EscrowGame: "blackjack", EscrowOpenedAt: "2026-09-14T12:00:00+09:00"},
+		}}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding returned error: %v", err)
+	}
+
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("refunded %d accounts, want 2 (the two with a stake, across both guilds)", count)
+	}
+
+	assertHoldings(t, path, "guildA", "u1", 1000, 0, "")
+	assertHoldings(t, path, "guildA", "u2", 500, 0, "")
+	assertHoldings(t, path, "guildB", "u3", 1000, 0, "")
+
+	// Idempotent: a second startup finds nothing left to refund, so a
+	// restart loop cannot pay the same stake twice.
+	count, err = st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("second RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("second refund reported %d accounts, want 0", count)
+	}
+	assertHoldings(t, path, "guildA", "u1", 1000, 0, "")
+}
+
+func TestRefundStaleEscrows_SkipsHandEditedNulls(t *testing.T) {
+	st, path := newTempStore(t)
+	// {"g": null} and {"users":{"someone":null}} are both reachable from a
+	// hand edit or a partial write. Dereferencing either kills the bot in a
+	// discordgo handler goroutine and the bad file survives the crash — a
+	// permanent crash loop, and this runs at startup where it would be a
+	// boot loop.
+	if err := os.WriteFile(path, []byte(`{"guildA":null,"guildB":{"users":{"u1":null,"u2":{"chips":100,"escrow":50}}}}`), 0o644); err != nil {
+		t.Fatalf("writing hand-edited file: %v", err)
+	}
+
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refunded %d accounts, want 1", count)
+	}
+	assertHoldings(t, path, "guildB", "u2", 150, 0, "")
+}
+
+func TestUserAccount_PreC2JSONWithoutEscrowFieldsLoadsAsNoGame(t *testing.T) {
+	st, path := newTempStore(t)
+	// Exactly the shape data/casino.json had before C-2: no escrow keys at
+	// all. It must load as "no game in progress" and stay playable.
+	if err := os.WriteFile(path, []byte(`{"guild1":{"users":{"user1":{"coins":5,"chips":1000,"last_daily_date":"2026-07-10","streak_days":3}}}}`), 0o644); err != nil {
+		t.Fatalf("writing legacy file: %v", err)
+	}
+
+	account := readAccount(t, path, escrowGuild, escrowUser)
+	if account.Escrow != 0 || account.EscrowGame != "" || account.EscrowOpenedAt != "" {
+		t.Fatalf("legacy account loaded with escrow state: %+v", account)
+	}
+	if account.Chips != 1000 || account.Coins != 5 || account.StreakDays != 3 {
+		t.Fatalf("legacy fields did not survive the round trip: %+v", account)
+	}
+
+	// And the account can open a game — i.e. the absent fields are genuinely
+	// "no game", not an unreadable state.
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 100, fixedNow); err != nil {
+		t.Fatalf("OpenGame on a legacy account returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, "highlow")
+}
+
+func TestUserAccount_NoGameInProgressSerializesWithoutEscrowKeys(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading persisted file: %v", err)
+	}
+	// omitempty, so an account with no game in flight writes the same bytes
+	// it did before C-2 — a downgrade or an external reader sees no change.
+	for _, key := range []string{"escrow", "escrow_game", "escrow_opened_at"} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("persisted file contains %q for an account with no game: %s", key, raw)
+		}
+	}
+}
+
+func TestOpenGame_ConcurrentOpensForOneUserLeaveExactlyOneStake(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	// 50 goroutines race to open a game for the SAME account. The store's
+	// single writer lock plus the Escrow>0 guard must let exactly one
+	// through: two winners would mean the loser's stake overwrote the
+	// winner's, stranding chips no settlement could return.
+	const goroutines = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	otherErrs := []error{}
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			err := st.OpenGame(escrowGuild, escrowUser, "highlow", 100, fixedNow)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, ErrGameInProgress):
+			default:
+				otherErrs = append(otherErrs, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(otherErrs) > 0 {
+		t.Fatalf("unexpected errors from concurrent OpenGame: %v", otherErrs)
+	}
+	if succeeded != 1 {
+		t.Fatalf("%d of %d concurrent OpenGame calls succeeded, want exactly 1", succeeded, goroutines)
+	}
+	// One stake of 100, and holdings still 1000.
+	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, "highlow")
+}
+
+func TestTotalAssets_CountEscrowAsTheUsersOwnMoney(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000, Coins: 2})
+
+	before, err := st.ViewAccount(escrowGuild, escrowUser, fixedNow)
+	if err != nil {
+		t.Fatalf("ViewAccount returned error: %v", err)
+	}
+	beforeRank, err := st.TopAssets(escrowGuild, fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 400, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+
+	after, err := st.ViewAccount(escrowGuild, escrowUser, fixedNow)
+	if err != nil {
+		t.Fatalf("ViewAccount returned error: %v", err)
+	}
+	afterRank, err := st.TopAssets(escrowGuild, fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+
+	// Staking a bet must not make the player poorer on /balance or in the
+	// ranking — the chips are still theirs until the hand settles.
+	if after.TotalAssets != before.TotalAssets {
+		t.Fatalf("ViewAccount total assets moved from %d to %d across a bet", before.TotalAssets, after.TotalAssets)
+	}
+	if len(beforeRank) != 1 || len(afterRank) != 1 {
+		t.Fatalf("ranking rows = %d before / %d after, want 1 each", len(beforeRank), len(afterRank))
+	}
+	if afterRank[0].TotalAssets != beforeRank[0].TotalAssets {
+		t.Fatalf("ranking total assets moved from %d to %d across a bet", beforeRank[0].TotalAssets, afterRank[0].TotalAssets)
+	}
+	if after.Account.Escrow != 400 {
+		t.Fatalf("AccountView.Account.Escrow = %d, want 400 (/balance needs the staked amount)", after.Account.Escrow)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 600, 400, "highlow")
 }

@@ -21,6 +21,14 @@ var (
 	// nothing (not even a partial debit) is persisted.
 	ErrChipCapExceeded = errors.New("casino: chip balance would exceed MaxChips")
 	ErrCoinCapExceeded = errors.New("casino: coin balance would exceed MaxCoins")
+	// ErrGameInProgress / ErrNoGameInProgress guard the escrow state machine
+	// (設計書 §3). An account holds at most one in-flight game: opening a
+	// second one would silently overwrite the first bet's escrow (the chips
+	// would be unrecoverable), and settling an account with no escrow would
+	// pay a second time for a hand already settled. Both are returned from
+	// inside the Update closure, so a refusal persists nothing.
+	ErrGameInProgress   = errors.New("casino: a game is already in progress")
+	ErrNoGameInProgress = errors.New("casino: no game in progress")
 )
 
 // ErrInsufficientChips carries the current balance so the command layer can

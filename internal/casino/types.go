@@ -50,12 +50,28 @@ type DailyRate struct {
 }
 
 // UserAccount is one user's balance in one guild, plus the bookkeeping the
-// daily bonus streak needs.
+// daily bonus streak needs and the chips currently held by an in-flight
+// button game (設計書 §3).
+//
+// The escrow trio is omitempty so an account with no game in flight
+// serializes exactly as it did before this field existed, and — the
+// direction that actually matters — a data/casino.json written before C-2
+// unmarshals with Escrow 0 / EscrowGame "" / EscrowOpenedAt "", i.e. "no
+// game in progress". No migration step exists or is needed.
+//
+// Escrow is NOT a separate pot of money: OpenGame/AddToEscrow move chips
+// out of Chips into Escrow and SettleGame moves them back, so the user's
+// holdings are Chips + Escrow throughout. Every total-assets computation
+// must therefore add Escrow, or a player would appear to lose their bet
+// from the ranking for the duration of a hand.
 type UserAccount struct {
-	Coins         int64  `json:"coins"`
-	Chips         int64  `json:"chips"`
-	LastDailyDate string `json:"last_daily_date"`
-	StreakDays    int    `json:"streak_days"`
+	Coins          int64  `json:"coins"`
+	Chips          int64  `json:"chips"`
+	LastDailyDate  string `json:"last_daily_date"`
+	StreakDays     int    `json:"streak_days"`
+	Escrow         int64  `json:"escrow,omitempty"`           // chips staked on the in-flight game (bet + any double)
+	EscrowGame     string `json:"escrow_game,omitempty"`      // "highlow" | "blackjack"
+	EscrowOpenedAt string `json:"escrow_opened_at,omitempty"` // RFC3339 in JST
 }
 
 // MaxChips / MaxCoins bound every account balance. They are NOT arbitrary:

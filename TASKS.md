@@ -60,13 +60,14 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 既存の `registry.go` と同じ流儀(`init()` 自己登録・重複 panic)。discordgo の `MessageComponentInteractionData` から `CustomID` を取る。押した人は `i.Member.User.ID`(DM は `i.User`)。
 
 ## C2-02: `casino.Store` の預かり(escrow)4 メソッドと保存則テスト(§3)
-- status: todo
+- status: done
 - done-when: `internal/casino/types.go` の `UserAccount` に `Escrow` / `EscrowGame` / `EscrowOpenedAt`(`omitempty`)を足す。`store.go` に `OpenGame(guild, user, game string, bet int64, now time.Time) error`(進行中なら `ErrGameInProgress`、残高不足なら既存の `ErrInsufficientChips`、1 未満のベットは拒否)、`AddToEscrow(guild, user string, amount int64) error`、`SettleGame(guild, user string, payout int64) (SettleResult, error)`(`Escrow == 0` なら `ErrNoGameInProgress`。`SettleResult` に精算後の `Chips` と支払った `payout`)、`RefundStaleEscrows(now time.Time) (int, error)` を、それぞれ `Update` 1 回で書く(クロージャ内から公開メソッドを呼ばない)。`errors.go` に 2 つのセンチネル。`store_test.go`: 保存則(`Chips + Escrow` が Open/Add/Settle/Refund の各経路で規則どおりにしか動かない)、二重精算の拒否、進行中の重複開始の拒否、既存 JSON(escrow フィールド無し)の読み込み互換、`RefundStaleEscrows` が全ギルドを返金して件数を返す、同一ユーザーへの並行 `OpenGame` 50 本で 1 本だけ成功する。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestStore|TestOpenGame|TestSettleGame|TestAddToEscrow|TestRefundStaleEscrows" -count=1`
 - verify: `go test ./internal/casino/... -count=1`
 - paths: internal/casino/types.go, internal/casino/errors.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 危険地帯(資金の保存則)。`EscrowOpenedAt` は JST の RFC3339。`TopAssets`(ランキング)の総資産に `Escrow` を含める(預かりは本人の資産)。`ViewAccount`(`/balance`)にも預かり額を出す(表示は C2-06/07 で)。
+  検証出力 `verify-C2-02-{1,2,3,4}.txt`(build+vet clean / 対象テスト 73 PASS・FAIL 0 / casino ok / `go test ./...` 8 パッケージ ok)。`AddToEscrow` は仕様の残高不足に加えて `Escrow == 0` も拒む(進行中でないゲームへの追加ベットは返す先が無い)。`RefundStaleEscrows` の `now` は `EscrowOpenedAt` と同じ流儀の引数で、返金の判定には使わない(起動時の預かりは定義上「消えた盤面」)。
 
 ## C2-03: カードとハイ&ローの純粋ロジック(§6)
 - status: todo

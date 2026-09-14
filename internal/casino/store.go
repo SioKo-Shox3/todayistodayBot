@@ -448,7 +448,22 @@ func (s *Store) EnsureCasinoAccess(guildID, userID string, now time.Time) error 
 // RankEntry is one row of the total-assets ranking.
 type RankEntry struct {
 	UserID      string
-	TotalAssets int64 // Chips + Coins*rate
+	TotalAssets int64 // Chips + Escrow + Coins*rate
+}
+
+// totalAssetsLocked values one account at `rate`. Escrow counts as the
+// user's own money (設計書 §3): it is chips that left Chips only for the
+// duration of a hand, so leaving it out would drop a player's bet out of
+// the ranking and off /balance while they are mid-game, then have it
+// reappear at settlement. Caller must already hold the Store's lock.
+//
+// Still cannot overflow int64: every write path keeps Chips + Escrow <=
+// MaxChips (staking moves chips between the two fields and settlement
+// credits through creditChipsLocked), so the bound is unchanged from
+// Chips-only — MaxChips + MaxCoins*maxRate = 1.41e14, about 65,413x below
+// math.MaxInt64.
+func totalAssetsLocked(account *UserAccount, rate int) int64 {
+	return account.Chips + account.Escrow + account.Coins*int64(rate)
 }
 
 // topAssetsLocked ranks economy's users by total assets at `rate`, ties
@@ -481,7 +496,7 @@ func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 			// the entry the moment that user actually plays.
 			continue
 		}
-		entries = append(entries, RankEntry{UserID: userID, TotalAssets: account.Chips + account.Coins*int64(rate)})
+		entries = append(entries, RankEntry{UserID: userID, TotalAssets: totalAssetsLocked(account, rate)})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].TotalAssets != entries[j].TotalAssets {
@@ -633,6 +648,8 @@ func (s *Store) ExchangeChipToCoin(guildID, userID string, chips int64, now time
 }
 
 // AccountView is one account plus the totals derived from today's rate.
+// Account carries the escrow trio verbatim, so /balance can show what is
+// staked on an in-flight game; TotalAssets already includes it.
 type AccountView struct {
 	Account     UserAccount
 	RateUsed    int
@@ -649,7 +666,7 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 		economy := ensureGuildLocked(d, guildID)
 		rate := ensureTodayRateLocked(economy, today, s.rng)
 		account := *ensureAccountLocked(economy, userID)
-		result = AccountView{Account: account, RateUsed: rate.Rate, TotalAssets: account.Chips + account.Coins*int64(rate.Rate)}
+		result = AccountView{Account: account, RateUsed: rate.Rate, TotalAssets: totalAssetsLocked(&account, rate.Rate)}
 		return nil
 	})
 	return result, err
@@ -716,4 +733,185 @@ func (s *Store) RecentRates(guildID string, now time.Time, limit int) ([]DailyRa
 		return nil
 	})
 	return result, err
+}
+
+// --- escrow: chips staked on an in-flight button game (設計書 §3) ---------
+//
+// A button game's BOARD lives in memory (the session manager); only the
+// STAKE is persisted, as account.Escrow. That split is what makes the money
+// safe across a crash: chips leave Chips the moment the game opens, so no
+// concurrent command can spend them twice, and a restart — which destroys
+// every board — finds the orphaned stakes and hands them back
+// (RefundStaleEscrows).
+//
+// The conservation law these four methods maintain, and that store_test.go's
+// escrow tests pin down: across OpenGame, AddToEscrow, SettleGame and
+// RefundStaleEscrows, an account's Chips + Escrow moves ONLY by the payout
+// SettleGame is handed. Staking is a move between two fields of the same
+// account, so it leaves the sum exactly where it was; a refund is the same
+// move backwards. Nothing here touches Coins.
+
+// moveToEscrowLocked stakes amount chips: Chips -= amount, Escrow += amount.
+// The sum Chips + Escrow is unchanged, which is why this does NOT go through
+// creditChipsLocked — no currency is created, so no cap is at risk (Escrow
+// can never exceed what Chips already held). Caller must already hold the
+// Store's lock.
+func moveToEscrowLocked(account *UserAccount, amount int64) error {
+	if amount < 1 {
+		return ErrInvalidAmount
+	}
+	if account.Chips < amount {
+		return &ErrInsufficientChips{Balance: account.Chips}
+	}
+	account.Chips -= amount
+	account.Escrow += amount
+	return nil
+}
+
+// clearEscrowLocked zeroes the whole escrow trio. The two string fields are
+// cleared alongside the amount so `Escrow == 0` and "no game in progress"
+// can never disagree — a leftover EscrowGame would make a settled account
+// look in-flight to anything that reads the game name.
+func clearEscrowLocked(account *UserAccount) {
+	account.Escrow = 0
+	account.EscrowGame = ""
+	account.EscrowOpenedAt = ""
+}
+
+// OpenGame stakes bet chips on a new game of `game` for guildID/userID,
+// auto-creating the account (welcome bonus) on first ever interaction.
+// Returns ErrGameInProgress if the account already has chips in escrow,
+// *ErrInsufficientChips if the balance will not cover the bet, and
+// ErrInvalidAmount for a bet below 1 (defense in depth: the command layer's
+// 10..1,000 option bounds are a UX nicety, not a guarantee). In every error
+// case nothing is persisted, so a refused open cannot eat the bet.
+//
+// The one-game-at-a-time rule is enforced HERE, under the store's lock,
+// rather than only in the in-memory session manager: two commands that race
+// arrive on two discordgo goroutines, and the session map alone would let
+// the loser overwrite the winner's escrow — chips that no settlement would
+// ever return.
+//
+// now is the instant recorded as EscrowOpenedAt (RFC3339 in JST, the
+// package-wide convention); no decision here reads it.
+func (s *Store) OpenGame(guildID, userID, game string, bet int64, now time.Time) error {
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.Escrow > 0 {
+			return ErrGameInProgress
+		}
+		if err := moveToEscrowLocked(account, bet); err != nil {
+			return err
+		}
+		account.EscrowGame = game
+		account.EscrowOpenedAt = now.In(jst).Format(time.RFC3339)
+		return nil
+	})
+}
+
+// AddToEscrow stakes amount MORE chips on the game already in flight —
+// blackjack's ダブル (設計書 §7). Returns ErrNoGameInProgress when the
+// account has no escrow (chips added to a game that does not exist would
+// have no settlement to return them), *ErrInsufficientChips when the balance
+// will not cover the raise, and ErrInvalidAmount below 1. Nothing is
+// persisted on any of those, so the command layer's "persist first, then
+// apply to the board" order leaves the board untouched when a raise is
+// refused.
+func (s *Store) AddToEscrow(guildID, userID string, amount int64) error {
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.Escrow == 0 {
+			return ErrNoGameInProgress
+		}
+		return moveToEscrowLocked(account, amount)
+	})
+}
+
+// SettleResult is what a settlement left behind.
+type SettleResult struct {
+	Chips  int64 // the account's chip balance after the payout landed
+	Payout int64 // what was paid, stake included (0 on a loss)
+}
+
+// SettleGame closes the in-flight game for guildID/userID: the escrow is
+// released and payout chips are credited. payout is the TOTAL the player
+// receives, the returned stake included — a push pays the stake back, a loss
+// pays 0, and the caller never adds the stake on top.
+//
+// Returns ErrNoGameInProgress when the account has no escrow. That is the
+// store-level half of the double-settlement guard (the session manager
+// dropping a settled session is the other half): a button pressed twice in
+// the same instant resolves the same board on two goroutines, and without
+// this check the second one would pay the whole payout again out of nothing.
+// ErrInvalidAmount rejects a negative payout and ErrChipCapExceeded a payout
+// that would break MaxChips — on any error nothing at all is persisted, so
+// the escrow survives for a retry rather than vanishing.
+func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, error) {
+	var result SettleResult
+	err := s.Update(func(d *Data) error {
+		if payout < 0 {
+			return ErrInvalidAmount
+		}
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.Escrow == 0 {
+			return ErrNoGameInProgress
+		}
+		clearEscrowLocked(account)
+		if err := creditChipsLocked(account, payout); err != nil {
+			return err // aborts: the escrow release above is discarded with the transaction
+		}
+		result = SettleResult{Chips: account.Chips, Payout: payout}
+		return nil
+	})
+	if err != nil {
+		return SettleResult{}, err
+	}
+	return result, nil
+}
+
+// RefundStaleEscrows returns every chip still held in escrow, in every
+// guild, to the account that staked it, and reports how many accounts were
+// refunded. cmd/bot calls it ONCE at startup (設計書 §3).
+//
+// The refund is unconditional rather than age-based, and that is the whole
+// point: boards live only in memory, so the process that could have settled
+// these stakes no longer exists. An escrow observed at startup is by
+// definition a game that can never finish. now is accepted for contract
+// symmetry with OpenGame and to pin the call to the same startup instant the
+// rest of the boot sequence uses; no decision here reads it.
+//
+// A hand-edited file whose Chips + Escrow already exceeds MaxChips is
+// refunded up to MaxChips and has its escrow cleared regardless. Aborting
+// instead would leave every account in every guild staked forever — none of
+// them could ever open another game — which is a far worse outcome than one
+// hand-broken balance being capped.
+func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
+	refunded := 0
+	err := s.Update(func(d *Data) error {
+		refunded = 0 // never double-count if the closure is ever run more than once
+		for _, economy := range *d {
+			if economy == nil {
+				continue // hand-edited {"g": null}; see ensureGuildLocked
+			}
+			for _, account := range economy.Users {
+				if account == nil || account.Escrow <= 0 {
+					continue // hand-edited {"users":{"someone":null}}; see topAssetsLocked
+				}
+				stake := account.Escrow
+				clearEscrowLocked(account)
+				if err := creditChipsLocked(account, stake); err != nil {
+					account.Chips = MaxChips
+				}
+				refunded++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return refunded, nil
 }
