@@ -4,6 +4,16 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-05(`/season` と `/balance` の今月の純利)= コミット `bc14bec`。証拠 `.harness/runs/20260915-064206/verify-C3B-05-{1,2,3}.txt`(3 本とも exit=0)。
+  **`SeasonStatus` はロールオーバーを通す読み取り**。`ensureTodayRateLocked` を呼ぶので、月初の `/season` は前月を閉じて賞与を払ってから今月の(空の)表を返す — 通さないと「もう誰かの手で閉じられる運命の表」を現役として見せることになる。順位表は `SeasonTopLimit`(10)で切るが**自分の順位は切らない**: `SelfRank` は全体順位なので 12 位の人には「12位」と出る(0 = 純利 0 の圏外)。`Players` は純利が動いた人数で、`SeasonResult.Players` と同じ定義。
+  **`Last` はスライスごとコピーして返す**。`economy.LastSeason` のポインタを渡すと、表示側の書き込みが次の `Update` のスナップショットに載る。テストは返った `Last` を書き換えてからファイルを読み直して確かめている。
+  **残り日数は今日を含める**(`SeasonDaysLeft`)。月末は「残り1日」= 今日で終わり。切り替えは次の深夜なので今日はまだ遊べる、という意味に合わせた。月の長さは**翌月1日の前日**から取るので 2 月も閏年も分岐が要らない。JST 固定(`now.In(jst)`)— UTC で数えると 7/31 15:00 UTC(= JST 8/01)が 7 月の最終日に見える。
+  **`/help` は何もしていない**。一覧はレジストリそのもので、`/duel` と `/season` は `init()` の自己登録で既に載る。`help_test.go` に 2 本を足したのは、`init()` が消えたときに気づくのが `/help` のテストだけだから。
+  **コマンド側テストの時計**: `internal/commands` からストアの時計は差せない(非公開)。決着は**ストアの時計**の月へ計上され、`SeasonStatus` は**引数の `now`** を使うので、固定 `now` と実決着を混ぜると月が食い違う。ストア越しの 1 件は実時計で回している(純粋関数側は固定値)。
+- NEXT_FINDINGS(反復 4 の NEEDS_WORK 2 件)= コミット `ac6a88f`。証拠 `.harness/runs/20260915-064206/findings-C3B-04-{1,2}.txt`(2 本とも exit=0)。
+  **[P1] 受諾の失敗で盤面を閉じる条件を反転した**。`duelAcceptKeepsTheChallenge`(残す側を列挙)は、列挙しなかった**保存 I/O の失敗**を「預かりは消えた」と誤読していた。`Update` は書けなければ何も永続化しないので預かりは口座に残り、そこで `Close` すると 🚫 も掃除人も届かず**再起動まで口座が「進行中」で固まる**。`duelAcceptDropsTheChallenge` は落とす側だけを列挙する(`ErrNoGameInProgress` = 預かりが無いか別ゲームのもの)。既定は**残す** — 残しすぎても 3 分で掃除人が返すが、閉じすぎると出口が無い。
+  **[P2] 受け手判定を `WithSession` の中へ移した**。`WithSession` はエラーを返さなかった呼び出しで必ず `LastActionAt` を更新するので、判定が外にあると**第三者の押下でも失効期限が延びる**(拒否され続ける人がボタンを叩くだけで返金を止められる)。クロージャ内で拒否し `errDuelNotOpponent` を返す = 期限を触らない。文言は `requireDuelOpponent` のものを外へ持ち出す(エラー値は経路の制御だけを持つ)。
+  **効き目の確認**: 2 つの修正をそれぞれ単独で戻すと、対応する新規テストだけが落ちる — (1) を戻すと `0 challenges are live, want 1`、(2) を戻すと accept / decline 両方で `1 challenges survived the sweep`(= 返金されない)。
 - C3B-04(`/duel` コマンドと受諾・辞退ボタン)= コミット `95cc63c`。証拠 `.harness/runs/20260915-033205/verify-C3B-04-{1,2,3}.txt`(3 本とも exit=0)。
   **所有者検査がこのゲームだけ逆向き**。`Session.UserID` は挑戦者で、ボタンを押してよいのは**受け手**(§4.5)。共有の `requireSessionOwner` は使えない(文言も §6 で別)ので `requireDuelOpponent(i, board.OpponentID)` を別に置いた。受け手 ID は盤面(`casino.DuelState.OpponentID`)が持つ — マネージャは知らない。挑戦者自身の押下も**他人と同じく弾く**(テスト `TestDuelOnlyTheReceiverCanPress` が挑戦者と無関係の 2 人で見ている)。
   **失効は「決着」ではなく「取り下げ」なので、掃除人の既定経路に乗せられない**。C-2 の掃除人は `AutoResolve() int64` → `SettleGame(guild, session.UserID, payout)` 一本で、duel をそこに通すと (a) 返金が `creditChipsLocked` の上限に当たって**掛け金の一部が消える**(`DeclineDuel` が `moveFromEscrowLocked` を選んだのと同じ理由)、(b) タイトルが「⌛ 時間切れ — 自動決着」になる。そこで `casino_sessions.go` に**3 つ目の任意インターフェース** `timedOutBoardSettler{ SettleTimedOutBoard(*casino.Session) (SettleResult, error) }` を足し、`sweepIdleBoards` の精算部分を `settleSweptBoard` へ切り出した。実装しないゲームは従来どおり `AutoResolve` → `SettleGame`(既存テストは 1 件も変えていない)。**`DuelState` は `casino.AutoResolver` を実装しない** — 「この盤面が 1 人の player に何を負っているか」という 1 つの数に、2 人分の帰結は入らない。
@@ -164,7 +174,9 @@
 - (なし)
 
 ## Next
-- **次は C3B-05**(`TASKS.md` の未完の先頭)。C3B-04 で C-3b のゲーム側は閉じた — 残るのは見せる側(`/season`、`/balance` の今月の純利行、9 時掲示のシーズン欄、`/help` と README の一覧)。
+- **次は C3B-06**(9 時掲示のシーズン欄と結果の祝い)。表示側で残っているのは掲示だけ — `/season` と `/balance` は C3B-05 で閉じた。`SeasonStatus` と同じ数(上位 3 名・純利)を掲示が必要とするが、掲示は `AnnouncementJob` を組む側(`internal/casino/announce.go`)なので、`SeasonView` を再利用するのではなく `LastSeason` / `SeasonRanks` を直に読む形になる。
+- **`README.md` のコマンド一覧に `/duel` と `/season` はまだ無い**。C3B-05 の `paths:` に README が無かったので触っていない(`/help` はレジストリ生成なので自動で載る)。README を触るタスクで拾う。
+- **旧: 次は C3B-05**(`TASKS.md` の未完の先頭)。C3B-04 で C-3b のゲーム側は閉じた — 残るのは見せる側(`/season`、`/balance` の今月の純利行、9 時掲示のシーズン欄、`/help` と README の一覧)。
 - **`/help` と `README.md` に `/duel` を足すのはまだ**(§5 は `/season` と同じタスクで足すと書いている)。C3B-04 では触っていない。
 - **掃除人の任意インターフェースは 3 つになった**(`casino_sessions.go`): `timedOutBoardRenderer`(ボタン)・`timedOutBoardResultRenderer`(本文)・`timedOutBoardSettler`(精算そのもの)。新しいゲームを足すときは、既定(`AutoResolve` → `SettleGame`)で足りるかを最初に決める。
 - **旧: 次は C3B-03**(`TASKS.md` の未完の先頭)。C3B-02 までで `SeasonNet` は**書き込み側も読み取り点も閉じた** — 残るのはシーズンの境界(月替わりで全口座の `SeasonNet` を 0 に戻し、賞与を配る)と、それを見せるコマンド層。C3B-03 は全口座を触るので C3B-02 と同じ危険地帯。
