@@ -471,20 +471,45 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 			Components: duelButtons(session.ID, false),
 		},
 	}); err != nil {
-		// The challenge never reached Discord, so there is nothing to press
-		// and nothing will ever settle it: give the stake back now instead of
-		// leaving the account stuck "in a game" until the next restart. ONLY
-		// if Close says the board was still ours — Discord can create the
-		// message and still fail this call, and the challenge can be answered
-		// while the error is in flight.
-		if c.sessions.Close(session.ID) {
-			c.refundUndeliveredChallenge(i.GuildID, challengerID, session.ID)
-		}
+		c.withdrawUndeliveredChallenge(i.GuildID, challengerID, session.ID)
 		return err
 	}
 
 	c.rememberChallengeMessage(r, i.Interaction, session.ID)
 	return nil
+}
+
+// withdrawUndeliveredChallenge takes back a challenge whose board reached the
+// manager but never reached Discord: there is nothing to press, so nothing
+// will ever settle it, and the stake would otherwise sit "in a game" until
+// the next restart.
+//
+// It runs where ⚔️ and 🚫 run — inside the SAME per-board lock, under the
+// manager's own Hold — because it is a third presser of a board those two can
+// be on right now: Discord can create the message and still fail the call
+// that sent it. A Hold that fails means the challenge is already somebody
+// else's (accepted, declined, swept), and this path must not hand back a
+// stake that has already been settled.
+//
+// The refund goes FIRST and the board is closed only once it has landed.
+// Closing first hides the board from the sweeper, so a refund that failed
+// after it would strand the stake with no button and no retry left; keeping
+// the board is what makes the next sweep (three minutes on) the retry, the
+// same order the sweeper itself keeps for a settlement (C2-10).
+func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessionID string) {
+	lock := c.locks.acquire(sessionID)
+	defer c.locks.release(sessionID, lock)
+
+	if _, held := c.sessions.Hold(sessionID); !held {
+		return
+	}
+	defer c.sessions.Release(sessionID)
+
+	if err := c.store.DeclineDuel(guildID, challengerID, sessionID); err != nil {
+		slog.Error("casino: refunding an undelivered duel challenge failed, the sweeper retries it", "error", redactInteractionError(err))
+		return
+	}
+	c.sessions.Close(sessionID)
 }
 
 // refundUndeliveredChallenge returns a stake whose challenge never became

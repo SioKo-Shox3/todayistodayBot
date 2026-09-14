@@ -847,3 +847,147 @@ func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
 		})
 	}
 }
+
+// --- the undelivered challenge (C3B-14) ------------------------------------
+
+// duelBankThatRefusesOneRefund is a real store whose NEXT DeclineDuel fails,
+// and that remembers the board a stake was bound to. Neither is reachable
+// from the outside — a refund only moves chips the account already owns, and
+// the board's ID is published by the manager — but "the withdrawal was
+// decided and the chips did not move" is exactly the state the retry exists
+// for, and the recorded ID is how a test presses the board the failing call
+// is standing on.
+type duelBankThatRefusesOneRefund struct {
+	*flakyBank
+	refuseNextRefund error
+	declines         int
+	bound            string
+	// beforeDecline runs once, immediately before a refund is attempted —
+	// the window this cleanup shares with ⚔️, and the only way a test gets
+	// to act inside it instead of hoping to hit it by timing.
+	beforeDecline func()
+}
+
+func (b *duelBankThatRefusesOneRefund) BindEscrowSession(guildID, userID, sessionID string) error {
+	if err := b.flakyBank.BindEscrowSession(guildID, userID, sessionID); err != nil {
+		return err
+	}
+	b.bound = sessionID
+	return nil
+}
+
+func (b *duelBankThatRefusesOneRefund) DeclineDuel(guildID, challengerID, sessionID string) error {
+	b.declines++
+	if hook := b.beforeDecline; hook != nil {
+		b.beforeDecline = nil // once — the hook must not re-enter its own refund
+		hook()
+	}
+	if err := b.refuseNextRefund; err != nil {
+		b.refuseNextRefund = nil
+		return err
+	}
+	return b.flakyBank.DeclineDuel(guildID, challengerID, sessionID)
+}
+
+// newDuelCommandOnRefusingBank is newDuelCommandForTest with a store whose
+// refunds the test can make fail, and with the manager's clock in the test's
+// hand so a sweep happens exactly when it asks for one.
+func newDuelCommandOnRefusingBank(t *testing.T, now func() time.Time) (*DuelCommand, *duelBankThatRefusesOneRefund) {
+	t.Helper()
+	bank := &duelBankThatRefusesOneRefund{flakyBank: &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}}
+	return &DuelCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(now, casino.DefaultSessionTTL),
+		flip:     func() bool { return true },
+	}, bank
+}
+
+// A challenge that never reached Discord has nothing to press, so the stake
+// behind it must come back. The board is what the sweeper retries through, so
+// it may only be closed once the refund has actually landed: closing it first
+// leaves a stake in escrow that no button, no sweep and no 🚫 can release —
+// the account is "in a game" until the next restart.
+func TestDuelUndeliveredChallengeKeepsTheBoardUntilTheRefundLands(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	c, bank := newDuelCommandOnRefusingBank(t, func() time.Time { return opened })
+	RegisterComponent(c) // the real settler, so the sweep withdraws like production
+
+	bank.refuseNextRefund = errors.New("the refund never reached the disk")
+	r := &fakeCasinoResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err == nil {
+		t.Fatal("/duel reported success although the challenge never reached Discord")
+	}
+
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Fatalf("challenger: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d challenges are live after a refused refund, want 1 — a closed board is one nothing can retry", c.sessions.Len())
+	}
+
+	// Three minutes on, the sweeper withdraws the challenge it can still see.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow after the sweep, want 1000 / 0 — the stake is stranded", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges survived the sweep, want 0", c.sessions.Len())
+	}
+	if bank.declines != 2 {
+		t.Errorf("DeclineDuel was called %d times, want 2 (the undelivered cleanup, then the sweep's retry)", bank.declines)
+	}
+}
+
+// The cleanup above is a third presser of a live board: Discord can create
+// the challenge message and still fail the call that sent it, so ⚔️ can
+// arrive while the withdrawal is in flight. Both must not pay — the board
+// lock is what serializes them, exactly as it does ⚔️ against 🚫.
+func TestDuelUndeliveredCleanupAndAcceptanceDoNotBothPay(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	c, bank := newDuelCommandOnRefusingBank(t, func() time.Time { return opened })
+	RegisterComponent(c)
+
+	accepted := make(chan struct{})
+	var acceptResponder *fakeCasinoResponder
+	bank.beforeDecline = func() {
+		acceptResponder = &fakeCasinoResponder{}
+		sessionID := bank.bound
+		go func() {
+			defer close(accepted)
+			customID := BuildCustomID(c.Prefix(), sessionID, duelActionAccept)
+			if err := c.handleComponent(acceptResponder, duelButtonInteraction(customID, duelOpponent), sessionID, duelActionAccept); err != nil {
+				t.Errorf("pressing ⚔️ during the cleanup: %v", err)
+			}
+		}()
+	}
+
+	r := &fakeCasinoResponder{respondErr: errors.New("the challenge never reached Discord")}
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err == nil {
+		t.Fatal("/duel reported success although the challenge never reached Discord")
+	}
+	<-accepted
+
+	challengerChips, challengerEscrow := duelHoldings(t, bank.flakyBank, duelChallenger)
+	opponentChips, opponentEscrow := duelHoldings(t, bank.flakyBank, duelOpponent)
+	if challengerEscrow != 0 || opponentEscrow != 0 {
+		t.Errorf("escrow: challenger %d / opponent %d, want 0 / 0", challengerEscrow, opponentEscrow)
+	}
+	// The withdrawal is the one that happened: nobody was paid out of a
+	// challenge that was already being taken back.
+	if challengerChips != 1000 || opponentChips != 1000 {
+		t.Errorf("chips: challenger %d / opponent %d, want 1000 / 1000 — the cleanup and ⚔️ both moved chips", challengerChips, opponentChips)
+	}
+	if got := acceptResponder.last(t).Data.Content; got != duelChallengeOverMessage {
+		t.Errorf("⚔️ answered %q, want %q", got, duelChallengeOverMessage)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges are still live after the withdrawal, want 0", c.sessions.Len())
+	}
+}
