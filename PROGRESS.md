@@ -402,3 +402,26 @@
   `economy.UnannouncedSeasons = nil`(= C3B-08 以前の「枠は 1 つ」)を入れると、このテストは
   `8/1 delivered [], want the June result` で落ちる(`verify-C3B-10-mutation.txt`)。緑なだけでは
   待ち行列が効いている証拠にならない。
+
+## 反復 7(C3B-11) — 2026-09-15
+
+- **Done**: C3B-11。反復 3 の評価者所見 1・2(どちらも P2・文書のみ)を閉じた。コードは変えていない。
+  ゲート 2 本とも exit=0・全 8 パッケージ ok(`.harness/runs/20260915-064206/verify-C3B-11-1..2.txt`)。
+  これで `TASKS.md` は 50 件すべて done。
+- **Next**: `TASKS.md` に未完は無い。次の作業は M1(新しい仕様の合意)から。
+  `blocked/C3B-07.md` の追記案を正本(`MyWorkflow/projects/todayistodayBot/Docs/agent-guide/architecture.md`)へ
+  写して再展開するのは**人**の作業で、まだ残っている(`Docs/agent-guide/architecture.md` は今も「6 点」のまま)。
+- **duel のゼロサムは上限で崩れる**: `AcceptDuel` は払い出しを `creditChipsCappedLocked` に通すので、
+  勝者の残高が `MaxChips` に近いと入り切らない分は切り捨てられ、その回だけ 2 口座の合計が減る。
+  切り捨てた分はプールにも敗者にも移らない(宝くじの「他の 1 人へ移る」規則は duel に無い)。
+  `SeasonNet` に足すのは表の額ではなく**実際に入った額 − 賭けた額**
+  (`TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat` が 300/-200 で実測)。
+  README は「ベット額の 2 倍」の断定をやめ、所持上限で頭打ちになる旨を 1 行足した。
+- **全口座を走査する経路は切り替えだけではない**: `SeasonStatus` は月替わりが無くても全口座を
+  `normalizeAccountLocked` で正規化して保存し、`RefundStaleEscrows` は全ギルドの対象口座をまとめて返金する。
+  危険地帯 7 点目(c)の「全口座を触る唯一の書き込み」「他はすべて 1〜2 口座」は成り立たないので、
+  「全口座の `SeasonNet` を一括で 0 にする書き込み」に直し、経路を限定する断定を消した。
+  nil 口座を飛ばす・順位を取る前に正規化する、という**守るべき中身の方は変えていない**。
+- **設計書の「duel はゼロサム」は `paths:` の外**: `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md:22` は
+  設計の契約として無条件のゼロサムを書いている(§2 の実測段落は上限の話と整合)。今回は触っていない。
+  次に設計書を開くときに、上限の例外を 1 行足すか判断する。

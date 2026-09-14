@@ -462,7 +462,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 評価者(反復 4)の所見 1。実装の不具合は見つかっておらず、足りないのは検証。閉じるときに `NEXT_FINDINGS.md` の反復 4 節を消す。
 
 ## C3B-11: duel のゼロサムと全口座を触る経路の説明を実装に合わせる(反復 3 の所見 1・2、P2)
-- status: todo
+- status: done
 - done-when: (1) `README.md` の duel が「勝者はベットの 2 倍を必ず受け取る」と読めないようにし、残高上限による切り捨てを明記する(`TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat` が実測)。(2) `blocked/C3B-07.md` の危険地帯 7 点目を「上限による切り捨てが無い場合にゼロサム」に直し、「全口座を触る唯一の書き込み」「他はすべて 1〜2 口座」の断定を消す(`SeasonStatus` は月替わりが無くても全口座を正規化して保存し、`RefundStaleEscrows` は全ギルドの対象口座をまとめて返金する)。公開物なので過程を書かない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./... -count=1`
