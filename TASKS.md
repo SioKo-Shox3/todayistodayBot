@@ -217,7 +217,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: サブコマンド構成は `/casino-admin` と `/exchange` の既存実装に倣う。
 
 ## C3-05: 9 時掲示の宝くじフィールドと当選者の祝い(§3 掲示)
-- status: todo
+- status: done
 - done-when: `internal/commands/casino_announce.go` の embed に「🎟️ 宝くじ」フィールド(昨日の当選者と賞金 / 今日の賞金プールと購入枚数)を足し、`LotteryDraw` に当選者がいれば**別メッセージ**で公開の祝い(`<@id>` メンション、賞金額。スロットの大当たりと同じ流儀)を送る。送信失敗はログのみで掲示と抽選には影響しない(既存の掲示と同じ)。`casino_announce_test.go`: フィールドの文言(当選あり/なし/購入者 0 の繰り越し)、祝いメッセージが当選者のいるときだけ送られる(fake sender で記録)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement|TestStartAnnounce" -count=1`

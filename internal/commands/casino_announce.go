@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -26,6 +27,12 @@ var announceMedals = []string{"🥇", "🥈", "🥉"}
 // where the guild watches the pool grow. It comes from the job (collected
 // under the store's lock, after the rollover seeded it), never from a fresh
 // read here — this function stays pure.
+//
+// 設計書 C-3a §3 adds a sixth: the lottery — this morning's settled draw and
+// the pot now open for buying (lotteryAnnounceLines). Same rule: every
+// number comes from the job, which collected them inside the Update that
+// performed the draw, so the embed cannot show a pot that was emptied a
+// microsecond after it was read.
 //
 // The 🚀/💥 tag comes from the PERSISTED casino.EventKind via
 // rateChangeLine, not from a day-over-day threshold. A threshold cannot
@@ -61,8 +68,50 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 		Fields: []*discordgo.MessageEmbedField{
 			{Name: "総資産ランキング TOP3", Value: rankValue, Inline: false},
 			{Name: "🎰 ジャックポット", Value: fmt.Sprintf("%d チップ", job.JackpotPool), Inline: false},
+			{Name: "🎟️ 宝くじ", Value: lotteryAnnounceLines(job), Inline: false},
 		},
 	}
+}
+
+// lotteryAnnounceLines renders the 🎟️ 宝くじ field's body: this morning's
+// settled draw on the first line, and on the second the pot that is open for
+// buying right now (設計書 C-3a §3 掲示).
+//
+// The winner is mentioned with <@id> exactly as /lottery status does
+// (lottery.go's lotteryLastDrawLine) — two renderings of one draw must not
+// disagree.
+//
+// A nil LotteryDraw is not a missing value, it is what a day nobody entered
+// looks like: drawLotteryLocked leaves LastDraw untouched then and rolls the
+// entire prize forward, so 「繰り越し」 is literally what happened and the
+// second line's amount IS that carried-over prize. Tickets read 0 枚 at 09:00
+// on every normal morning — the draw just emptied the pot — and only climb
+// above 0 here when the announcement is a late catch-up posted after people
+// have already started buying into the new pot.
+func lotteryAnnounceLines(job casino.AnnouncementJob) string {
+	result := "🏆 昨日の当選: 該当者なし — 賞金は繰り越し"
+	if d := job.LotteryDraw; d != nil && d.WinnerID != "" {
+		result = fmt.Sprintf("🏆 昨日の当選: <@%s> が %dチップ 獲得(%d枚 / %d人)", d.WinnerID, d.Prize, d.TicketsSold, d.Buyers)
+	}
+	return fmt.Sprintf("%s\n💰 本日の賞金: %dチップ / 🎫 売れた枚数: %d枚", result, job.LotteryPrize, job.LotteryTickets)
+}
+
+// lotteryAnnounceCelebration renders the SEPARATE public message a won draw
+// posts, in the same shape as slot.go's jackpot celebration
+// (slotCelebrationMessage): an embed field is easy to scroll past, and the
+// whole point of the mention is that the winner gets pinged.
+//
+// "" means「何も投稿しない」: no draw, no winner named, or a prize of 0. The
+// last case is not hypothetical — drawLotteryLocked pays through
+// creditChipsCappedLocked, so a winner already at MaxChips is recorded with
+// Prize 0 and the whole pot rolls forward instead. 「0 チップ 獲得!!」 would
+// be a celebration of nothing; the embed field still reports that draw
+// exactly as it was recorded.
+func lotteryAnnounceCelebration(draw *casino.LotteryDraw) string {
+	if draw == nil || draw.WinnerID == "" || draw.Prize <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("🎉🎉🎉 <@%s> が 🎟️ 宝くじに当選!! %d チップ 獲得!! 🎉🎉🎉", draw.WinnerID, draw.Prize)
 }
 
 // startAnnounceScheduler is StartCasinoAnnounceScheduler's testable core:
@@ -79,12 +128,38 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 // would assert nothing at all — a test that cannot fail is not evidence
 // (Docs/agent-guide/build-and-verify.md). casino.SleepFunc is already
 // exported for exactly this reason (see its doc comment, Task 6).
-func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(channelID string, embed *discordgo.MessageEmbed) error, now func() time.Time, sleep casino.SleepFunc) (wait func()) {
+//
+// sendText is the second, plain-text sender the lottery celebration needs.
+// It is a separate parameter rather than a second call on one sender
+// because the two have opposite failure semantics, encoded below.
+func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(channelID string, embed *discordgo.MessageEmbed) error, sendText func(channelID, content string) error, now func() time.Time, sleep casino.SleepFunc) (wait func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		casino.RunAnnounceScheduler(ctx, st, func(job casino.AnnouncementJob) error {
-			return send(job.ChannelID, buildAnnouncementEmbed(job))
+			// The embed decides the job: its error propagates, so
+			// runAnnouncePass leaves LastAnnounced untouched and a later
+			// pass retries the whole posting.
+			if err := send(job.ChannelID, buildAnnouncementEmbed(job)); err != nil {
+				return err
+			}
+			// The celebration is posted AFTER, and only on success, for
+			// exactly that reason: posting it first would re-post it on
+			// every retry of a failing embed, @mentioning the winner again
+			// each time.
+			celebration := lotteryAnnounceCelebration(job.LotteryDraw)
+			if celebration == "" {
+				return nil
+			}
+			if err := sendText(job.ChannelID, celebration); err != nil {
+				// Log only, and return nil. The draw is already committed
+				// to the store and the announcement is already up; failing
+				// the job here would re-post the embed tomorrow morning and
+				// still could not un-lose this message. The result stays
+				// visible via /lottery status (設計書 C-3a §3).
+				slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+			}
+			return nil
 		}, now, sleep)
 	}()
 	return func() { <-done }
@@ -113,6 +188,12 @@ func StartCasinoAnnounceScheduler(ctx context.Context, s *discordgo.Session) (wa
 			// this is the only place the real Discord error (a *url.Error
 			// carrying the request URL) enters the announcement path.
 			return errors.New(redactInteractionError(err))
+		}
+		return nil
+	}, func(channelID, content string) error {
+		_, err := s.ChannelMessageSend(channelID, content)
+		if err != nil {
+			return errors.New(redactInteractionError(err)) // same redaction, same reason
 		}
 		return nil
 	}, time.Now, casino.RealSleepUntil)
