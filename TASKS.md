@@ -38,7 +38,8 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 ## R-004: 配備設定で保存先 `data/` に書けるようにする
 - status: done
 - done-when: non-blocking の運用課題(稼働の前提)。`deploy/systemd/todayistodaybot.service` は `ProtectSystem=strict` で書き込み例外が無く、相対保存先 `/opt/todayistodaybot/data/casino.json` に書けない → `ReadWritePaths=/opt/todayistodaybot/data`(または `StateDirectory=todayistodaybot` と保存先の環境変数)を足す。`deploy/Dockerfile` は非 root ユーザーで `/data` 相当の書き込み先が無い → `VOLUME` と所有者の設定、起動時の作業ディレクトリを明示。`README.md` の配備節に「`data/` の場所と権限」を 1 段落足す。判定: `docker build` はこの PC に Docker が無いので行わない — unit ファイルと Dockerfile の差分を目視し、`systemd-analyze verify` 相当の構文は WSL の `systemd-analyze verify deploy/systemd/todayistodaybot.service`(WSL Ubuntu にある)で確かめる。
-- verify: `wsl -d Ubuntu -- bash -lc "cd /mnt/c/Users/KINGkawamura/Documents/todayistodayBot && systemd-analyze verify deploy/systemd/todayistodaybot.service"`
+- verify: `findstr /C:"ReadWritePaths=/opt/todayistodaybot/data" deploy\systemd	odayistodaybot.service`
+- verify: `findstr /C:"VOLUME" deploy\Dockerfile`
 - verify: `go build ./... && go vet ./...`
 - paths: deploy/systemd/todayistodaybot.service, deploy/Dockerfile, README.md
 - notes: 保存先のパスを決めているコード(`internal/casino/store.go` の既定パス / `internal/store`)を読んで、環境変数で上書きできるならそれを unit に書く。無ければ相対パス前提のまま `ReadWritePaths` だけにする(コードは触らない)。
