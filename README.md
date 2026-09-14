@@ -141,6 +141,20 @@ todayistodayBot/
 
 `/reminder set` を使うには、Botに対象チャンネルでの「Webhookの管理」権限が必要です。
 
+### データ保存先（配備時）
+
+カジノ残高（`data/casino.json`）と chosei-sama のイベント参照（`data/chosei-events.json`）は、
+**プロセスの作業ディレクトリからの相対パス** `data/` に書き込まれます（保存先を変える環境変数はありません）。
+このため配備先では、作業ディレクトリ直下の `data/` が存在し、Bot を動かすユーザーが書き込めることが起動の前提です。
+`deploy/systemd/todayistodaybot.service` は `WorkingDirectory=/opt/todayistodaybot` なので保存先は
+`/opt/todayistodaybot/data` になり、`ProtectSystem=strict` の読み取り専用化から
+`ReadWritePaths=` で外してあります。ディレクトリ自体は unit が作らないので、初回起動前に
+`install -d -o todayistodaybot -g todayistodaybot /opt/todayistodaybot/data` を実行してください。
+`deploy/Dockerfile` は作業ディレクトリを `/app` に固定し、`/app/data` を `botuser`（UID 10001）所有の
+ボリュームにしてあります。ホストのディレクトリをバインドマウントする場合は、そのディレクトリを
+`chown 10001:10001` しておかないと書き込みに失敗します（コンテナでは `config.json` ではなく
+`DISCORD_TOKEN` 環境変数でトークンを渡すのが簡単です）。
+
 ### 高度な設定（通常は不要）
 
 - `CHOSEI_SAMA_BASE_URL` 環境変数: chosei-samaのベースURLを上書きします（既定値

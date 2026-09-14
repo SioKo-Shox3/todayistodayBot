@@ -15,6 +15,12 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# The stores write to paths relative to WorkingDirectory (data/casino.json and
+# data/chosei-events.json), and ProtectSystem=strict makes all of /opt
+# read-only. Without this exception the first save fails with EROFS. The
+# directory must exist and belong to the service user before the first start:
+# install -d -o todayistodaybot -g todayistodaybot /opt/todayistodaybot/data
+ReadWritePaths=/opt/todayistodaybot/data
 
 [Install]
 WantedBy=multi-user.target
