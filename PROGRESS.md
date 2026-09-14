@@ -23,11 +23,16 @@
 
 - C2-03(カードの山とハイ&ローの純粋ロジック)= 8c81337。`cards.go`(`Card`/`Suit`/`Deck`、`NewDeck(n, rng)` は Fisher-Yates、`Draw`/`Remaining`(コピー)/`Len`)と `highlow.go`(`HighLowGame` は全フィールド非公開+アクセサ、`Odds`/`Multiplier`/`Guess`/`CashOut`/`AutoResolve`)。検証出力: `.harness/runs/20260914-121315/verify-C2-03-{1,2,3,4}.txt`(build+vet clean / `TestDeck|TestHighLow` ok・exit=0 / `go test ./...` 8 パッケージ ok / gofmt 差分なし)。統計テストの実測は 1 手あたり RTP 0.9479(100 万手・0.7 秒)。
 
+- C2-03 の評価者指摘(固定山でのロー勝利が未検証)= 8446bbc。`highlow_test.go` に `TestHighLow_LowGuessGrowsThePotAndAdvancesTheBoard` を追加 — 現在 7 / 引く順 `[3,9]` / ベット・ポット 1000 で `Guess(false)`、ポット 1900・現在 3♠・連勝 1・残りハイ 1 枚とロー 0 枚(`LowMultiplier == 0`)を固定。もう 1 件(「指定差分が `paths:` 内に収まっていない」)はコード変更なし: `store.go` / `store_test.go` の変更は C2-02 修正の別コミット `28ff79a`、C2-03 の比較基点は `28ff79a..8c81337`。検証出力: `.harness/runs/20260914-121315/verify-C2-04-3.txt`(`TestDeck|TestHighLow` 37 PASS・exit=0)。
+
+- C2-04(ブラックジャックの純粋ロジック)= 375c178。`blackjack.go`: `BlackjackGame`(全フィールド非公開+アクセサ)、`NewBlackjack(bet, rng)` は 6 デッキのシューから表順(プレイヤー→ディーラー→プレイヤー→ディーラー)に 4 枚配り、ナチュラル 3 分岐を配布時に決着。`Hit` / `Stand` / `Double`(`CanDouble` = 生きている・2 枚・未ダブル)、`playDealer` は `HandValue < 17` の間だけ引く、`Settle`、`AutoResolve`(= スタンド)、`HandValue`(A は 11、入らなければ 1 枚ずつ 1 に落とす)。検証出力: `.harness/runs/20260914-121315/verify-C2-04-{1,2,4}.txt`(build+vet exit=0 / 対象テスト 42 PASS・FAIL 0・exit=0 / `go test ./...` 8 パッケージ ok)。
+
 ## In progress
 - (なし)
 
 ## Next
-- **次は C2-04**(ブラックジャックの純粋ロジック)。`cards.go` の `Deck`/`Card` はそのまま使える(`Draw` は末尾から引く。テストの `deckOf` が引く順で並べ替える)。`internal/commands` 側の配線は C2-06 以降。
+- **次は C2-05**(セッション管理と放置の自動決着)。`internal/casino` の純粋ロジック 2 つ(`HighLowGame` / `BlackjackGame`)は揃った — どちらも `AutoResolve() int64` を持つので、セッション管理はこの 1 メソッドだけを知っていればよい。`internal/commands` 側の配線は C2-06 以降。
+- (済)~~次は C2-04~~(ブラックジャックの純粋ロジック)。`cards.go` の `Deck`/`Card` はそのまま使える(`Draw` は末尾から引く。テストの `deckOf` が引く順で並べ替える)。`internal/commands` 側の配線は C2-06 以降。
 - (済)~~次は C2-03~~(`internal/casino/cards.go` + `highlow.go` の純粋ロジック)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-06)。C2-05 の `SessionManager` はまだ無い。
 - **C-2 開始(2026-09-14)**: 仕様 `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`、タスク C2-01〜C2-08(`TASKS.md`)。ブランチ `feat/casino-c2`。順に消化する。
 - **C-1 は完了**(2026-09-14: R-001〜R-004 着地、Astra 2 周目 PASS、`main` へ ff マージ)。次は稼働(トークンと実行場所はユーザー判断)か C-2(ボタン基盤+ハイ&ロー+ブラックジャック、未設計 → M1 から)。
@@ -35,6 +40,12 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **ブラックジャックの設計(C2-04 で決めた)**: 状態は「進行中 / 終了」の 2 値で、勝敗は `BlackjackResult`(未決・プレイヤー勝ち・ディーラー勝ち・プッシュ・ナチュラル)に分けた。バーストは独立の結果にしない — 相手の勝ちであり、バーストした合計は手札に残るので表示側が読める。`Settle` は状態遷移ではない純粋な読み取り(`CashOut` と違い 2 回呼んでも同じ数を返す)で、二重決済を止めるのはセッション削除と `SettleGame` の `ErrNoGameInProgress`。
+- **ディーラーの 17 はソフト判定を持たない(C2-04)**: `HandValue(dealer) < 17` の間だけ引く。A+6 は `HandValue` が 17 を返すので止まる — 「この 17 はソフトか」という分岐を書かないことがソフト 17 スタンドの実装そのもの。テストは結果で見分ける(誤ってヒットすると A+6+4 = 21 でプッシュになる山を渡す)。
+- **ダブルの順序の危険(C2-04)**: `Double` は `CanDouble` が偽なら `ErrDoubleUnavailable` を返すが、コマンド層は**先に `CanDouble` を見てから `AddToEscrow`** を呼ぶこと。逆順にすると古いメッセージの ⏫ で追加ベットだけ預かられ、手札が数えない預かりが残る(C2-06 以降の配線で守る)。
+- **3:2 の丸め(C2-04)**: `payout = bet + floor(bet*3/2)`。ベット 1 枚なら 2 枚(`floor(1.5) = 1`)。配当の上限は総ベットの 2.5 倍で、ナチュラルはダブルできない(配布時に終わる)ので 2 つの倍率が掛け合わさることはない。境界テストは `2*payout <= 5*totalBet` で見る(除算の丸めを入れない)。
+- **配布をテストから駆動する seam(C2-04)**: `newBlackjackFromShoe(bet, shoe)` は `NewBlackjack` からシャッフルを抜いたもの。ナチュラルの決着は配布の規則なので、終了済みの手札を手で組むテストでは検証にならない。固定山は `cards_test.go` の `deckOf`(引く順に並べる)を使う。
+- **シューは切れない(C2-04)**: 312 枚の中で 1 手は終わるので `mustDraw` の空シューは panic。`Draw` の `ok=false` を無視してゼロ値の `Card` を配ると rank 0 のカードとして描画され 0 点で数えられるため、壊れたシューには黙って続けるより落ちる方を選んだ(`errDeckExhausted` と同じ理由、扱いだけ違う)。
 - **ハイ&ローの数式(C2-03 で確定)**: 倍率は x100 整数の `Multiplier(winning, remaining) = 95*remaining/winning` 一式で、切り捨ては最後に 1 回だけ(常にハウス有利)。ポットは `floor(pot*m/100)`。**同ランクは分母にだけ入る**(高い/低いのどちらの分子にも数えない)ので、ハウス取り分は 5 % + 同ランク分。上限 100 倍は**上限で**支払う(設計書 §6「超えたら上限で自動キャッシュアウト」)— `growPot` が clamp し、オーバーフロー時も cap を返すので clamp は全域。1 手あたり RTP の実測は 0.9479(95 %±1 % に収まる)。
 - **`errDeckExhausted` は到達不能**(C2-03): `Odds` が数える山と `Guess` が引く山は同じなので、当たり枚数 > 0 なら必ずカードが残る。将来この結合が壊れたときに大声で落ちるための防御で、非公開・テスト無し。
 - **預かりと上限の関係(C2-02 の指摘で確定)**: チップ上限 `MaxChips` は **Chips + Escrow** に掛かる。付与(`creditChipsLocked`)は預かりを数え、口座内の移動(`moveToEscrowLocked` / `moveFromEscrowLocked`)は数えない。返金は「返せない」があってはならない — 切り捨てもエラーもチップの消失か永久ロックになる。
