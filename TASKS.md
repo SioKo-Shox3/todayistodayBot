@@ -468,3 +468,53 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: README.md, blocked/C3B-07.md
 - notes: 評価者(反復 3)の所見 1・2。コードは変えない — 文書が実装に追いついていないだけ。閉じるときに `NEXT_FINDINGS.md` の反復 3 節を消す。
+
+# C-3b 区切りレビュー(1 周目)の対応
+
+所見の全文は `.harness/reviews/2026-09-15-astra-casino-c3b-round1.md`。blocking 5 件を C3B-12〜16 に割る。
+設計判断は親が決めた(各 notes)。仕様 § は `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`。
+
+## C3B-12: 精算の入金を他の経路と同じ「上限で切り詰める」形に揃える(blocking 3、P1)
+- status: todo
+- done-when: 月次賞与が口座の空きを埋めた直後の `SettleGame` が `creditChipsLocked`(厳格版)で `ErrChipCapExceeded` を返し、**トランザクション全体(月次切り替えを含む)が巻き戻って何度やっても失敗する**(再現: 7 月首位を `Chips=MaxChips-300`・`Escrow=100`・`SeasonNet=500` にして 8 月の時計で `SettleGame(..., 200)`)。§2 の契約は「配当が口座の上限で入り切らない分は**捨てる**」なので、`SettleGame` の入金を `creditChipsCappedLocked` に変え、`SeasonNet` は**実際に入った額**で数える(§2 の既存規則)。`SettleResult` に実際に入った額が分かる情報を残す(表示が「配当 N」と嘘をつかないこと)。同じ理由で上限に当たりうる他の精算経路(`AcceptDuel` の勝者への入金など)も同じ扱いか確認し、違えば揃える。併せて設計書 §2 冒頭の「合計は不変」「消えない」という無条件の書き方に**上限の例外**を足す(non-blocking 1。実測段落・README・`blocked/C3B-07.md` とは既に整合しているので冒頭だけ)。回帰テスト: 上の再現手順で精算が成功し、入った分だけ増え、`SeasonNet` も入った額で動く / 通常範囲の既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
+- notes: 危険地帯。**「入金が拒否されて取引全体が巻き戻る」形を残さない** — 上限は行き先の問題であって、精算を止める理由にしない(§2)。
+
+## C3B-13: 預かりに持ち主の印を付け、別の盤面の預かりで精算できないようにする(blocking 2 の構造、P1)
+- status: todo
+- done-when: `AcceptDuel`(`store.go` 1570 付近)の確認がゲーム種別と金額だけなので、**別のセッションの預かりで精算できる**(再現: S1 の受諾を `AcceptDuel` 直前で止め、S1 を後始末で閉じて返金 → 同額で S2 を開始 → 止めていた S1 の受諾を再開すると、S2 の預かりで A と B を精算する)。親の決定(2026-09-15): **預かりに持ち主の印を持たせる** — `UserAccount` に `EscrowSession string`(`json:"escrow_session,omitempty"`)を足し、`OpenGame` / `AddToEscrow` がセッション ID を書き、`SettleGame` / `AcceptDuel` / `DeclineDuel` は**渡されたセッション ID と一致するときだけ**精算する(不一致は `ErrNoGameInProgress` 相当の新しいセンチネル `ErrEscrowMismatch`)。呼び出し側(C-2 の H&L / BJ、C-3b の duel、掃除人)はセッション ID を渡す。既存 JSON(印なし)は「印が空なら従来どおり通す」で後方互換を保つ(印が付くのは C3B-13 以降に開かれた盤面だけ)。回帰テスト: 上の再現手順で S1 の受諾が `ErrEscrowMismatch` で拒否され S2 の預かりが動かない / 正常な H&L・BJ・duel の精算が通る / 印の無い既存データの精算が通る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, internal/casino/errors.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go
+- notes: 危険地帯。**この印は C-2 の全ゲームを同じ穴から守る**(duel だけの問題ではない)。`Update` のクロージャ内から公開メソッドを呼ばない。
+
+## C3B-14: 未送達時の後始末を盤面ロックの内側で行い、返金が成功するまで盤面を閉じない(blocking 1、P1)
+- status: todo
+- done-when: `duel.go` 464 付近の後始末(初回 `InteractionRespond` が失敗したときの取り下げ)が、(a) **盤面ロック(`Hold`)を取らずに `Close` する**ため受諾と競合し、(b) **返金の保存より先に `Close` する**ため返金に失敗すると預かりが取り残される(辞退も掃除人の自動返金も効かない)。両方直す: 後始末は受諾・辞退と**同じ per-board ロック**の内側で行い、`DeclineDuel`(返金)が**成功したときだけ** `Close` する。失敗したら盤面を残す(掃除人が 3 分後に再試行する)。C2-10 で掃除人に入れた「精算が成功するまで消さない」規律と同じ形。回帰テスト: 初回応答を失敗させ、返金も 1 回失敗させると盤面が残り、次の掃除人の巡回で返金されて `Escrow` が 0 になる / 後始末と受諾を競わせても二重精算が起きない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/duel.go, internal/commands/duel_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go
+- notes: 危険地帯。C3B-13 の印が入っていれば競合しても誤精算は起きないが、**預かりが取り残される穴はこのタスクで塞ぐ**(印は誤精算を防ぐだけで返金はしない)。
+
+## C3B-15: 挑戦の開始時に受け手の進行中ゲームも断る(blocking 4、P2)
+- status: todo
+- done-when: `/duel` の開始(`duel.go` 430 付近)が挑戦者の進行中しか見ないため、受け手が既にブラックジャック等で預けていても挑戦が公開され、挑戦者のチップが 3 分間拘束される(§4.5 は「どちらかに進行中のゲームがあれば断る」)。開始時に**受け手の `Escrow` も検査**して断る(文言は既存の「❌ 進行中のゲームがあります(先に決着してください)」に相手を示す形へ。例「❌ <@相手> は進行中のゲームがあります」)。受諾時の再検査は**残す**(3 分の間に相手が別のゲームを始めうるため)。検査は `Store` 側に読み取りメソッドを足して 1 回の `Update`/`Snapshot` で行う(コマンド層で口座を直接触らない)。回帰テスト: 受け手が預かり中なら挑戦が始まらず挑戦者のチップも減らない / 受け手が空いていれば従来どおり / 受諾時の再検査が生きている。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/duel.go, internal/commands/duel_test.go, internal/casino/store.go, internal/casino/store_test.go
+- notes: 受け手が「口座を持っていない」場合は進行中ではない(拒否しない)。
+
+## C3B-16: 掲示済みの記録に失敗したときの再送を減らし、契約を明記する(blocking 5、P2)
+- status: todo
+- done-when: `casino_announce.go` 293 付近は結果の送信に成功した後の `MarkSeasonAnnounced` の失敗をログに残して続行するため、**送信済みなのに未送信として次の巡回で再送**される(メンション付きの結果が二度出る)。親の決定(2026-09-15): 完全な一度きりは二相コミットが要るので狙わない — **(a) 記録を短い間隔で数回(3 回まで)再試行し、(b) それでも失敗したら「送信済みだが記録できなかった」ことを警告としてログに残し、(c) 契約を `at-least-once`(記録に失敗した回は再送されうる)として設計書 §4 と `blocked/C3B-07.md` に明記する**。同じ形の記録(`MarkAnnounced`・宝くじの待ち行列)にも同じ再試行を入れるかは実装者が判断し、入れないなら理由を進捗に書く。回帰テスト: 記録が 1 回失敗 → 2 回目で成功すると再送されない / 3 回とも失敗すると警告が出て(再送はされうる)、次の巡回で記録が成功すれば以後は再送されない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
+- notes: **嘘を書かない** — 「必ず一度だけ」とは書かず、再送されうる条件をそのまま書く(C-3a の「精算失敗は手動再試行だけが出口」と同じ扱い)。
