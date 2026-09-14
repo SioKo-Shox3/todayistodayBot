@@ -4,6 +4,10 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-13(永続化された数値を読み取り点で正規化し、算術の桁あふれを一箇所で断つ)= コミット `b02581e`。C3-11 の差し戻し(`NEXT_FINDINGS.md` の反復 2)。**個別の加算にガードを足す直し方をやめた** — プールへの加算 → ハウス分 → 残額 → 繰り越し と 3 度「直した次の変数」で破綻していたのは、検査の場所が算術の側にあったから。`normalizeLotteryLocked(lottery *Lottery)` を `store.go` の宝くじ節に足し、日次ロールオーバー(`ensureTodayRateIndexLocked`)で **`seedJackpotLocked` と `drawLotteryLocked` の両方より前に**呼ぶ。`Sales` / `Carryover` → `[0, MaxChips]`、`Tickets` の各値 → `[1, LotteryMaxTicketsPerDraw]`(0 以下は `delete`、空になったら map ごと nil)。
+  **順序が要件**: 後ろに置くと「既にあふれた値を丸める」ことになり何も直らない。これは mutation で確かめてある(正規化を `drawLotteryLocked` の後ろへ移すとテスト 2 件が落ちる)。読み取り経路は `BuyLotteryTickets` / `LotteryStatus` / `collectDailyAnnouncements` の 3 つで、いずれも `ensureTodayRateLocked` を通るので追加の呼び出しは不要 — `MarkAnnounced` だけは通らないが `Unannounced` しか触らないので正規化の対象外。
+  正規化後の余裕は `types.go` のコメントに既存の `MaxChips`/`MaxCoins` 分析と同じ論法で書いた: `sales*90 = 9e13`、`prize = floor(Sales×90/100) + Carryover < 2e12` で `math.MaxInt64` の 4.6e6 分の 1。`LotteryPrize` の「桁あふれしない」というコメントは**正規化済み入力が前提**である旨へ直した(符号の修復はその場に残し、大きさの上限は二重に書かない — `MaxChips` と歩調を合わせる場所を 2 つにしないため)。設計書 §8 に規律そのものを書いた。
+  検証出力: `.harness/runs/20260915-014154/verify-C3-13-{1,2,3}.txt`(build+vet exit=0 / casino の絞り込み ok exit=0 / `go test ./...` 8 パッケージ ok exit=0)。mutation は `mutation-C3-13.txt`(呼び出しを消す → 3 件落ちる / 抽選の後ろへ移す → 2 件落ちる)。評価者が「壊れた状態を合格させている」と指摘した既存テストは、当選者残高 900・`Carryover = MaxInt64-40`・`Sales = 100`・プール 5000 で **当選者が `MaxChips` に到達し、プールが 5000 → 6000(残額 990 + ハウス分 10)になる**ことを見るテストへ書き換えた。
 - C3-12(未掲示の当選を 1 枠で上書きしない — 掲示待ちの回を並べて持つ)= コミット `2395498`。C3-08 の差し戻し(`NEXT_FINDINGS.md` の反復 2)。`Lottery.Unannounced []LotteryDraw`(`json:"unannounced,omitempty"`)を足し、`drawLotteryLocked` は当選者が出た回をここへ**追記**する。`LastDraw` は据え置き — **この 2 つは違う問いに答える**: `LastDraw` は `/lottery status` の「直近の結果は」で 1 枠が正しく、掲示は「まだ知らせていない回は」なので待ち行列が要る。1 枠しか無いと、9 時に落ちていて復旧後に前日分を精算し、その日の購入を挟んで翌朝もう 1 回抽選が走る経路で**先の当選者が上書きされて永久に掲示されない**(評価者の再現手順そのまま)。
   待ち行列から消えるのは `MarkAnnounced`(= 送信成功時だけ呼ばれる)で、消すのは **`Date <= date` の回だけ** — 送信中に発生した回は日付が後なので残り、次の巡回で掲示される。空になったら `nil` に戻す(`omitempty` が空配列をファイルに書かないように)。上限は `lotteryUnannouncedLimit = 7` で、超えたら**古い方から**落とす(賞金は抽選時に支払い済みなので落ちるのは掲示だけ。掲示チャンネルを消したギルドがファイルを無限に太らせない)。`collectDailyAnnouncements` は `Unannounced` を**そのまま**(日付で絞らずコピーして)job に載せる — ここで `LastAnnounced` と突き合わせ直すと「未掲示は 1 件で最終掲示日より後」という壊れた前提が戻ってくる。既存 JSON は `unannounced` キーが無いので nil = 空の待ち行列として読める(移行処理なし)。
   掲示側は `AnnouncementJob.LotteryDraw *LotteryDraw` → `LotteryDraws []LotteryDraw`。embed の 🎟️ フィールドは待ち行列の全件を**各回の日付付きで 1 行ずつ**並べ、最後に今開いている壺の行。祝いは**回ごとに 1 通**送る(当選者が別人なので、まとめると片方のメンションが落ちる)。1 通の送信失敗は従来どおりログのみで `continue` — 掲示は既に上がっているので job を失敗させても失った 1 通は戻らない。
@@ -94,6 +98,9 @@
 - (なし)
 
 ## Next
+- **`TASKS.md` に未完のタスクは無い。** 次はここから先へ進むために `TASKS.md` へ項目を足す必要がある(M1 へ戻る)。候補は `NEXT_FINDINGS.md` に残っている 3 件 — 所見 2(当選者がいない回でハウス分が消える。**通貨が消える既知の穴としては最優先**。`lottery.Carryover = prize` の経路に `creditJackpotCappedLocked(economy, house)` を足す)/ 所見 3(`creditChipsCappedLocked` の `headroom` が `Chips = Escrow = MaxInt64` の手編集であふれる。**今回の規律をそのまま口座側へ適用する — 個別の引き算にガードを足すのではなく、口座の読み取り点に正規化を置く**)/ 所見 4(`casino_announce.go` 108 付近の旧挙動コメント。文字だけ)。C3-09 の反復 3(`DrawDate == ""` のテスト不足)と C3-12 の反復 3(許可パス)は既にコミット済みの対応がある。
+- **`NEXT_FINDINGS.md` から今回消したのは「反復 2」(C3-11 の差し戻し)の節だけ。** `## C3-07 の区切り評価` の所見 2・3・4、C3-09 の反復 3、C3-12 の反復 3 は残してある。
+- **新しい永続フィールドを足したら、その読み取り点に正規化を置くか、既存の正規化点を通ることを確かめる。** 現在の正規化点は `ensureTodayRateIndexLocked` の先頭にある 2 つだけ(`seedJackpotLocked` と `normalizeLotteryLocked`)で、レートの修復も同じ場所にある。ここを通らない読み取り経路を足すと、今回閉じた穴がその経路から開き直す。
 - **次は C3-13(永続値の読み取り点での正規化)**。`TASKS.md` の未完はこれ 1 件。入力は `NEXT_FINDINGS.md` の「反復 2」(C3-11 の差し戻し: プールに空きがあっても桁あふれした賞金が消える)と、`## C3-07 の区切り評価` に残っている所見 2・3。
 - **`NEXT_FINDINGS.md` から消したのは C3-08 の反復 2 の節だけ**(C3-12 で閉じた)。`## C3-07 の区切り評価` の所見 2・3・4 と、C3-09 の反復 3、C3-11 の反復 2 は残してある。
 - **掲示待ちに手を入れるときの不変条件**: 待ち行列を消してよいのは `MarkAnnounced` だけで、条件は `Date <= date`。「掲示したら全部消す」に変えると、送信中に確定した回が一度も出ないまま消える。`collectDailyAnnouncements` 側で日付の絞り込みを足すのも同じ穴を開ける。
