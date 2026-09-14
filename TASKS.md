@@ -289,3 +289,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/types.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/slot.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md, blocked/C3-06.md
 - notes: 危険地帯(資金の保存則)。プール ≤ 1e12・加算 ≤ 1e12 なので、正規化点を通れば `int64` に対して十分な余裕がある(`types.go` の既存の分析と同じ論法で書く)。閉じたら `NEXT_FINDINGS.md` の当該 2 節を消す。
+
+## C3-12: 未掲示の当選を 1 枠で上書きしない — 掲示待ちの回を並べて持つ(C3-08 の差し戻し)
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の「反復 2」の節(`LastDraw` が 1 枠なので、未掲示の回が次の抽選で上書きされて永久に掲示されない)を閉じる。親の決定(2026-09-14): **掲示待ちの回を並べて持つ**。(1) `Lottery` に `Unannounced []LotteryDraw`(`json:"unannounced,omitempty"`)を足し、`drawLotteryLocked` は当選者がいた回をここに**追記**する(`LastDraw` は `/lottery status` 用の最新 1 件として従来どおり更新)。上限 7 件、超えたら古い方から落とす(賞金は抽選時に支払い済みなので、落ちるのは掲示だけ。ファイルを無制限に太らせない)。(2) `AnnouncementJob` の `LotteryDraw *LotteryDraw` を `LotteryDraws []LotteryDraw` に変え、`CollectDailyAnnouncements` は `Unannounced` を**そのまま**渡す(日付での絞り込みはしない)。(3) `MarkAnnounced(guildID, date)` は `LastAnnounced` を書くのに加えて、`Unannounced` から `Date <= date` の要素を取り除く(送信成功時だけ呼ばれるので、失敗した回は残って次の巡回で再送される。送信中に発生した新しい回は日付が後なので消えない)。(4) 掲示 embed は待ち行列の全件を出し(複数なら日付付きで並べる)、当選者のいる回ごとに公開の祝いを送る。`announce_test.go` / `casino_announce_test.go`: 13 日の当選が未掲示のまま 14 日の抽選が起きても両方が job に入る / `MarkAnnounced` 後は消える / 送信失敗(= `MarkAnnounced` を呼ばない)なら次の巡回でまた入る / 8 回連続で溜まったら古い 1 件が落ちて 7 件になる / 当選者のいない回は溜まらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced|TestLottery|TestStore" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/types.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: 既存 JSON(`unannounced` 無し)はそのまま読める(`omitempty` + nil スライス)。設計書 §3 の掲示の節に「掲示待ちは並べて持ち、送信成功で消す(最大 7 件)」を書く。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
