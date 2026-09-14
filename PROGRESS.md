@@ -4,6 +4,20 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-06(9 時掲示のシーズン欄と閉じた回の結果発表)= コミット `2910ca0`。証拠 `.harness/runs/20260915-064206/verify-C3B-06-{1,2,3,4}.txt`(4 本とも exit=0)。
+  **掲示済みの判定は `GuildEconomy.LastSeasonAnnounced`(月 `"2006-01"` の high-water)**。宝くじが**待ち行列**(`Unannounced`)を持つのは、掲示が止まっている間に抽選が毎日積み上がるから。シーズンは**月に1回しか閉じない**ので、保持するのは `LastSeason` 1 件で足り、必要なのは「その1件を channel が既に見たか」だけ = 境界1本。判定は `LastSeason.Month > LastSeasonAnnounced`(`!=` ではない — C3-19 と同じ理由で、時計が戻ったギルドが済んだ月を開き直して上位3名を二度 @メンションするのを断つ)。空文字の月は `MarkSeasonAnnounced` の no-op(`"" > x` は常に偽)なので、閉じた回を持たない巡回が境界を白紙に戻せない。
+  **`LastAnnounced` と分けたのが要点**。embed と結果発表は**別メッセージで別々に失敗する**。1本の境界にすると、結果発表だけが落ちた朝に (a) 境界を進める = 祝いを失う、(b) 進めない = 翌朝 embed ごと二重掲示(宝くじ当選者も再 @メンション)、のどちらかしか選べない。2本あるので「embed は載った、結果は次の巡回へ」が言える。
+  **`MarkSeasonAnnounced` は `runAnnouncePass` ではなく `internal/commands` のコールバック内で呼ぶ**。`AnnounceCallback` は `error` 1 本しか返さないので、「embed は成功・祝いは失敗」を `runAnnouncePass` へ伝える経路が無い。送信の直後に印を付けるのが唯一の場所(宝くじの祝いが `sendText` の失敗を**ログのみ**にしているのと同じ判断。ただしこちらは**印を付けずに `return nil`** する = 次の巡回が同じ結果をまた運ぶ)。
+  **上位3名は `SeasonRanks` を `topAssetsLocked` の後で呼ぶ**。`SeasonRanks` は保存値を**丸めずに**比較するだけなので、手編集の `season_net` を弾くのは `topAssetsLocked` が通りがけに回す `normalizeAccountLocked`(`SeasonStatus` が同じ理由で明示ループを持つ)。件数は `seasonRankLimit`(3)で、リテラルの 3 は使わない — 掲示の表彰台と精算の表彰台がずれない。
+  **祝いの本文は `Bonus`(実際に入った額)を出す**。上限に座った勝者は表の 10,000 より少ない額しか受け取らないので、`SeasonBonus(rank)` を出すと残高が裏付けない数字になる(`LotteryDraw.Prize` と同じ規律)。表彰台は**メダル3枚で切る** — 手編集の `last_season` が 50 行持っていても 50 人を @メンションしない。`Ranks` が空の月(誰も遊ばなかった)は本文が `""` = 送らないが、**印は付ける**(再送しても誰も居ない)。
+  **掲示チャンネル未設定なら何も起きない**。`collectDailyAnnouncements` がそのギルドを飛ばすので job 自体が出ず、印も付かない。結果は `LastSeason` に残るので `/season` から読め、後でチャンネルを設定した巡回がそのまま運ぶ(`TestCollectDailyAnnouncements_NoChannelKeepsTheClosedSeasonPending` が両方を固定)。
+  **既存テストの期待値を 1 か所だけ直した**: embed のフィールド数 3 → 4(`len(embed.Fields)`)。主張は「どのフィールドが在るか」で、弱めていない。
+  **「コピーを返す」テストは書かなかった**。`Update` は毎回ファイルから読み直し `Store` は Data を持たない(`Snapshot` の doc)ので、`job.SeasonClosed` にストア側のポインタを渡す変異を入れても**ファイルは壊れない** = 落ちないテストになる。実装のコピーは残す(`LotteryDraws` と同じ防御)が、落ちない検査は証拠ではないので消した。
+  **効き目の確認**(`mutation-C3B-06.txt`、3 本。いずれも狙ったテストだけが落ちる): M1 high-water 判定を外す → 掲示済みの回が毎朝よみがえる 4 件 / M2 送信失敗でも印を付ける → 失敗した結果が二度と送られない 1 件 / M3 job から今月の表彰台を落とす → 1 件。
+- NEXT_FINDINGS(反復 1 の NEEDS_WORK: 月替わりの競合で表示月と残り日数が食い違う)= コミット `c79bad2`。証拠 `.harness/runs/20260915-064206/findings-C3B-05-1.txt`(exit=0)。
+  **月は永続値・残り日数は引数と、出所が違った**。`SeasonStatus` の `Month` は `economy.SeasonMonth`(ロールオーバーが**前進のみ**で書く)、`DaysLeft` は呼び出し側がロック前に読んだ `now`。JST 8/01 00:00 と 7/31 23:59:59 が**逆順で**ストアに着くと、後者は 8 月の表を渡されたまま 7 月の最終日を数えて「8月・残り1日」と出す。
+  **直し方は `seasonDaysLeftIn(month, now)`** — 遅れて着いた `now` を**その月の初日まで引き上げる**。逆向きに食い違うことは無い(ロールオーバーが同じ `Update` の中で走るので、`SeasonMonth` が `now` の月より後ろにはならない)。読めない `season_month` は `now` にそのまま落とす(`lotteryDrawDateLabel` と同じ — 手編集の値から月の長さを推測しない)。
+  **効き目の確認**: `DaysLeft` を `SeasonDaysLeft(now)` に戻すと `TestStore_SeasonStatus_LateArrivalCountsTheMonthItIsShown` が評価者の再現どおり `DaysLeft = 1, want 31` で落ちる。
 - C3B-05(`/season` と `/balance` の今月の純利)= コミット `bc14bec`。証拠 `.harness/runs/20260915-064206/verify-C3B-05-{1,2,3}.txt`(3 本とも exit=0)。
   **`SeasonStatus` はロールオーバーを通す読み取り**。`ensureTodayRateLocked` を呼ぶので、月初の `/season` は前月を閉じて賞与を払ってから今月の(空の)表を返す — 通さないと「もう誰かの手で閉じられる運命の表」を現役として見せることになる。順位表は `SeasonTopLimit`(10)で切るが**自分の順位は切らない**: `SelfRank` は全体順位なので 12 位の人には「12位」と出る(0 = 純利 0 の圏外)。`Players` は純利が動いた人数で、`SeasonResult.Players` と同じ定義。
   **`Last` はスライスごとコピーして返す**。`economy.LastSeason` のポインタを渡すと、表示側の書き込みが次の `Update` のスナップショットに載る。テストは返った `Last` を書き換えてからファイルを読み直して確かめている。
@@ -174,7 +188,8 @@
 - (なし)
 
 ## Next
-- **次は C3B-06**(9 時掲示のシーズン欄と結果の祝い)。表示側で残っているのは掲示だけ — `/season` と `/balance` は C3B-05 で閉じた。`SeasonStatus` と同じ数(上位 3 名・純利)を掲示が必要とするが、掲示は `AnnouncementJob` を組む側(`internal/casino/announce.go`)なので、`SeasonView` を再利用するのではなく `LastSeason` / `SeasonRanks` を直に読む形になる。
+- **次は C3B-07**(README・設計書の実測・architecture の追記案)= `TASKS.md` の最後の未完。C-3b の実装は C3B-06 で全部閉じた。README のコマンド一覧に `/duel` と `/season` が無いのはここで拾う(下の残件と同じもの)。
+- **旧: 次は C3B-06**(9 時掲示のシーズン欄と結果の祝い)。表示側で残っているのは掲示だけ — `/season` と `/balance` は C3B-05 で閉じた。`SeasonStatus` と同じ数(上位 3 名・純利)を掲示が必要とするが、掲示は `AnnouncementJob` を組む側(`internal/casino/announce.go`)なので、`SeasonView` を再利用するのではなく `LastSeason` / `SeasonRanks` を直に読む形になる。
 - **`README.md` のコマンド一覧に `/duel` と `/season` はまだ無い**。C3B-05 の `paths:` に README が無かったので触っていない(`/help` はレジストリ生成なので自動で載る)。README を触るタスクで拾う。
 - **旧: 次は C3B-05**(`TASKS.md` の未完の先頭)。C3B-04 で C-3b のゲーム側は閉じた — 残るのは見せる側(`/season`、`/balance` の今月の純利行、9 時掲示のシーズン欄、`/help` と README の一覧)。
 - **`/help` と `README.md` に `/duel` を足すのはまだ**(§5 は `/season` と同じタスクで足すと書いている)。C3B-04 では触っていない。
