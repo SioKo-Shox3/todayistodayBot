@@ -55,10 +55,10 @@ func (c *RankCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 		// §3.8: /rank も共通入口を通す(実行者に口座が無いまま順位表だけ見える、
 		// という経路依存をなくす)。
 		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, now); err != nil {
-			slog.Error("casino: EnsureCasinoAccess failed", "command", "rank", "error", err)
+			slog.Error("casino: EnsureCasinoAccess failed", "command", "rank", "error", redactInteractionError(err))
 			content = "❌ カジノの初期化に失敗しました。"
 		} else if entries, err := c.store.TopAssets(i.GuildID, now, 10); err != nil {
-			slog.Error("casino: TopAssets failed", "error", err)
+			slog.Error("casino: TopAssets failed", "error", redactInteractionError(err))
 			content = "❌ ランキングの取得に失敗しました。"
 		} else {
 			content = formatRankMessage(entries)

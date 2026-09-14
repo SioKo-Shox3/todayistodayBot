@@ -40,10 +40,10 @@ func (c *BalanceCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCr
 		// §3.8: open the account (+ welcome bonus) and today's rate as their
 		// OWN committed transaction, before anything that can fail.
 		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, now); err != nil {
-			slog.Error("casino: EnsureCasinoAccess failed", "command", "balance", "error", err)
+			slog.Error("casino: EnsureCasinoAccess failed", "command", "balance", "error", redactInteractionError(err))
 			content = "❌ カジノの初期化に失敗しました。"
 		} else if view, err := c.store.ViewAccount(i.GuildID, userID, now); err != nil {
-			slog.Error("casino: ViewAccount failed", "error", err)
+			slog.Error("casino: ViewAccount failed", "error", redactInteractionError(err))
 			content = "❌ 残高の取得に失敗しました。"
 		} else {
 			content = formatBalanceMessage(view)

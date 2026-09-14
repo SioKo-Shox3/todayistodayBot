@@ -81,7 +81,7 @@ func (c *ScheduleResultCommand) buildResultEmbed(ctx context.Context, channelID,
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("❌ このイベントはchosei-sama側で見つかりませんでした。")
 		}
-		slog.Error("choseisama: GetEvent failed", "error", err)
+		slog.Error("choseisama: GetEvent failed", "error", redactInteractionError(err))
 		return nil, fmt.Errorf("❌ 日程調整結果の取得に失敗しました。")
 	}
 

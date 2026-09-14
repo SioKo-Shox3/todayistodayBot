@@ -41,7 +41,7 @@ func (c *DailyCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 	} else {
 		userID := resolveUserID(i)
 		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, time.Now()); err != nil { // §3.8
-			slog.Error("casino: EnsureCasinoAccess failed", "command", "daily", "error", err)
+			slog.Error("casino: EnsureCasinoAccess failed", "command", "daily", "error", redactInteractionError(err))
 			content = "❌ カジノの初期化に失敗しました。"
 		} else {
 			// No instant is passed: ClaimDaily reads the clock inside its own
@@ -54,7 +54,7 @@ func (c *DailyCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 			case errors.Is(err, casino.ErrChipCapExceeded):
 				content = "❌ チップ残高が上限に達しているため受け取れません。"
 			case err != nil:
-				slog.Error("casino: ClaimDaily failed", "error", err)
+				slog.Error("casino: ClaimDaily failed", "error", redactInteractionError(err))
 				content = "❌ デイリーボーナスの受け取りに失敗しました。"
 			default:
 				content = formatDailyMessage(resolveDisplayName(i), result)

@@ -1,6 +1,9 @@
 package commands
 
 import (
+	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -199,5 +202,61 @@ func TestMarketCommentary_LegacyEmptyEventTreatedAsNone(t *testing.T) {
 	history := []casino.DailyRate{{Trend: casino.TrendBull, Event: ""}}
 	if got := marketCommentary(history); got != "コイン強気1日目。天井はどこだ?" {
 		t.Fatalf("unexpected commentary: %q", got)
+	}
+}
+
+// TestRedactInteractionError_DropsTokens pins the one property every log site
+// in this package depends on: whatever comes back, it does not carry the
+// Discord token. The *url.Error case is what net/http actually hands back
+// from a failed InteractionRespond; the string cases cover errors from other
+// layers that merely quote a path.
+func TestRedactInteractionError_DropsTokens(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantContain string
+	}{
+		{
+			name:        "url.Error from InteractionRespond",
+			err:         &url.Error{Op: "Post", URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback", Err: errors.New("connection reset")},
+			wantContain: "connection reset",
+		},
+		{
+			name:        "url.Error from a webhook edit",
+			err:         &url.Error{Op: "Patch", URL: "https://discord.com/api/v9/webhooks/1/TEST_TOKEN/messages/@original", Err: errors.New("timeout")},
+			wantContain: "timeout",
+		},
+		{
+			name:        "wrapped url.Error",
+			err:         fmt.Errorf("reveal: %w", &url.Error{Op: "Post", URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback", Err: errors.New("EOF")}),
+			wantContain: "EOF",
+		},
+		{
+			name:        "plain error quoting an interaction path",
+			err:         errors.New("HTTP 401 Unauthorized on /interactions/1/TEST_TOKEN/callback"),
+			wantContain: "[redacted]",
+		},
+		{
+			name:        "plain error quoting a webhook path",
+			err:         errors.New("HTTP 404 on /webhooks/1/TEST_TOKEN/messages/@original"),
+			wantContain: "[redacted]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactInteractionError(tc.err)
+			if strings.Contains(got, "TEST_TOKEN") {
+				t.Fatalf("redactInteractionError kept the token: %q", got)
+			}
+			if !strings.Contains(got, tc.wantContain) {
+				t.Fatalf("redactInteractionError = %q, want it to still say %q", got, tc.wantContain)
+			}
+		})
+	}
+}
+
+func TestRedactInteractionError_NilError(t *testing.T) {
+	if got := redactInteractionError(nil); got != "<nil>" {
+		t.Fatalf("redactInteractionError(nil) = %q, want \"<nil>\"", got)
 	}
 }

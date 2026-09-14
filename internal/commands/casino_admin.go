@@ -50,7 +50,7 @@ func translateMintError(err error) string {
 	case errors.Is(err, casino.ErrCoinCapExceeded), errors.Is(err, casino.ErrAmountOverflow):
 		return "❌ 発行枚数が大きすぎます。対象ユーザーの残高上限を超えます。"
 	default:
-		slog.Error("casino: Mint failed", "error", err)
+		slog.Error("casino: Mint failed", "error", redactInteractionError(err))
 		return "❌ コインの発行に失敗しました。"
 	}
 }
@@ -70,7 +70,7 @@ func (c *CasinoAdminCommand) handleMint(guildID string, opts []*discordgo.Applic
 	// cap-exceeded Mint cannot roll their brand-new account and welcome bonus
 	// back. (The invoking admin's own account is opened by buildResponse.)
 	if err := c.store.EnsureCasinoAccess(guildID, targetUserID, now); err != nil {
-		slog.Error("casino: EnsureCasinoAccess failed", "command", "casino-admin/mint", "error", err)
+		slog.Error("casino: EnsureCasinoAccess failed", "command", "casino-admin/mint", "error", redactInteractionError(err))
 		return "❌ カジノの初期化に失敗しました。"
 	}
 	if err := c.store.Mint(guildID, targetUserID, amount); err != nil {
@@ -87,7 +87,7 @@ func (c *CasinoAdminCommand) handleChannel(guildID string, opts []*discordgo.App
 		}
 	}
 	if err := c.store.SetAnnounceChannel(guildID, channelID); err != nil {
-		slog.Error("casino: SetAnnounceChannel failed", "error", err)
+		slog.Error("casino: SetAnnounceChannel failed", "error", redactInteractionError(err))
 		return "❌ 掲示チャンネルの設定に失敗しました。"
 	}
 	return fmt.Sprintf("✅ 掲示チャンネルを <#%s> に設定しました。", channelID)
@@ -104,7 +104,7 @@ func (c *CasinoAdminCommand) buildResponse(i *discordgo.InteractionCreate, now t
 		return msg
 	}
 	if err := c.store.EnsureCasinoAccess(i.GuildID, resolveUserID(i), now); err != nil { // §3.8
-		slog.Error("casino: EnsureCasinoAccess failed", "command", "casino-admin", "error", err)
+		slog.Error("casino: EnsureCasinoAccess failed", "command", "casino-admin", "error", redactInteractionError(err))
 		return "❌ カジノの初期化に失敗しました。"
 	}
 	data := i.ApplicationCommandData()

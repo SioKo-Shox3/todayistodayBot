@@ -133,7 +133,7 @@ func (c *ReminderCommand) handleSet(ctx context.Context, webhookCreator discordW
 
 	webhook, err := webhookCreator.WebhookCreate(channelID, "chosei-sama リマインダー", "")
 	if err != nil {
-		slog.Error("discord: WebhookCreate failed", "error", err)
+		slog.Error("discord: WebhookCreate failed", "error", redactInteractionError(err))
 		return "❌ Discord Webhookの作成に失敗しました。Botに「Webhookの管理」権限があるか確認してください。"
 	}
 	webhookURL := fmt.Sprintf("https://discord.com/api/webhooks/%s/%s", webhook.ID, webhook.Token)
@@ -147,7 +147,7 @@ func (c *ReminderCommand) handleSet(ctx context.Context, webhookCreator discordW
 		MentionEveryone:     mentionEveryone,
 	})
 	if err != nil {
-		slog.Error("choseisama: SetDiscordReminder failed", "error", err)
+		slog.Error("choseisama: SetDiscordReminder failed", "error", redactInteractionError(err))
 		return "❌ リマインダーの登録に失敗しました。"
 	}
 
@@ -181,7 +181,7 @@ func (c *ReminderCommand) handleOff(ctx context.Context, opts []*discordgo.Appli
 		if errors.As(err, &apiErr) && apiErr.Code == "discord_webhook_url_required" {
 			return "❌ まだリマインダーが設定されていません。先に `/reminder set` を実行してください。"
 		}
-		slog.Error("choseisama: SetDiscordReminder (off) failed", "error", err)
+		slog.Error("choseisama: SetDiscordReminder (off) failed", "error", redactInteractionError(err))
 		return "❌ リマインダーの無効化に失敗しました。"
 	}
 	return "✅ リマインダーを無効化しました。"
@@ -202,7 +202,7 @@ func (c *ReminderCommand) handleStatus(ctx context.Context, opts []*discordgo.Ap
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
 			return "❌ このイベントの操作権限が確認できませんでした。"
 		}
-		slog.Error("choseisama: GetOwnerView failed", "error", err)
+		slog.Error("choseisama: GetOwnerView failed", "error", redactInteractionError(err))
 		return "❌ リマインダー設定の取得に失敗しました。"
 	}
 

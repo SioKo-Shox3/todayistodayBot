@@ -61,7 +61,7 @@ func translateExchangeError(err error) string {
 	case errors.Is(err, casino.ErrCoinCapExceeded):
 		return "❌ 両替するとコイン残高が上限を超えます。もっと少ない枚数を指定してください。"
 	default:
-		slog.Error("casino: exchange failed", "error", err)
+		slog.Error("casino: exchange failed", "error", redactInteractionError(err))
 		return "❌ 両替に失敗しました。"
 	}
 }
@@ -98,7 +98,7 @@ func (c *ExchangeCommand) Handle(s *discordgo.Session, i *discordgo.InteractionC
 		now, userID := time.Now(), resolveUserID(i)
 		data := i.ApplicationCommandData()
 		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, now); err != nil { // §3.8
-			slog.Error("casino: EnsureCasinoAccess failed", "command", "exchange", "error", err)
+			slog.Error("casino: EnsureCasinoAccess failed", "command", "exchange", "error", redactInteractionError(err))
 			content = "❌ カジノの初期化に失敗しました。"
 		} else if len(data.Options) == 0 {
 			content = "❌ サブコマンドを指定してください（coin-to-chip / chip-to-coin）。"

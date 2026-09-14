@@ -1,7 +1,10 @@
 package commands
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +17,8 @@ import (
 // reveal animation can be asserted without a Discord connection.
 type fakeSlotResponder struct {
 	respondErr    error
-	editErrAtCall int // 1-based edit call that fails; 0 = never
+	editErr       error // error the failing edit returns; nil = a generic one
+	editErrAtCall int   // 1-based edit call that fails; 0 = never
 	responded     []string
 	edited        []string
 	sentChannels  []string
@@ -35,6 +39,9 @@ func (f *fakeSlotResponder) InteractionResponseEdit(interaction *discordgo.Inter
 	}
 	f.edited = append(f.edited, *newresp.Content)
 	if f.editErrAtCall != 0 && len(f.edited) == f.editErrAtCall {
+		if f.editErr != nil {
+			return nil, f.editErr
+		}
 		return nil, errors.New("edit failed")
 	}
 	return &discordgo.Message{}, nil
@@ -261,5 +268,72 @@ func TestSlotCommand_FirstAccess_OpensAccountWithWelcomeBonus(t *testing.T) {
 	// The welcome bonus is what makes a brand-new user's first /slot playable.
 	if _, err := store.Spin("g1", "u1", 10); err != nil {
 		t.Fatalf("Spin right after the first access: %v", err)
+	}
+}
+
+// captureSlogOutput swaps the default slog logger for the duration of the
+// test and returns the buffer every log line lands in. runReveal logs through
+// the package-level slog, which is what production writes to a file.
+func captureSlogOutput(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
+
+// TestRunReveal_DiscordFailure_DoesNotLogInteractionToken is the §R-003
+// regression: net/http returns a *url.Error carrying the full request URL,
+// and that URL contains the interaction token. Logging the error verbatim
+// writes the token to disk. Both the initial respond and the reveal edits
+// must go through redactInteractionError.
+func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
+	result := casino.SpinResult{
+		Reels:  [3]casino.SlotSymbol{casino.SymbolCherry, casino.SymbolLemon, casino.SymbolGrape},
+		Bet:    10,
+		Payout: 0,
+	}
+	tests := []struct {
+		name      string
+		responder *fakeSlotResponder
+	}{
+		{
+			name: "initial respond fails",
+			responder: &fakeSlotResponder{respondErr: &url.Error{
+				Op:  "Post",
+				URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback",
+				Err: errors.New("connection reset by peer"),
+			}},
+		},
+		{
+			name: "a reveal edit fails",
+			responder: &fakeSlotResponder{editErrAtCall: 1, editErr: &url.Error{
+				Op:  "Patch",
+				URL: "https://discord.com/api/v9/webhooks/1/TEST_TOKEN/messages/@original",
+				Err: errors.New("connection reset by peer"),
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureSlogOutput(t)
+			cmd := &SlotCommand{}
+
+			if err := cmd.runReveal(tc.responder, &discordgo.Interaction{}, "c1", "u1", result, func(time.Duration) {}); err != nil {
+				t.Fatalf("runReveal returned error: %v", err)
+			}
+
+			out := logged.String()
+			if !strings.Contains(out, "connection reset by peer") {
+				t.Fatalf("the Discord failure was not logged at all: %q", out)
+			}
+			if strings.Contains(out, "TEST_TOKEN") {
+				t.Fatalf("the interaction token reached the log: %q", out)
+			}
+			if strings.Contains(out, "discord.com/api") {
+				t.Fatalf("the request URL reached the log: %q", out)
+			}
+		})
 	}
 }

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -101,6 +102,12 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 func StartCasinoAnnounceScheduler(ctx context.Context, s *discordgo.Session) (wait func()) {
 	return startAnnounceScheduler(ctx, casino.Default(), func(channelID string, embed *discordgo.MessageEmbed) error {
 		_, err := s.ChannelMessageSendEmbed(channelID, embed)
-		return err
+		if err != nil {
+			// The scheduler logs whatever this returns, so redact here:
+			// this is the only place the real Discord error (a *url.Error
+			// carrying the request URL) enters the announcement path.
+			return errors.New(redactInteractionError(err))
+		}
+		return nil
 	}, time.Now, casino.RealSleepUntil)
 }

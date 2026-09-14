@@ -156,7 +156,7 @@ func (c *ScheduleCommand) buildAndCreateEvent(ctx context.Context, title, startA
 		Candidates: candidates,
 	})
 	if err != nil {
-		slog.Error("choseisama: CreateEvent failed", "error", err)
+		slog.Error("choseisama: CreateEvent failed", "error", redactInteractionError(err))
 		return nil, fmt.Errorf("❌ 日程調整の作成に失敗しました。")
 	}
 
@@ -168,7 +168,7 @@ func (c *ScheduleCommand) buildAndCreateEvent(ctx context.Context, title, startA
 		CreatedAt:  now,
 		CreatedBy:  userID,
 	}); err != nil {
-		slog.Error("store: Save failed", "error", err)
+		slog.Error("store: Save failed", "error", redactInteractionError(err))
 		return nil, fmt.Errorf("❌ 日程調整の保存に失敗しました。")
 	}
 

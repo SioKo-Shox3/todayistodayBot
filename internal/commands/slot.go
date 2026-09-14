@@ -83,7 +83,7 @@ func translateSlotError(err error) string {
 	case errors.Is(err, casino.ErrChipCapExceeded):
 		return "❌ チップ残高が上限に達しているため回せません。"
 	default:
-		slog.Error("casino: spin failed", "error", err)
+		slog.Error("casino: spin failed", "error", redactInteractionError(err))
 		return "❌ スロットの実行に失敗しました。"
 	}
 }
@@ -119,7 +119,7 @@ func (c *SlotCommand) runReveal(responder slotResponder, interaction *discordgo.
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: stages[0]},
 	}); err != nil {
-		slog.Error("discord: InteractionRespond failed at slot reveal start", "error", err)
+		slog.Error("discord: InteractionRespond failed at slot reveal start", "error", redactInteractionError(err))
 		return nil
 	}
 
@@ -127,7 +127,7 @@ func (c *SlotCommand) runReveal(responder slotResponder, interaction *discordgo.
 		sleep(800 * time.Millisecond)
 		content := stage
 		if _, err := responder.InteractionResponseEdit(interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
-			slog.Error("discord: InteractionResponseEdit failed during slot reveal", "error", err)
+			slog.Error("discord: InteractionResponseEdit failed during slot reveal", "error", redactInteractionError(err))
 			return nil // 演出の失敗は払い戻しに一切影響しない(設計書)。ログのみ、呼び出し元にはエラーを伝播しない。
 		}
 	}
@@ -135,7 +135,7 @@ func (c *SlotCommand) runReveal(responder slotResponder, interaction *discordgo.
 	if result.IsJackpot {
 		celebration := fmt.Sprintf("🎉🎉🎉 <@%s> が %s%s%s で大当たり!! 🎉🎉🎉", userID, result.Reels[0], result.Reels[1], result.Reels[2])
 		if _, err := responder.ChannelMessageSend(channelID, celebration); err != nil {
-			slog.Error("discord: ChannelMessageSend failed for jackpot celebration", "error", err)
+			slog.Error("discord: ChannelMessageSend failed for jackpot celebration", "error", redactInteractionError(err))
 		}
 	}
 	return nil
@@ -164,7 +164,7 @@ func (c *SlotCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 
 	userID := resolveUserID(i)
 	if err := c.store.EnsureCasinoAccess(i.GuildID, userID, time.Now()); err != nil { // §3.8
-		slog.Error("casino: EnsureCasinoAccess failed", "command", "slot", "error", err)
+		slog.Error("casino: EnsureCasinoAccess failed", "command", "slot", "error", redactInteractionError(err))
 		return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{Content: "❌ カジノの初期化に失敗しました。"},

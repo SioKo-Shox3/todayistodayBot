@@ -86,10 +86,10 @@ func (c *RateCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 		// §3.8: /rate も共通入口を通る。これがないと「/rate を最初に叩いた
 		// ユーザーだけ口座が作られない」という経路依存が残る。
 		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, now); err != nil {
-			slog.Error("casino: EnsureCasinoAccess failed", "command", "rate", "error", err)
+			slog.Error("casino: EnsureCasinoAccess failed", "command", "rate", "error", redactInteractionError(err))
 			content = "❌ カジノの初期化に失敗しました。"
 		} else if history, err := c.store.RecentRates(i.GuildID, now, 7); err != nil {
-			slog.Error("casino: RecentRates failed", "error", err)
+			slog.Error("casino: RecentRates failed", "error", redactInteractionError(err))
 			content = "❌ レート情報の取得に失敗しました。"
 		} else {
 			content = buildRateMessage(history)

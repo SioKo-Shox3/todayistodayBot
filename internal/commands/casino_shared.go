@@ -1,7 +1,10 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/SioKo-Shox3/todayistodayBot/internal/casino" // required by rateRankCommentary/marketCommentary below
@@ -145,4 +148,34 @@ func marketCommentary(history []casino.DailyRate) string {
 	default:
 		return fmt.Sprintf("凪%d日目。動かない相場も相場だ。", streak)
 	}
+}
+
+// discordTokenInPath matches the secret segment of the two Discord REST
+// paths that carry one in the URL itself: /interactions/<id>/<token>/... and
+// /webhooks/<id>/<token>/.... The first group keeps the route (and the
+// non-secret id) so a redacted line still says WHICH endpoint failed.
+var discordTokenInPath = regexp.MustCompile(`(/(?:interactions|webhooks)/[^/\s]+/)[^/\s?]+`)
+
+// redactInteractionError renders err for a log line with the Discord token
+// removed. net/http puts the full request URL into *url.Error, so logging a
+// failed InteractionRespond verbatim writes the interaction token — and a
+// failed webhook call the webhook token — into the log file. The interaction
+// token is short-lived and is not the bot token, but it authorises replies to
+// that interaction for its lifetime and there is no reason to keep it.
+//
+// *url.Error is reduced to its Op plus the redacted cause; the URL is
+// dropped entirely. Anything else keeps its message with the token segment of
+// any embedded path replaced by [redacted], because errors from other layers
+// (discordgo's own RESTError, a wrapped fmt.Errorf) can quote a path too.
+// Every log site in this package passes its error through here, so no call
+// site has to decide whether its error could contain a URL.
+func redactInteractionError(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Op + ": " + redactInteractionError(urlErr.Err)
+	}
+	return discordTokenInPath.ReplaceAllString(err.Error(), "${1}[redacted]")
 }

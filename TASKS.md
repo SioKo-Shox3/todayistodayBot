@@ -24,9 +24,10 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/commands/... -run "TestRate|TestExchange" -count=1`
 - paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/economy.go, internal/casino/economy_test.go
 - notes: 9 時掲示スケジューラ(`announce.go`)も `EnsureTodayRate` を呼ぶ。掲示テストが通ることを R-002 の verify の範囲で確かめる(`go test ./internal/casino/...` が丸ごと通る)。
+  反復 3 の評価者指摘(逆順履歴で確定日が再抽選される)を 33d6bfa で追加修正。検証出力 `verify-R-002-{5,6,7,8}.txt`。
 
 ## R-003: スロットの通信エラーで Interaction トークンをログへ出さない
-- status: todo
+- status: done
 - done-when: 所見 3(P1)。`internal/commands/slot.go` の 122 行・130 行付近が `respond` / `edit` の通信エラー(`*url.Error`、URL に `/interactions/<id>/<token>/callback` を含む)をそのまま `slog.Error` に渡す。ログに出す前にエラーを**秘匿化**する共通ヘルパー(例 `casino_shared.go` の `redactInteractionError(err) string` — `*url.Error` は `Op` と `Err` の種類だけ、URL は捨てる。それ以外はメッセージ中の `/interactions/…/…/` と `/webhooks/…/…/` のトークン部分を `[redacted]` に置換)を通す。7 コマンド全部と掲示(`casino_announce.go`)の同種のログ行を同じヘルパーに揃える。回帰テスト: `fakeSlotResponder.respondErr` に `/interactions/1/TEST_TOKEN/callback` の `*url.Error` を設定して `runReveal` を呼び、`slog` の出力を捕捉して `TEST_TOKEN` を含まない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`
