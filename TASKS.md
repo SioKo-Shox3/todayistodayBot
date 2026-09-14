@@ -434,7 +434,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 
 ## C3B-08: 未掲示のシーズン結果を月替わりで失わない(所見 1、P1)
 - status: todo
-- done-when: 掲示できなかった `LastSeason` の結果が、次の月替わり(`rolloverSeasonLocked` の上書き)で消えない。C-3a の宝くじが持つ掲示待ち行列と同じ形にするか、`LastSeason` とは別に未掲示の 1 件を保持するかは実装者が §4 と C3-12 の規律に沿って決め、選んだ理由を進捗に書く。回帰テスト: 7/31 の巡回で結果送信だけ失敗 → 8/1 の巡回で 6 月の結果が再送される(掲示チャンネル未設定のまま月をまたいだ場合も同じ)。
+- done-when: 掲示できなかった `LastSeason` の結果が、次の月替わり(`rolloverSeasonLocked` の上書き)で消えない。**親の決定(2026-09-15): C-3a の宝くじ(C3-12)と同じ待ち行列にする** — 機構を実装者に委ねたのが今回の取りこぼしの原因なので、ここで固定する。`GuildEconomy` に `UnannouncedSeasons []SeasonResult`(`json:"unannounced_seasons,omitempty"`、上限 3 件、超えたら古い方から落とす)を足し、`rolloverSeasonLocked` が閉じた結果を**追記**する(`LastSeason` は `/season` の表示用に最新 1 件として残す)。掲示側は待ち行列をそのまま渡し、**結果の送信に成功した月だけ**取り除く(`MarkAnnounced` と同じく、成功が確認できたときだけ)。既存 JSON(キー無し)はそのまま読める。回帰テスト: 7/31 の巡回で結果送信だけ失敗 → 8/1 の巡回で 6 月の結果が再送される(掲示チャンネル未設定のまま月をまたいだ場合も同じ)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
 - verify: `go test ./internal/commands/... -count=1`
