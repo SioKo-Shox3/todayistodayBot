@@ -4,6 +4,8 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C2-09(README のコマンド一覧に C-1 のカジノ 7 コマンドを足す)= 454a182。「カジノ（コイン・チップの経済）」節を新設し、`/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` を各 `Definition()` の Description とオプションどおりに載せた(`/exchange` と `/casino-admin` はサブコマンドごとに 1 行)。既存の「カジノ（ボタン操作のゲーム）」節はそのまま。検証出力: `.harness/runs/20260914-154156/verify-C2-09-{2,3}.txt`(build+vet exit=0 / `go test ./...` 8 パッケージ ok)。
+- 反復 1 の評価者(codex)の指摘 3 件 = 7082177 / a9f6460 / 103021b。(1) 起動時の返金を `session.Open()` より前へ動かした — `startupSteps{refund, open, register}` に切り出して順序をテストできるようにし、返金が失敗したら受付を始めずに `os.Exit(1)`。(2) `SessionManager.Hold`/`Release` を足し、`Sweep` は押下中(`busy > 0`)の盤面を飛ばす — ダブルの `AddToEscrow` はロックの外なので、その隙間で 200 枚の預かりを 100 枚のゲームとして自動決着していた。(3) 時間切れの編集はボタンを消さず、`custom_id` の prefix で引いたゲーム自身(`DisabledComponents`)に無効化した行を描かせる(設計書 §4・§8)。検証出力: `.harness/runs/20260914-154156/verify-C2-09-1.txt`(build+vet+test exit=0、8 パッケージ ok)、`mutation-sweep-busy.txt`(busy 判定を外すと新しい回帰テストが落ちる)。
 - フェーズ C-1(カジノ経済基盤+スロット)の実装 Task 1〜19 は `feat/casino-c1` に着地済み(2026-07-27、9 コミット)。レビューは 2026-09-14 に開始。
 - R-001(`/daily` の日付境界二重受給)= caa2753。`ClaimDaily` は受給日が最後の受給日以下なら `ErrAlreadyClaimedToday`(受給日は単調非減少)、時刻は `Store.clock` からロック内で取る(引数の `now` を廃止)。検証出力: `.harness/runs/20260914-105906/verify-R-001-{1,2,3}.txt`(build+vet clean / casino 58 PASS / commands TestDaily 2 PASS)。
 - R-002(`EnsureTodayRate` の順序逆転)= 20ed1a0。レート履歴は前へしか進まない: 渡された日付が履歴末尾の日付以下なら `settledRateLocked` がその日の記録(無ければ最新の記録)を返し、追加も抽選もしない。`RecentRates` は返ったレートの日付より後のエントリを落とすので `/rate` の見出しと `/exchange` の請求が一致する。検証出力: `.harness/runs/20260914-105906/verify-R-002-{1,2,3,4}.txt`(build+vet clean / casino 87 PASS / commands TestRate・TestExchange 12 PASS / `go test ./...` 8 パッケージ ok)。
@@ -44,7 +46,8 @@
 - (なし)
 
 ## Next
-- **次は C2-09**(README のコマンド一覧に C-1 のカジノ 7 コマンドを足す)。C2-08 で `/highlow` `/blackjack` だけを載せたので、`/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` が README から抜けたままになっている。文書のみ。
+- **`TASKS.md` の未完は無し**(C2-01〜C2-09 すべて done)。次は C-2 全体の評価者 2 周目 — 反復 1 の指摘 3 件への対応差分だけを見せる(Astra、`codex exec -m gpt-6-astra -s read-only`)。危険地帯は escrow の保存則と二重決着(掃除人・ダブル・未送達の盤面の 3 経路)＋今回足した `Hold`/`Release`。
+- (済)~~次は C2-09~~(README のコマンド一覧に C-1 のカジノ 7 コマンドを足す)。C2-08 で `/highlow` `/blackjack` だけを載せたので、`/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` が README から抜けたままになっている。文書のみ。
 - **C-2 の機能は C2-08 で全部着地した** — 次の区切りで評価者(Astra、`codex exec -m gpt-6-astra -s read-only`)を通す。危険地帯は escrow の保存則と二重決着(掃除人・ダブル・未送達の盤面の 3 経路)。
 - **`blocked/C2-08.md` は人への申し送り**: `Docs/agent-guide/architecture.md` は展開コピーなので、C-2 の追記(レイヤー表・`DefaultSessions` の所有権・依存方向・危険地帯 5 点目)は MyWorkflow の正本へ写して再展開する必要がある。
 - (済)~~次は C2-08~~(起動時の返金・放置の Sweep goroutine・help・文書)。`TASKS.md` の未完はこれ 1 件。Sweep を書くときは下の Notes「未払いの精算と Sweep」を先に読むこと — 決着した盤面は `WithSession(done=true)` で即座にマネージャから外れるので Sweep とは競合しないが、`AddToEscrow` と `Double` の隙間だけは Sweep が割り込める。
@@ -59,6 +62,9 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **押下中の盤面は掃除しない(反復 2 の指摘 2)**: 盤面ごとのロック(`boardLocks`)は押下どうししか直列化しない — 掃除人はそのロックを取らない。ダブルの `AddToEscrow` はディスク I/O なので `WithSession` の中では呼べず、その隙間は `LastActionAt` が更新されないまま残る。`Hold` はマネージャ自身のロック(= `Sweep` が期限判定に使うロック)で盤面に「操作中」の印を付け、`Sweep` はその盤面を返さない。押下が自分で終わらせた盤面は map から消えるので `Release` は空振りする(セッション ID は 16 バイト乱数なので別の盤面に当たらない)。効き目は `busy` 判定を外した木で `TestBlackjackDoubleIsNotSweptBetweenTheStakeAndTheHand` が落ちることで確認済み(`mutation-sweep-busy.txt`)。
+- **時間切れのボタンはゲームが描く(反復 2 の指摘 3)**: 掃除人は `casino.AutoResolver` しか知らないが、設計書 §4・§8 は決着後もボタンを無効化して残せと言う。`timedOutBoardRenderer`(`DisabledComponents(sessionID, state)`)を `ComponentHandler` の**任意の**片割れにして、`custom_id` の prefix で引いたゲームに描かせた。実装しないゲームは空の行(= ボタン削除)に落ちるので、掃除人側に分岐は増えない。`registeredComponents` はテストが `resetComponentsForTest` で空にするため、この経路を見るテストは自分で `RegisterComponent` する。
+- **起動の順序(反復 2 の指摘 1)**: 「起動時に残っている預かり = 消えた盤面」は、**新しいゲームがまだ 1 つも始まっていない間だけ**成り立つ。返金は `session.Open()` より前。`startupSteps` は 3 手を関数フィールドにしただけの構造体で、Discord 接続なしに順序をテストするためにある。返金が失敗したら開かない — 預かりが残ったままの口座は「進行中のゲームがあります」で遊べず、黙って劣化運転する方が悪い。
 - **掃除人はゲームを知らない(C2-08)**: 掃除人が知っているのは `casino.AutoResolver` 1 メソッドだけ。だから時間切れの編集はゲーム固有の盤面を描き直さず、`⌛ 時間切れ — 自動決着` + 配当/残高の embed に差し替えてボタンを**消す**。設計書 §4 の「決着後のボタンは無効化して残す」から外れる唯一の場所 — ボタンのラベルはゲームの持ち物(手札や倍率が入る)で、掃除人が組み直すには全ゲームの描画を知る必要がある。
 - **掃除人の順序(C2-08)**: `Sweep` が期限判定と削除を同じクリティカルセクションでやるので、返ってきた盤面はこの goroutine だけのもの(ロック無しで `AutoResolve` してよい)。精算が失敗した盤面は**編集しない** — 払われていないのに「決着しました」と出すのが最悪。預かりは口座に残り、次の起動の `RefundStaleEscrows` が返す。
 - **`main.go` の shutdown(C2-08)**: 掃除人も 9 時掲示と同じく `session.Close()` の前に終了を待つ(`sweeperDone`)。編集の最中にセッションを閉じると use-after-close になる。掃除人の周期は `commands.CasinoSweepInterval`(30 秒)= 時間切れの player が余分に待つ上限。
