@@ -70,7 +70,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
   検証出力 `verify-C2-02-{1,2,3,4}.txt`(build+vet clean / 対象テスト 73 PASS・FAIL 0 / casino ok / `go test ./...` 8 パッケージ ok)。`AddToEscrow` は仕様の残高不足に加えて `Escrow == 0` も拒む(進行中でないゲームへの追加ベットは返す先が無い)。`RefundStaleEscrows` の `now` は `EscrowOpenedAt` と同じ流儀の引数で、返金の判定には使わない(起動時の預かりは定義上「消えた盤面」)。
 
 ## C2-03: カードとハイ&ローの純粋ロジック(§6)
-- status: todo
+- status: done
 - done-when: `internal/casino/cards.go`(`Card{Rank 2..14, Suit}`、`NewDeck(n int, rng randSource)`(n 組をシャッフル。既存の `randSource` を流用)、`Draw()`、`Remaining() []Card`)。`internal/casino/highlow.go`: `HighLowGame`(現在のカード・山・ポット・連勝・ベット・状態)、`NewHighLow(bet, rng)`、`Odds()`(残りの山から高い/低いの当たり枚数と残り枚数。同ランクは負け)、`Multiplier(winning, remaining) int64`(x100 整数 = `95 * remaining / winning` を切り捨て。`winning=0` は 0 = 選択不可。ハウス 5 %)、`Guess(high bool) (StepResult, error)`(勝ちなら `pot = floor(pot*m/100)`、次のカードを現在に、連勝 +1。連勝 10 かポット ≥ ベット×100 で自動キャッシュアウト。負けなら状態 lost・pot 0)、`CashOut() int64`(未プレイなら bet を返す)、`AutoResolve()`(= CashOut)。`highlow_test.go`: 決定的テスト(固定山で各分岐)、境界(A でハイは選択不可・2 でローは選択不可、同ランク負け、連勝 10・上限 100 倍の自動決着、未プレイのキャッシュアウトは全額)、統計テスト(seed 付き 100 万手で 1 手あたりの RTP が 95 %±1 %。数秒以内)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestDeck|TestHighLow" -count=1`
