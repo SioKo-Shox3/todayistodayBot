@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -118,8 +120,8 @@ func TestBuildAnnouncementEmbed_IncludesMarketCommentary(t *testing.T) {
 func TestBuildAnnouncementEmbed_EmptyTopAssetsShowsPlaceholder(t *testing.T) {
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	embed := buildAnnouncementEmbed(announceJob(history, nil))
-	if len(embed.Fields) != 3 {
-		t.Fatalf("expected the ranking, jackpot and lottery fields, got %d", len(embed.Fields))
+	if len(embed.Fields) != 4 {
+		t.Fatalf("expected the ranking, jackpot, lottery and season fields, got %d", len(embed.Fields))
 	}
 	if embed.Fields[0].Name != "総資産ランキング TOP3" {
 		t.Fatalf("unexpected field name: %q", embed.Fields[0].Name)
@@ -138,8 +140,8 @@ func TestBuildAnnouncementEmbed_TopAssetsRenderedWithMedals(t *testing.T) {
 		{UserID: "u4", TotalAssets: 70},
 	}
 	embed := buildAnnouncementEmbed(announceJob(history, top))
-	if len(embed.Fields) != 3 {
-		t.Fatalf("expected the ranking, jackpot and lottery fields, got %d", len(embed.Fields))
+	if len(embed.Fields) != 4 {
+		t.Fatalf("expected the ranking, jackpot, lottery and season fields, got %d", len(embed.Fields))
 	}
 	want := "🥇 <@u1> — 100\n🥈 <@u2> — 90\n🥉 <@u3> — 80\n4. <@u4> — 70"
 	if embed.Fields[0].Value != want {
@@ -218,8 +220,8 @@ func TestBuildAnnouncementEmbed_ShowsJackpotPool(t *testing.T) {
 	job := announceJob(history, nil)
 	job.JackpotPool = 12345
 	embed := buildAnnouncementEmbed(job)
-	if len(embed.Fields) != 3 {
-		t.Fatalf("expected the ranking, jackpot and lottery fields, got %d", len(embed.Fields))
+	if len(embed.Fields) != 4 {
+		t.Fatalf("expected the ranking, jackpot, lottery and season fields, got %d", len(embed.Fields))
 	}
 	field := embed.Fields[1]
 	if field.Name != "🎰 ジャックポット" {
@@ -579,5 +581,219 @@ func TestStartAnnounceScheduler_CelebratesEveryQueuedWinner(t *testing.T) {
 		if channels[i] != "c1" {
 			t.Fatalf("celebration %d went to %q, want the announce channel", i, channels[i])
 		}
+	}
+}
+
+// --- 🏆 シーズン(今月) と結果の祝い (設計書 C-3b §4 掲示) -------------------
+
+func seasonField(t *testing.T, embed *discordgo.MessageEmbed) *discordgo.MessageEmbedField {
+	t.Helper()
+	for _, f := range embed.Fields {
+		if f.Name == "🏆 シーズン(今月)" {
+			return f
+		}
+	}
+	t.Fatalf("the embed carries no 🏆 シーズン(今月) field: %+v", embed.Fields)
+	return nil
+}
+
+func TestBuildAnnouncementEmbed_SeasonFieldShowsThePodiumWithMedals(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.SeasonMonth = "2026-07"
+	// A loser on the podium is not a rendering accident: in a month where
+	// everybody lost, somebody lost the least, and the sign is what keeps
+	// that readable.
+	job.SeasonTop = []casino.SeasonRank{
+		{UserID: "u1", Net: 1_200}, {UserID: "u2", Net: 800}, {UserID: "u3", Net: -50},
+	}
+
+	got := seasonField(t, buildAnnouncementEmbed(job)).Value
+
+	want := "2026-07 の純利ランキング\n🥇 <@u1> — 純利 +1200\n🥈 <@u2> — 純利 +800\n🥉 <@u3> — 純利 -50"
+	if got != want {
+		t.Fatalf("season field =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// A month nobody has played is the ordinary state of the 1st, not a broken
+// table, and it says so in the same words /season uses.
+func TestBuildAnnouncementEmbed_SeasonFieldEmptyMonth(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.SeasonMonth = "2026-08"
+
+	got := seasonField(t, buildAnnouncementEmbed(job)).Value
+
+	want := "2026-08 — まだ誰も勝敗を記録していません。"
+	if got != want {
+		t.Fatalf("season field = %q, want %q", got, want)
+	}
+}
+
+func TestSeasonAnnounceCelebration_OnlyForAClosedSeasonWithAPodium(t *testing.T) {
+	podium := []casino.SeasonRank{
+		{UserID: "u1", Net: 5_000, Bonus: 10_000},
+		{UserID: "u2", Net: 3_000, Bonus: 5_000},
+		{UserID: "u3", Net: 1_000, Bonus: 2_500},
+	}
+	cases := []struct {
+		name   string
+		result *casino.SeasonResult
+		want   string
+	}{
+		{"no season has closed", nil, ""},
+		{"a month nobody played", &casino.SeasonResult{Month: "2026-06"}, ""},
+		{
+			"the podium",
+			&casino.SeasonResult{Month: "2026-06", Ranks: podium, Players: 7},
+			"🎉🎉🎉 2026-06 のシーズンが終了!! 🎉🎉🎉\n" +
+				"🥇 <@u1> — 純利 +5000 / 賞与 10000チップ\n" +
+				"🥈 <@u2> — 純利 +3000 / 賞与 5000チップ\n" +
+				"🥉 <@u3> — 純利 +1000 / 賞与 2500チップ\n" +
+				"参加者: 7人 — 新しいシーズンが始まりました!",
+		},
+		{
+			// A winner already at the chip cap was credited less than the
+			// table offers, and the message prints what landed.
+			"a winner credited nothing",
+			&casino.SeasonResult{Month: "2026-06", Ranks: []casino.SeasonRank{{UserID: "u1", Net: 5_000, Bonus: 0}}, Players: 1},
+			"🎉🎉🎉 2026-06 のシーズンが終了!! 🎉🎉🎉\n" +
+				"🥇 <@u1> — 純利 +5000 / 賞与 0チップ\n" +
+				"参加者: 1人 — 新しいシーズンが始まりました!",
+		},
+		{
+			// A hand-edited last_season with more rows than the rollover
+			// ever writes must not become a wall of mentions.
+			"a hand-edited overlong podium",
+			&casino.SeasonResult{Month: "2026-06", Ranks: append(append([]casino.SeasonRank(nil), podium...),
+				casino.SeasonRank{UserID: "u4", Net: 900, Bonus: 999}), Players: 9},
+			"🎉🎉🎉 2026-06 のシーズンが終了!! 🎉🎉🎉\n" +
+				"🥇 <@u1> — 純利 +5000 / 賞与 10000チップ\n" +
+				"🥈 <@u2> — 純利 +3000 / 賞与 5000チップ\n" +
+				"🥉 <@u3> — 純利 +1000 / 賞与 2500チップ\n" +
+				"参加者: 9人 — 新しいシーズンが始まりました!",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := seasonAnnounceCelebration(tc.result); got != tc.want {
+				t.Fatalf("seasonAnnounceCelebration() =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// seededCasinoStore opens a store on a casino.json written by hand. A CLOSED
+// season only exists once the month has moved, and internal/commands cannot
+// reach the store's clock to move it (the rate/season rollover reads it under
+// the lock), so the file is the seam these wiring tests seed through — the
+// same way oldFormatStore seeds a pre-queue lottery file in internal/casino.
+func seededCasinoStore(t *testing.T, content string) *casino.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "casino.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing the seed file: %v", err)
+	}
+	return casino.New(path)
+}
+
+// season_month is JULY, so a pass driven at 2026-07-10 does not roll the
+// month again: what is under test is the JUNE result already on file, and
+// last_season_announced being absent is what makes it pending.
+const closedJuneSeasonFile = `{"g1":{"announce_channel_id":"c1","rates":[],"last_announced":"",` +
+	`"season_month":"2026-07","last_season":{"month":"2026-06","players":7,"ranks":[` +
+	`{"user_id":"u1","net":5000,"bonus":10000},{"user_id":"u2","net":3000,"bonus":5000},` +
+	`{"user_id":"u3","net":1000,"bonus":2500}]},"users":{}}}`
+
+func TestStartAnnounceScheduler_CelebratesAClosedSeasonInASeparateMessage(t *testing.T) {
+	// 設計書 C-3b §4 掲示: the closed month's result is its own public
+	// message, so the three winners are actually pinged.
+	store := seededCasinoStore(t, closedJuneSeasonFile)
+
+	embeds, texts, channels := runOneAnnouncePass(t, store, announceAt10())
+
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	if len(texts) != 1 {
+		t.Fatalf("got %d separate messages, want 1 (the season result): %q", len(texts), texts)
+	}
+	if channels[0] != "c1" {
+		t.Errorf("the result went to %q, want the announcement channel c1", channels[0])
+	}
+	for _, want := range []string{"2026-06", "<@u1>", "<@u2>", "<@u3>", "賞与 10000チップ", "参加者: 7人"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("the season result message %q is missing %q", texts[0], want)
+		}
+	}
+	// The embed's field describes the RUNNING month, which the closed one
+	// zeroed — the two must not be confused for each other.
+	if got := seasonField(t, embeds[0]).Value; got != "2026-07 — まだ誰も勝敗を記録していません。" {
+		t.Errorf("season field = %q, want the freshly opened month", got)
+	}
+}
+
+// 結果の祝いは閉じた回だけ: a month whose result has already been posted is
+// not posted again, however many mornings go by.
+func TestStartAnnounceScheduler_AnAlreadyAnnouncedSeasonIsNotCelebratedAgain(t *testing.T) {
+	store := seededCasinoStore(t, strings.Replace(closedJuneSeasonFile,
+		`"season_month":"2026-07"`, `"season_month":"2026-07","last_season_announced":"2026-06"`, 1))
+
+	embeds, texts, _ := runOneAnnouncePass(t, store, announceAt10())
+
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	if len(texts) != 0 {
+		t.Fatalf("the June result was celebrated again: %q", texts)
+	}
+}
+
+// 送信失敗なら次の巡回でまた送られる: the result is kept until a send is
+// confirmed, and the embed that already landed is NOT re-posted for it —
+// which is why the mark is taken separately from LastAnnounced.
+func TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass(t *testing.T) {
+	store := seededCasinoStore(t, closedJuneSeasonFile)
+
+	var embeds int
+	var texts []string
+	fail := true
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { embeds++; return nil }
+	sendText := func(channelID, content string) error {
+		if fail {
+			return errors.New("discord is down")
+		}
+		texts = append(texts, content)
+		return nil
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+	}
+
+	day1 := announceAt10()
+	pass(day1)
+	if embeds != 1 || len(texts) != 0 {
+		t.Fatalf("first pass: %d embeds / %d results delivered, want 1/0", embeds, len(texts))
+	}
+
+	// The next morning: the result is still owed, and now it gets through.
+	fail = false
+	pass(day1.AddDate(0, 0, 1))
+	if embeds != 2 {
+		t.Fatalf("second pass: %d embeds in total, want 2 (one per day)", embeds)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "2026-06") {
+		t.Fatalf("second pass delivered %q, want the June result", texts)
+	}
+
+	// And having landed, it is not owed a third time.
+	pass(day1.AddDate(0, 0, 2))
+	if len(texts) != 1 {
+		t.Fatalf("the delivered result was posted again: %q", texts)
 	}
 }

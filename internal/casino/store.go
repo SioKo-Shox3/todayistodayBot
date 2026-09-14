@@ -726,10 +726,10 @@ func (s *Store) SeasonStatus(guildID, userID string, now time.Time) (SeasonView,
 
 		ranked := SeasonRanks(economy.Users, len(economy.Users))
 		view = SeasonView{
-			Month:    economy.SeasonMonth,
-			Ranks:    ranked,
-			Self:     SeasonRank{UserID: userID, Net: account.SeasonNet},
-			Players:  len(ranked),
+			Month:   economy.SeasonMonth,
+			Ranks:   ranked,
+			Self:    SeasonRank{UserID: userID, Net: account.SeasonNet},
+			Players: len(ranked),
 			// Counted against the month being SHOWN, not against `now`:
 			// see seasonDaysLeftIn for why the two can disagree.
 			DaysLeft: seasonDaysLeftIn(economy.SeasonMonth, now),

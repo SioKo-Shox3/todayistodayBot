@@ -414,7 +414,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 順位表の整形は `/rank` の既存実装に倣う。
 
 ## C3B-06: 9 時掲示のシーズン欄と結果の祝い(§4 掲示)
-- status: todo
+- status: done
 - done-when: `AnnouncementJob` に今月の上位 3 名と、閉じたシーズンの結果(あれば)を足し、`internal/commands/casino_announce.go` の embed に「🏆 シーズン(今月)」フィールドを足す。シーズンが閉じた回は**別メッセージ**で公開の結果発表(上位 3 名を @メンション、賞与額)。掲示チャンネル未設定なら送らない(結果は `/season` で見える)。C-3a の掲示待ち行列と同じく、**閉じたシーズンの結果も掲示に成功するまで保持する**(`LastSeason` は上書きされないので、掲示済みかどうかは `LastAnnounced` と同じ high-water 方式で判定する — 詳細は実装者が §4 と C3-19 の規律に沿って決め、選んだ方法を進捗に書く)。`casino_announce_test.go` / `announce_test.go`: フィールドの文言(遊んだ人がいない月を含む)、結果の祝いが閉じた回だけ送られる、送信失敗なら次の巡回でまた送られる。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

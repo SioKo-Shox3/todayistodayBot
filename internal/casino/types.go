@@ -57,8 +57,25 @@ type GuildEconomy struct {
 	// — the file is a live state snapshot, not a history — and omitempty plus
 	// the nil zero is what makes a pre-C-3b file read back as "nothing closed
 	// yet" rather than as an empty result with a blank month.
-	LastSeason *SeasonResult           `json:"last_season,omitempty"`
-	Users      map[string]*UserAccount `json:"users"`
+	LastSeason *SeasonResult `json:"last_season,omitempty"`
+	// LastSeasonAnnounced is the month ("2006-01") of the last closed season
+	// whose public result actually went out, and it exists for the reason
+	// Lottery.Unannounced exists: a result that could not be posted must not
+	// be lost. The lottery keeps a QUEUE because several draws can pile up
+	// between postings; a season closes once a month, so a single high-water
+	// mark is enough — LastSeason holds the one pending result, and this says
+	// whether the channel has already seen it.
+	//
+	// It is separate from LastAnnounced rather than derived from it because
+	// the two mark different messages: the daily embed and the season's own
+	// celebration are posted independently, and losing the second must not
+	// re-post the first (nor the reverse).
+	//
+	// "" — what every pre-C-3b file reads back as — means 「まだ何も出して
+	// いない」, which is the right default: a guild upgrading with a closed
+	// season on file is owed that posting.
+	LastSeasonAnnounced string                  `json:"last_season_announced,omitempty"`
+	Users               map[string]*UserAccount `json:"users"`
 }
 
 // SeasonResult is one closed month: who finished on the podium and how many

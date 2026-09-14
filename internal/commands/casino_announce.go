@@ -69,6 +69,7 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 			{Name: "総資産ランキング TOP3", Value: rankValue, Inline: false},
 			{Name: "🎰 ジャックポット", Value: fmt.Sprintf("%d チップ", job.JackpotPool), Inline: false},
 			{Name: "🎟️ 宝くじ", Value: lotteryAnnounceLines(job), Inline: false},
+			{Name: "🏆 シーズン(今月)", Value: seasonAnnounceLines(job), Inline: false},
 		},
 	}
 }
@@ -108,6 +109,68 @@ func lotteryAnnounceLines(job casino.AnnouncementJob) string {
 	}
 	lines = append(lines, fmt.Sprintf("💰 本日の賞金: %dチップ / 🎫 売れた枚数: %d枚", job.LotteryPrize, job.LotteryTickets))
 	return strings.Join(lines, "\n")
+}
+
+// seasonAnnounceLines renders the 🏆 シーズン(今月) field's body: the running
+// season's month and its podium so far (設計書 C-3b §4 掲示).
+//
+// 純利 carries its sign here exactly as /season prints it (season.go's
+// formatSeasonMessage), and the empty-month sentence is the same one: two
+// renderings of one table must not disagree about what "nobody has played
+// yet" looks like. An empty SeasonTop is that case and nothing else —
+// SeasonRanks excludes 純利 0, so a guild whose accounts exist only because
+// /balance opened them shows this line rather than a podium of people who
+// never placed a bet.
+//
+// The month is printed even though the field is headed 今月: the posting can
+// be a late catch-up, and the heading alone would then name the wrong month.
+func seasonAnnounceLines(job casino.AnnouncementJob) string {
+	if len(job.SeasonTop) == 0 {
+		return fmt.Sprintf("%s — まだ誰も勝敗を記録していません。", job.SeasonMonth)
+	}
+	lines := make([]string, 0, len(job.SeasonTop)+1)
+	lines = append(lines, fmt.Sprintf("%s の純利ランキング", job.SeasonMonth))
+	for i, rank := range job.SeasonTop {
+		marker := fmt.Sprintf("%d.", i+1)
+		if i < len(announceMedals) {
+			marker = announceMedals[i]
+		}
+		lines = append(lines, fmt.Sprintf("%s <@%s> — 純利 %+d", marker, rank.UserID, rank.Net))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// seasonAnnounceCelebration renders the SEPARATE public message a closed
+// season posts, for lotteryAnnounceCelebration's reason: the winners are
+// @mentioned, and a mention buried in an embed field is easy to scroll past.
+//
+// Bonus is printed as CREDITED, never as SeasonBonus offers it — a winner
+// already at the chip cap took only what fit (types.go), and the message
+// beside their balance must not promise chips that never arrived.
+//
+// "" means 「何も投稿しない」 and has one structural cause: a month that
+// closed with nobody on the podium (an empty guild, or one where every
+// account ended on 純利 0). There is no one to ping and no prize to report.
+// The caller still marks that season announced — there is nothing left to
+// retry, and leaving it pending would re-ask the question every morning.
+//
+// The podium is capped at the medals it has, which is the same three places
+// rolloverSeasonLocked pays: a hand-edited last_season holding fifty rows
+// must not turn the celebration into fifty mentions.
+func seasonAnnounceCelebration(result *casino.SeasonResult) string {
+	if result == nil || len(result.Ranks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "🎉🎉🎉 %s のシーズンが終了!! 🎉🎉🎉\n", result.Month)
+	for i, rank := range result.Ranks {
+		if i >= len(announceMedals) {
+			break
+		}
+		fmt.Fprintf(&b, "%s <@%s> — 純利 %+d / 賞与 %dチップ\n", announceMedals[i], rank.UserID, rank.Net, rank.Bonus)
+	}
+	fmt.Fprintf(&b, "参加者: %d人 — 新しいシーズンが始まりました!", result.Players)
+	return b.String()
 }
 
 // lotteryDrawDateLabel renders a stored draw date ("2006-01-02") as the M/D
@@ -189,6 +252,28 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 					// still could not un-lose this message. The results stay
 					// visible via /lottery status (設計書 C-3a §3).
 					slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+				}
+			}
+			// 設計書 C-3b §4 掲示: a season that has closed since the last
+			// posting gets its own public message. Only a closed one — on
+			// every other morning SeasonClosed is nil and nothing is sent.
+			//
+			// The mark is taken HERE, right after the confirmed send, and
+			// not by runAnnouncePass with the rest of the job: a failure
+			// must leave the result pending WITHOUT failing the job, because
+			// failing it would re-post the embed (and re-ping the lottery
+			// winner) on the next pass of the same day. Left unmarked, the
+			// result is carried by the next pass that reaches this guild,
+			// and it stays readable through /season in the meantime.
+			if job.SeasonClosed != nil {
+				if celebration := seasonAnnounceCelebration(job.SeasonClosed); celebration != "" {
+					if err := sendText(job.ChannelID, celebration); err != nil {
+						slog.Error("discord: ChannelMessageSend failed for a season result", "guild_id", job.GuildID, "error", err)
+						return nil // the embed is up; leave the season for the next pass
+					}
+				}
+				if err := st.MarkSeasonAnnounced(job.GuildID, job.SeasonClosed.Month); err != nil {
+					slog.Error("casino: MarkSeasonAnnounced failed", "guild_id", job.GuildID, "error", err)
 				}
 			}
 			return nil

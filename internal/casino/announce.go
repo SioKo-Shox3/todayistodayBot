@@ -39,6 +39,25 @@ type AnnouncementJob struct {
 	// with no carryover are 0.
 	LotteryPrize   int64
 	LotteryTickets int
+	// SeasonMonth is the JST month ("2006-01") of the season that is RUNNING
+	// at collection time, and SeasonTop its podium so far — read after the
+	// rollover, so on the 1st of a month they describe the month that has
+	// just opened rather than the one that was paid out a microsecond ago.
+	// SeasonTop is empty in a month nobody has won or lost anything in yet,
+	// which is a normal morning, not a missing value (SeasonRanks excludes
+	// 純利 0).
+	SeasonMonth string
+	SeasonTop   []SeasonRank
+	// SeasonClosed is the most recently closed season when its public result
+	// has NOT been posted yet, and nil otherwise — including on every
+	// ordinary morning of a month, since a season closes only once.
+	//
+	// Kept until a send succeeds, the discipline the lottery queue follows:
+	// MarkSeasonAnnounced is called only after a confirmed post, so an
+	// outage across the 1st leaves the result here and the next pass that
+	// reaches this guild posts it. The month it names is the month that
+	// CLOSED, not today's.
+	SeasonClosed *SeasonResult
 }
 
 // collectDailyAnnouncements ensures every known guild's rate exists for
@@ -74,13 +93,35 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			// is what performed this morning's draw — so the job carries the
 			// settled result and the freshly opened pot, not yesterday's.
 			sold, _, prize := lotterySummaryLocked(&economy.Lottery)
+			top := topAssetsLocked(economy, rate.Rate, 3)
+			// AFTER topAssetsLocked on purpose: SeasonRanks compares the
+			// stored 純利 without bounding it, and that loop is what
+			// normalises every account on the way past (SeasonStatus does the
+			// same normalisation for the same reason). seasonRankLimit, not a
+			// literal 3, so the podium the embed shows cannot drift away from
+			// the podium the rollover pays.
+			seasonTop := SeasonRanks(economy.Users, seasonRankLimit)
 			job := AnnouncementJob{
 				GuildID: guildID, ChannelID: economy.AnnounceChannelID,
 				Today: rate, RecentRates: recent,
-				TopAssets:      topAssetsLocked(economy, rate.Rate, 3),
+				TopAssets:      top,
 				JackpotPool:    economy.Jackpot, // read after ensureTodayRateLocked seeded it
 				LotteryPrize:   prize,
 				LotteryTickets: sold,
+				SeasonMonth:    economy.SeasonMonth,
+				SeasonTop:      seasonTop,
+			}
+			// A closed season is pending until its own mark catches up with
+			// it — `>` and not `!=`, the high-water rule LastAnnounced
+			// follows: a clock that steps back must not re-open a month that
+			// has already been celebrated and @mention its winners twice.
+			// Copied, slice included, for the reason LotteryDraws is: the
+			// value behind LastSeason belongs to the Data this Update is
+			// about to drop, and the job outlives it.
+			if last := economy.LastSeason; last != nil && last.Month > economy.LastSeasonAnnounced {
+				closed := *last
+				closed.Ranks = append([]SeasonRank(nil), last.Ranks...)
+				job.SeasonClosed = &closed
 			}
 			// Handed over whole, with no date filter of its own: the queue
 			// already IS the list of draws that have not been announced, and
@@ -135,6 +176,33 @@ func (s *Store) MarkAnnounced(guildID, date string) error {
 			lottery.Unannounced = nil // keep omitempty's promise: no empty array on disk
 		} else {
 			lottery.Unannounced = kept
+		}
+		return nil
+	})
+}
+
+// MarkSeasonAnnounced records that guildID's closed season for `month`
+// ("2006-01") has been posted. Call ONLY after a confirmed successful send,
+// for MarkAnnounced's reason — leaving the mark behind is what makes the
+// next pass carry the result again (設計書 C-3b §4 掲示).
+//
+// It is a SEPARATE call from MarkAnnounced, not a second field on it,
+// because the two messages fail independently: the daily embed goes out
+// first and the season's result follows it, so a result that could not be
+// delivered must be retried WITHOUT re-posting the embed that already
+// landed (and without re-pinging the lottery winner alongside it).
+//
+// FORWARD ONLY, exactly like LastAnnounced: a host whose clock or zone data
+// steps back would otherwise let an already-celebrated month look pending
+// again, and its podium would be @mentioned a second time.
+//
+// An empty month is a no-op ("" > "" is false), so a caller that reaches
+// here with no closed season to mark cannot blank the boundary.
+func (s *Store) MarkSeasonAnnounced(guildID, month string) error {
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		if month > economy.LastSeasonAnnounced {
+			economy.LastSeasonAnnounced = month
 		}
 		return nil
 	})
