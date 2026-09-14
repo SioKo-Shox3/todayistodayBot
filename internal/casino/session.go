@@ -50,7 +50,8 @@ type MessageRef struct {
 // Session is one in-flight board. ID, GuildID, UserID, Game and Ref are
 // immutable after Open; State and LastActionAt are mutable and may only be
 // touched while the manager's lock is held (i.e. from inside WithSession,
-// Touch, or on a session already removed from the manager by Sweep).
+// Touch, or on an Expired session that Sweep handed to the sweeper — it stays
+// in the manager until Remove after a successful settlement).
 type Session struct {
 	ID           string
 	GuildID      string
