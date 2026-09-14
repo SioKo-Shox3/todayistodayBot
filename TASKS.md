@@ -325,3 +325,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/store_test.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, NEXT_FINDINGS.md
 - notes: どちらも小さい。テストの追加はケース 1 行と期待値だけで、既存の表の形を変えない。
+
+## C3-16: 正規化点を通らずに口座を触る経路(`RefundStaleEscrows`)を塞ぐ
+- status: todo
+- done-when: C3-14 の差し戻し(`NEXT_FINDINGS.md` の最新節)を閉じる。`RefundStaleEscrows`(`internal/casino/store.go` 1095 付近)は口座を map から直接読んで `moveFromEscrowLocked` で加算するため、C3-14 で置いた正規化点(`ensureAccountLocked`)を通らない。手編集の `Chips = Escrow = math.MaxInt64` を読むと返金で `Chips = -2` が**保存され**、次の読み取りで 0 に丸められる(= チップが消える)。返金対象の口座も加算前に `ensureAccountLocked` を通す(既に非 nil でも通す)。`store_test.go`: `Chips = Escrow = math.MaxInt64` のファイルで `RefundStaleEscrows` → `ViewAccount` を回し、保存される値が負にならず上限で頭打ちになる / 通常の返金(C-2 の既存テスト)の期待値が 1 つも変わらない。`headroom` の式は変えない。**もし直前の反復が差し戻しの処理としてこれを既に直していたら**、検証を回して `status: done` にするだけでよい(重複作業をしない)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go
+- notes: 危険地帯(資金の保存則)。これで「口座に触る経路はすべて `ensureAccountLocked` を通る」が閉じる — 他にも直接 map を引いている箇所があれば同じ扱いにし、見つけた場所を進捗に書く。
