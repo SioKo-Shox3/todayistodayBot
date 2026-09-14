@@ -4,6 +4,10 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-06(README・設計書の実測・architecture の追記案)= 7cba582。README は公開物なので `/slot` の 3 行(積立 2 %・7️⃣7️⃣7️⃣ でプール全額と種 1,000 へのリセット・表示場所)と `/lottery buy|status` の各 3 行を**規則だけ**書いた(過程・判断の経緯は書かない)。`/help` はレジストリから自動生成なので変更不要(C3-04 で確認済み)。設計書 §2・§3 の「実測」は**通っているテストの値だけ**から書いた — 積立は 10 チップ×5 スピンで 1,001・端数 0(`TestStore_Spin_AccruesTheSmallestBetWithoutLosingTheRemainder`)、発火はプール 37,500 + 自分の積立 2 = 37,502(`TestStore_Spin_TripleSevenPaysTheWholePoolAndResetsToTheSeed`)、賞金は 500→450/50・1,234→1,110/124(`TestLotteryPrize_SplitsSalesAndAddsTheCarryover`)。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3-06.md` に正本へ写す 3 節(レイヤー表の「宝くじ」行、日次ロールオーバーの 3 つ = レート生成・種・抽選、危険地帯 6 点目 = プールと賞金の保存則)を書いた。**これはユーザー(人)が MyWorkflow の正本へ写して再展開する作業**(C2-08.md と同じ)。`cmd/bot/main.go` は §7 どおり変更していない。検証出力: `.harness/runs/20260914-204154/verify-C3-06-{1,2,3}.txt`(build+vet exit=0 / `go test ./...` 8 パッケージ ok exit=0 / `go build -o bin/todayistodaybot ./cmd/bot` exit=0)。
+  **README は行末が混在している**(231 行中 217 行が CRLF、残り 14 行が LF)。テキストモードで読み書きすると全行 CRLF に揃ってしまい `git diff --numstat` が 226/217 の全面書き換えになる — バイナリで読み、挿入行に `
+` を付けて書き戻した(`--numstat` と `--ignore-cr-at-eol --numstat` が 9/0 で一致)。
+- 反復 5 の評価者指摘(NEEDS_WORK 1 件)= 5e56d17。**C3-05 の「賞金 0 は祝わない」を撤回した** — `lotteryAnnounceCelebration` の除外条件は `draw == nil || WinnerID == ""` の 2 つだけにし、`Prize == 0` の当選者にもメンション付きの祝いを送る。done-when は「`LotteryDraw` に当選者がいれば別メッセージで祝う」で、賞金による除外はそこに無い。`MaxChips` に張り付いた当選者は実際に `Prize 0` で記録される(`creditChipsCappedLocked`)ので、抑止すると**本物の当選者へのメンションが落ちる**。金額は記録どおり 0 と出す(`/lottery status` と掲示フィールドに揃う)。検証は fake sender 経由の `TestStartAnnounceScheduler_CelebratesAWinnerWhoWasCreditedNothing`(実ストアで 2 枚買わせ、`Update` で残高を `MaxChips` にしてから 1 パス回す)。検証出力: `.harness/runs/20260914-204154/verify-C3-06-finding-{1,2}.txt`(build+vet exit=0 / `go test ./...` 8 パッケージ ok exit=0)、`mutation-C3-06-finding.txt`(`Prize <= 0` を戻すと新旧 2 件が落ちる)。
 - C3-05(9 時掲示の 🎟️ フィールドと当選者の祝い)= 16dabfb。`AnnouncementJob` は C3-03/C3-04 で既に `LotteryDraw` / `LotteryPrize` / `LotteryTickets` を運んでいたので、`internal/casino` 側は 1 行も触っていない — 変更は `internal/commands/casino_announce.go` だけ。**祝いのために `startAnnounceScheduler` の引数を 1 つ増やした**(`sendText func(channelID, content string) error`)。埋め込みと同じ 1 つの sender にまとめなかったのは失敗時の扱いが逆だから: 埋め込みの失敗は**エラーを返す**(`LastAnnounced` が立たず翌朝の掃き出しが掲示ごとやり直す)が、祝いの失敗は**ログだけで nil を返す**(抽選はもうストアに確定し、掲示も上がっている。ここで job を失敗させても失った 1 通は戻らず、翌朝に掲示が二重に出るだけ。結果は `/lottery status` で見える)。**祝いは埋め込みの成功後にだけ送る** — 先に送ると、埋め込みが落ち続ける間リトライのたびに当選者へメンションが飛ぶ。
   `lotteryAnnounceCelebration` は **`Prize <= 0` を「祝わない」に倒した**。`drawLotteryLocked` は `creditChipsCappedLocked` 経由で払うので、当選者が `MaxChips` に張り付いていると `LastDraw.Prize` が 0 のまま記録され、壺は丸ごと繰り越される —「0 チップ 獲得!!」は祝いではない。埋め込みのフィールド側は記録どおり出す(`/lottery status` と食い違わせない)。
   フィールドの 2 行目「本日の賞金 / 売れた枚数」は**通常の 09:00 では必ず 0/0**(抽選が壺を空けた直後)。0 以外になるのは遅れて出る追いつき掲示(`announce.go` の「上限を切らない」)のときだけで、そのケースもテストにした。
@@ -62,6 +66,8 @@
 - (なし)
 
 ## Next
+- **`TASKS.md` に未完は無い**(C3-01〜C3-06 すべて done)。次に進めるなら M1 へ戻って C-3b(`/duel`・シーズン制)の設計を詰めるか、下の残課題を拾う。
+- **`blocked/C3-06.md` はユーザー(人)待ち** — `Docs/agent-guide/architecture.md` の正本(MyWorkflow 側)へ写して `node MyWorkflow/deploy.mjs --apply todayistodayBot` で再展開するまで、展開コピーは C-2 までの記述のまま(宝くじ・ジャックポットが載っていない)。
 - **次は C3-06**(`TASKS.md` の未完の先頭)。C-3a で残るのはこれ 1 件で、掲示・コマンド・ストアはすべて着地済み。
 - **掲示に sender が 2 つある**(C3-05 以降): `startAnnounceScheduler(ctx, st, send, sendText, now, sleep)`。掲示側へ新しい「別メッセージ」を足すときは `sendText` を使い、**失敗でエラーを返さない**(返すと掲示ごと翌朝にやり直しになる)。実物を差すのは `StartCasinoAnnounceScheduler` だけで、どちらも `redactInteractionError` を通す。
 - **`internal/commands` の JST は `lottery.go` の `jstZone`**。掲示側で時刻を出すなら新しく `FixedZone` を作らずこれを使う(`internal/casino` の `jst` は非公開で、パッケージを跨げない)。
