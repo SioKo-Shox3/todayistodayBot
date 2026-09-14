@@ -288,6 +288,18 @@ func normalizeAccountLocked(account *UserAccount) {
 	} else if account.Coins > MaxCoins {
 		account.Coins = MaxCoins
 	}
+	// SeasonNet is clamped at BOTH ends rather than floored at 0: it is a
+	// signed 純利 (types.go), so a losing player's negative value is the
+	// legitimate reading and flooring it would promote every loser to even.
+	// The magnitude bound is what addSeasonNetLocked's arithmetic is sized
+	// for, and putting it here — not only inside that helper — means the
+	// season ranking and any future reader see a bounded number too, without
+	// having to add a credit first.
+	if account.SeasonNet > MaxChips {
+		account.SeasonNet = MaxChips
+	} else if account.SeasonNet < -MaxChips {
+		account.SeasonNet = -MaxChips
+	}
 }
 
 // creditChipsLocked adds delta to account.Chips, refusing to push the
@@ -904,6 +916,11 @@ func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 		if err := creditChipsLocked(account, result.Payout); err != nil {
 			return err // aborts: the deduction AND the accrual above are discarded with the transaction
 		}
+		// The 純利 is booked only after the credit has actually landed.
+		// creditChipsLocked is all-or-nothing, so on the path that reaches
+		// here the credited amount IS result.Payout — 設計書 C-3b §3's
+		// "実際に口座へ入った額" and the owed amount coincide for the slot.
+		addSeasonNetLocked(account, result.Payout-bet)
 		return nil
 	})
 	if err != nil {
@@ -1080,10 +1097,17 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 		if account.Escrow == 0 {
 			return ErrNoGameInProgress
 		}
+		// The escrow is read BEFORE it is cleared because it is the only
+		// record of what this game was staked for: SettleGame is told the
+		// payout and never the bet, and by the time the credit lands the
+		// stake is gone. It is the bet plus every ダブル raise, which is
+		// exactly 設計書 C-3b §3's 「賭けた額」 for a hand that doubled.
+		staked := account.Escrow
 		clearEscrowLocked(account)
 		if err := creditChipsLocked(account, payout); err != nil {
 			return err // aborts: the escrow release above is discarded with the transaction
 		}
+		addSeasonNetLocked(account, payout-staked)
 		result = SettleResult{Chips: account.Chips, Payout: payout}
 		return nil
 	})
@@ -1567,7 +1591,15 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 		return
 	}
-	paid := creditChipsCappedLocked(ensureAccountLocked(economy, winner), prize)
+	winnerAccount := ensureAccountLocked(economy, winner)
+	paid := creditChipsCappedLocked(winnerAccount, prize)
+	// The winner's half of the lottery's 純利 (設計書 C-3b §3). It books
+	// `paid`, not `prize`: a winner already at MaxChips takes only what fits,
+	// and the remainder below goes to the jackpot pool rather than to them —
+	// counting it would show a season rank their balance never earned. The
+	// matching 「賭けた額」 was booked ticket by ticket in BuyLotteryTickets,
+	// because that is where the chips actually left the buyer.
+	addSeasonNetLocked(winnerAccount, paid)
 	// The house's cut feeds the slot jackpot pool (設計書 C-3a §3), and so
 	// does prize-paid: that remainder is 0 on every normal draw and non-zero
 	// only when the winner was at MaxChips. It goes down the same path as the
@@ -1667,6 +1699,13 @@ func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Ti
 			return nil // commit the rollover, not the purchase
 		}
 		account.Chips -= cost
+		// The ticket price is booked as 純利 the moment it is paid, not at
+		// the draw, because a ticket has no refund path: unlike an escrowed
+		// bet, these chips are gone whatever happens next (the draw may name
+		// someone else, or the bot may never run it). Booking it here is also
+		// what makes a buyer who never wins show up as negative rather than
+		// as never having played.
+		addSeasonNetLocked(account, -cost)
 		if lottery.Tickets == nil {
 			lottery.Tickets = make(map[string]int, 1)
 		}

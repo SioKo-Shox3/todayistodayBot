@@ -378,7 +378,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。`Update` のクロージャ内から公開メソッドを呼ばない(絶対規則 3)。口座に触る経路は必ず `ensureAccountLocked`(C3-14 の正規化点)を通す。
 
 ## C3B-02: `SeasonNet` を全ゲームの決着に配線する(§3)
-- status: todo
+- status: done
 - done-when: `UserAccount.SeasonNet`(C3B-01 で追加済み)を、既存の全ゲームの決着で更新する — スロット(`Spin`)、ハイ&ロー / ブラックジャック(`SettleGame`)、宝くじ(当選の入金と購入の支払い)。**1 回ごとに `SeasonNet += (実際に口座へ入った額 − 賭けた額)`**。デイリーボーナス・両替・`mint`・ウェルカムボーナス・シーズン賞与は**含めない**(§3)。`SettleGame` は「賭けた額」を知らないので、預かり(`Escrow`)を消す時点の値を使う(= 賭けた総額。ダブル込み)。読み取り点(`ensureAccountLocked`)で `SeasonNet` を `[-MaxChips, MaxChips]` へ正規化する。`store_test.go`: スロットの勝ち負け・H&L・BJ・duel・宝くじで `SeasonNet` が期待どおり動く / デイリーと両替と mint では動かない / 破損ファイルの巨大値が正規化される / 既存の期待値が 1 つも変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

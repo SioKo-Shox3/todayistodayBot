@@ -4460,3 +4460,316 @@ func TestAcceptDuel_ConcurrentAcceptancesSettleExactlyOnce(t *testing.T) {
 	assertSeasonNet(t, path, escrowGuild, escrowUser, 200)
 	assertSeasonNet(t, path, escrowGuild, duelOpponent, -200)
 }
+
+// --- SeasonNet: the month's 純利 across every game (設計書 C-3b §3) --------
+//
+// The one rule all of these pin: SeasonNet moves by (what the account
+// actually RECEIVED − what it staked), once per settlement, and only for
+// settlements. The duel's half of it lives with the duel tests above.
+
+// TestSpin_SeasonNetAccumulatesEachSpinsNet covers the slot, where the stake
+// and the credit happen in the same call. The final assertion is the one that
+// makes it more than arithmetic: with no handout anywhere in the run, the
+// season's 純利 must equal the whole change in the balance — that identity is
+// what a missed or double-counted settlement breaks.
+func TestSpin_SeasonNetAccumulatesEachSpinsNet(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 1000})
+
+	// 🍒🍒🍒 (×7) on a 100 bet: 700 in, 100 staked.
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolCherry)}}
+	if _, err := st.Spin("guild1", "user-1", 100); err != nil {
+		t.Fatalf("Spin (win) returned error: %v", err)
+	}
+	assertSeasonNet(t, path, "guild1", "user-1", 600)
+
+	// 🍋🍇🔔 pays nothing: the whole stake is the loss.
+	st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+	if _, err := st.Spin("guild1", "user-1", 100); err != nil {
+		t.Fatalf("Spin (loss) returned error: %v", err)
+	}
+	assertSeasonNet(t, path, "guild1", "user-1", 500)
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != 1500 {
+		t.Fatalf("Chips = %d, want 1500 (1000 - 100 + 700 - 100)", account.Chips)
+	}
+	if account.SeasonNet != account.Chips-1000 {
+		t.Fatalf("SeasonNet = %d but the balance moved by %d — with no handout in the run the two must agree", account.SeasonNet, account.Chips-1000)
+	}
+}
+
+// A refused spin persists nothing, so it must not leave a loss on the season
+// board either: the chips never left the account.
+func TestSpin_RefusedSpinLeavesSeasonNetUntouched(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 50})
+	st.rng = forbiddenRand{t: t, reason: "an unaffordable bet is refused before the reels are drawn"}
+
+	if _, err := st.Spin("guild1", "user-1", 100); err == nil {
+		t.Fatal("Spin accepted a bet the balance cannot cover")
+	}
+	assertSeasonNet(t, path, "guild1", "user-1", 0)
+}
+
+// TestSettleGame_SeasonNetUsesTheWholeEscrowAsTheStake is the ハイ&ロー /
+// ブラックジャック half. SettleGame is told the payout and never the bet, so
+// the stake it books is the escrow it is about to release — which for a
+// doubled hand is bet + ダブル, not bet. The 400-on-200 rows are the ones that
+// fail if the raise is left out.
+func TestSettleGame_SeasonNetUsesTheWholeEscrowAsTheStake(t *testing.T) {
+	tests := []struct {
+		name          string
+		game          GameKind
+		bet, raise    int64
+		payout        int64
+		wantNet       int64
+		wantChipsLeft int64
+	}{
+		{"ハイ&ローの勝ち", GameHighLow, 100, 0, 200, 100, 1100},
+		{"ハイ&ローの負け", GameHighLow, 100, 0, 0, -100, 900},
+		{"引き分けは賭け金が戻るだけ", GameHighLow, 100, 0, 100, 0, 1000},
+		{"ダブルした勝ち", GameBlackjack, 100, 100, 400, 200, 1200},
+		{"ダブルした負け", GameBlackjack, 100, 100, 0, -200, 800},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+			if err := st.OpenGame(escrowGuild, escrowUser, string(tc.game), tc.bet, fixedNow); err != nil {
+				t.Fatalf("OpenGame returned error: %v", err)
+			}
+			if tc.raise > 0 {
+				if err := st.AddToEscrow(escrowGuild, escrowUser, tc.raise); err != nil {
+					t.Fatalf("AddToEscrow returned error: %v", err)
+				}
+			}
+			if _, err := st.SettleGame(escrowGuild, escrowUser, tc.payout); err != nil {
+				t.Fatalf("SettleGame returned error: %v", err)
+			}
+			assertHoldings(t, path, escrowGuild, escrowUser, tc.wantChipsLeft, 0, "")
+			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantNet)
+		})
+	}
+}
+
+// A settlement that never happened must not be booked. Both refusals leave
+// the escrow in place for a retry, so booking a stake here would count the
+// same hand twice once that retry lands.
+func TestSettleGame_RefusalsLeaveSeasonNetUntouched(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	// No game in flight at all.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, 200); !errors.Is(err, ErrNoGameInProgress) {
+		t.Fatalf("SettleGame with no escrow returned %v, want ErrNoGameInProgress", err)
+	}
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+
+	// A payout that breaks the cap aborts the whole transaction.
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), 100, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+	if _, err := st.SettleGame(escrowGuild, escrowUser, MaxChips); !errors.Is(err, ErrChipCapExceeded) {
+		t.Fatalf("SettleGame over the cap returned %v, want ErrChipCapExceeded", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, string(GameHighLow))
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+}
+
+// Successive games accumulate rather than overwrite.
+func TestSettleGame_SeasonNetAccumulatesAcrossGames(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	for _, step := range []struct {
+		game           GameKind
+		bet, payout    int64
+		wantRunningNet int64
+	}{
+		{GameHighLow, 100, 200, 100},
+		{GameBlackjack, 300, 0, -200},
+		{GameHighLow, 50, 100, -150},
+	} {
+		if err := st.OpenGame(escrowGuild, escrowUser, string(step.game), step.bet, fixedNow); err != nil {
+			t.Fatalf("OpenGame(%s) returned error: %v", step.game, err)
+		}
+		if _, err := st.SettleGame(escrowGuild, escrowUser, step.payout); err != nil {
+			t.Fatalf("SettleGame(%s) returned error: %v", step.game, err)
+		}
+		assertSeasonNet(t, path, escrowGuild, escrowUser, step.wantRunningNet)
+	}
+
+	account := readAccount(t, path, escrowGuild, escrowUser)
+	if account.SeasonNet != account.Chips-1000 {
+		t.Fatalf("SeasonNet = %d but the balance moved by %d", account.SeasonNet, account.Chips-1000)
+	}
+}
+
+// TestLottery_SeasonNetBooksTheTicketAtPurchaseAndThePrizeAtTheDraw pins the
+// lottery's two halves, which happen on different DAYS. The final figure is
+// the point: a sole buyer who wins their own pot back is still down the
+// house's 10%, and that is what the season board must show — not 0.
+func TestLottery_SeasonNetBooksTheTicketAtPurchaseAndThePrizeAtTheDraw(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	yesterday := fixedNow.AddDate(0, 0, -1)
+
+	if _, err := st.BuyLotteryTickets("guild1", "u1", 2, yesterday); err != nil {
+		t.Fatalf("BuyLotteryTickets returned error: %v", err)
+	}
+	// The ticket price is booked where the chips actually leave, not at the
+	// draw: a buyer whose draw never runs is still out the money.
+	assertSeasonNet(t, path, "guild1", "u1", -100)
+
+	if _, err := st.LotteryStatus("guild1", "u1", fixedNow); err != nil {
+		t.Fatalf("LotteryStatus returned error: %v", err)
+	}
+	draw := readGuild(t, path, "guild1").Lottery.LastDraw
+	if draw == nil || draw.WinnerID != "u1" || draw.Prize != 90 {
+		t.Fatalf("LastDraw = %+v, want u1 winning 90 of the 100 sales", draw)
+	}
+	assertSeasonNet(t, path, "guild1", "u1", -10)
+}
+
+// A refused purchase takes no chips, so it books nothing — the same rule the
+// refused spin follows, on the one path in this package that COMMITS its
+// transaction while refusing (危険地帯: the rollover must survive).
+func TestLottery_RefusedPurchaseLeavesSeasonNetUntouched(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"u1": {Chips: 10}})
+
+	if _, err := st.BuyLotteryTickets("guild1", "u1", 1, fixedNow); err == nil {
+		t.Fatal("BuyLotteryTickets accepted a ticket the balance cannot cover")
+	}
+	assertSeasonNet(t, path, "guild1", "u1", 0)
+}
+
+// TestLottery_SeasonNetCountsWhatTheWinnerCouldActuallyTake is the cap rule
+// (§2) on the lottery path: a winner already at MaxChips takes only what
+// fits, the remainder goes to the jackpot pool rather than to them, and the
+// season board must show the amount that landed. PickLotteryWinner walks the
+// buyers in sorted order, so u1 holds the first two of the twelve tickets and
+// roll 0 names them.
+func TestLottery_SeasonNetCountsWhatTheWinnerCouldActuallyTake(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	seedAccounts(t, st, "guild1", map[string]UserAccount{
+		"u1": {Chips: MaxChips},
+		"u2": {Chips: 1000},
+	})
+	yesterday := fixedNow.AddDate(0, 0, -1)
+
+	if _, err := st.BuyLotteryTickets("guild1", "u1", 2, yesterday); err != nil {
+		t.Fatalf("BuyLotteryTickets(u1) returned error: %v", err)
+	}
+	if _, err := st.BuyLotteryTickets("guild1", "u2", 10, yesterday); err != nil {
+		t.Fatalf("BuyLotteryTickets(u2) returned error: %v", err)
+	}
+	if _, err := st.LotteryStatus("guild1", "u1", fixedNow); err != nil {
+		t.Fatalf("LotteryStatus returned error: %v", err)
+	}
+
+	// 600 sales -> a 540 prize, but u1's headroom is only the 100 they spent.
+	draw := readGuild(t, path, "guild1").Lottery.LastDraw
+	if draw == nil || draw.WinnerID != "u1" || draw.Prize != 100 {
+		t.Fatalf("LastDraw = %+v, want u1 credited 100 of the 540 prize", draw)
+	}
+	assertSeasonNet(t, path, "guild1", "u1", 0) // -100 staked, 100 received
+	assertSeasonNet(t, path, "guild1", "u2", -500)
+}
+
+// TestSeasonNet_HandoutsAndExchangesAreExcluded is the negative half of §3:
+// the board measures PLAYING, so every path that hands chips over or merely
+// changes their denomination must leave it at 0. Without this, the top of the
+// season board would be whoever claimed the most daily bonuses.
+func TestSeasonNet_HandoutsAndExchangesAreExcluded(t *testing.T) {
+	st, path := newTempStore(t)
+	seedRate(t, st, "guild1", fixedNow, 100)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"u1": {Coins: 1000, Chips: 1000}})
+	st.rng = forbiddenRand{t: t, reason: "today's rate is already seeded, so no draw may happen"}
+
+	// The welcome bonus, on an account that has never played.
+	if _, err := st.ViewAccount("guild1", "newbie", fixedNow); err != nil {
+		t.Fatalf("ViewAccount returned error: %v", err)
+	}
+	assertSeasonNet(t, path, "guild1", "newbie", 0)
+
+	if _, err := st.at(fixedNow).ClaimDaily("guild1", "u1"); err != nil {
+		t.Fatalf("ClaimDaily returned error: %v", err)
+	}
+	if _, err := st.ExchangeCoinToChip("guild1", "u1", 100, fixedNow); err != nil {
+		t.Fatalf("ExchangeCoinToChip returned error: %v", err)
+	}
+	if _, err := st.ExchangeChipToCoin("guild1", "u1", 1000, fixedNow); err != nil {
+		t.Fatalf("ExchangeChipToCoin returned error: %v", err)
+	}
+	if err := st.Mint("guild1", "u1", 500); err != nil {
+		t.Fatalf("Mint returned error: %v", err)
+	}
+
+	account := readAccount(t, path, "guild1", "u1")
+	if account.SeasonNet != 0 {
+		t.Fatalf("SeasonNet = %d, want 0 — the daily bonus, both exchanges and mint are excluded from 純利 (§3)", account.SeasonNet)
+	}
+	if account.Chips == 1000 && account.Coins == 1000 {
+		t.Fatal("no balance moved at all — the test proved nothing about exclusion")
+	}
+}
+
+// A stake that is handed back rather than played out is not a result: a
+// declined duel and a startup refund both leave the season board alone.
+func TestSeasonNet_RefundedStakesAreNotResults(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	openDuelChallenge(t, st, 200)
+	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+		t.Fatalf("DeclineDuel returned error: %v", err)
+	}
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameBlackjack), 300, fixedNow); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+	if _, err := st.RefundStaleEscrows(fixedNow); err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+}
+
+// TestSeasonNet_HandEditedExtremesAreNormalisedAtTheReadPoint is the file
+// half. A season_net near math.MaxInt64 wraps the very next addition, and a
+// wrapped 純利 puts the worst player at the top of the board. The clamp sits
+// at ensureAccountLocked, so merely OPENING a game repairs it — before any
+// arithmetic touches it.
+func TestSeasonNet_HandEditedExtremesAreNormalisedAtTheReadPoint(t *testing.T) {
+	tests := []struct {
+		name                         string
+		seeded                       int64
+		wantAfterRead, wantAfterLoss int64
+	}{
+		// The loss comes off the clamped value, not the file's.
+		{"上限を超えた値", math.MaxInt64, MaxChips, MaxChips - 100},
+		// Already saturated at the floor: a further loss cannot wrap it positive.
+		{"下限を下回った値", math.MinInt64, -MaxChips, -MaxChips},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000, SeasonNet: tc.seeded})
+
+			if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), 100, fixedNow); err != nil {
+				t.Fatalf("OpenGame returned error: %v", err)
+			}
+			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantAfterRead)
+
+			if _, err := st.SettleGame(escrowGuild, escrowUser, 0); err != nil {
+				t.Fatalf("SettleGame returned error: %v", err)
+			}
+			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantAfterLoss)
+		})
+	}
+}
