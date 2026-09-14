@@ -887,6 +887,75 @@ func TestStore_ExchangeAndRecentRates_AgreeAfterClockGoesBackwards(t *testing.T)
 	}
 }
 
+// seedRates writes a rate history straight into guildID, bypassing
+// ensureTodayRateIndexLocked so a test can start from a history that only the
+// pre-fix code could have produced (days stored out of order).
+func seedRates(t *testing.T, st *Store, guildID string, rates []DailyRate) {
+	t.Helper()
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		economy.Rates = append([]DailyRate(nil), rates...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding rates for %s: %v", guildID, err)
+	}
+}
+
+// TestStore_EnsureTodayRate_ReusesSettledDayInOutOfOrderHistory covers the
+// histories the pre-fix code already wrote to disk: D, D+1, D. Asking for D+1
+// again must hand back the D+1 ALREADY stored, not draw a second one — the
+// tail (D) says nothing about whether D+1 has been settled, and /exchange has
+// already paid out at the stored value.
+func TestStore_EnsureTodayRate_ReusesSettledDayInOutOfOrderHistory(t *testing.T) {
+	st, path := newTempStore(t)
+	day1, day2 := jstDate(fixedNow), jstDate(daysAfter(1))
+	seeded := []DailyRate{
+		{Date: day1, Rate: 100, Trend: TrendFlat, Event: EventNone},
+		{Date: day2, Rate: 102, Trend: TrendBull, Event: EventNone},
+		{Date: day1, Rate: 104, Trend: TrendBull, Event: EventNone},
+	}
+	seedRates(t, st, "guild1", seeded)
+	st.rng = fixedRand{float: 0.9}
+
+	got, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+	if got != seeded[1] {
+		t.Fatalf("EnsureTodayRate for an already settled day = %+v, want the stored %+v", got, seeded[1])
+	}
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != len(seeded) {
+		t.Fatalf("persisted rates = %+v, want the untouched %+v", economy.Rates, seeded)
+	}
+	for i, want := range seeded {
+		if economy.Rates[i] != want {
+			t.Fatalf("persisted rate %d = %+v, want the untouched %+v", i, economy.Rates[i], want)
+		}
+	}
+
+	// /exchange and /rate must quote that same stored rate.
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 100}})
+	exchange, err := st.ExchangeCoinToChip("guild1", "user-1", 10, daysAfter(1))
+	if err != nil {
+		t.Fatalf("ExchangeCoinToChip returned error: %v", err)
+	}
+	if exchange.RateUsed != seeded[1].Rate {
+		t.Fatalf("/exchange charged %d, want the settled %d", exchange.RateUsed, seeded[1].Rate)
+	}
+	history, err := st.RecentRates("guild1", daysAfter(1), 7)
+	if err != nil {
+		t.Fatalf("RecentRates returned error: %v", err)
+	}
+	if len(history) == 0 {
+		t.Fatal("RecentRates returned an empty history")
+	}
+	if headline := history[len(history)-1]; headline != seeded[1] {
+		t.Fatalf("/rate headlines %+v while /exchange charged %d (history %+v)", headline, exchange.RateUsed, history)
+	}
+}
+
 func TestStore_EnsureCasinoAccess_FirstAccessGrantsWelcomeBonus(t *testing.T) {
 	st, path := newTempStore(t)
 	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
