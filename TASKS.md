@@ -352,3 +352,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/announce.go, internal/casino/announce_test.go
 - notes: この形式は**このブランチの途中コミットでしか存在しない**(Bot はまだ一度も本番稼働していない)が、古いビルドで生成したファイルを持ち込む可能性はあるので閉じる。移行は読み取り点に置き、抽選で `LastDraw` を上書きする**前**に効くこと。
+
+## C3-19: 移行の掲示チャンネル条件を外し、掲示済み境界を後退させない
+- status: todo
+- done-when: `.harness/reviews/2026-09-15-astra-c3-18.md` の blocking 2 件を直す。(1) **[P1] チャンネル未設定のギルドで移行対象の旧当選が失われる**: 移行(`store.go` 1301 付近)が `AnnounceChannelID == ""` を除外条件にしているため、掲示先が未設定のギルドでは移行が飛び、次の抽選が `LastDraw` を上書きして当選記録が消える(掲示は後からチャンネルを設定すれば送れるはずだった)。**チャンネルの条件を外す** — 移行は掲示先の有無に関係なく行う(掲示するかどうかは `CollectDailyAnnouncements` 側の判断)。再現(レビューの手順)を回帰テストにする: チャンネル空・`LastAnnounced=2026-09-12`・`LastDraw.Date=2026-09-13`(当選者あり)・待ち行列なし・次回分の券ありで 9/14 10:00 に `EnsureTodayRate` を呼ぶと、9/13 の当選が待ち行列に残る(抽選が上書きしても失われない)。(2) **[P2] 日付が巻き戻ると掲示済みの当選が復活する**: `MarkAnnounced` は `LastAnnounced` を後退させられるため、時計が戻ると掲示済みの回が「未掲示」に見えて再掲示・再祝いされる。`LastAnnounced` を**単調非減少**にする(`date > LastAnnounced` のときだけ書く)。回帰テスト: 9/14 掲示済みの状態で 9/13 10:00 → 9/14 10:00 の順に掲示パスを回しても、9/14 の当選が二度掲示されない / 通常の前進では従来どおり更新される。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go
+- notes: (2) は宝くじだけでなくレート掲示にも効く(時計の巻き戻しで 9 時掲示が二度出るのも同じ原因)。日付の比較は文字列の辞書順で足りる(`YYYY-MM-DD` 固定長)。
