@@ -396,7 +396,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(全口座を触る)。賞与は**意図的な新規発行**で、保存則の例外として設計書に書いてある(§2)— テストもその前提で書く。
 
 ## C3B-04: `/duel` コマンドと受諾・辞退ボタン(§4.5・§5・§6)
-- status: todo
+- status: done
 - done-when: `internal/commands/duel.go`: `/duel <相手> <bet>`(ギルド専用宣言 + 実行時ガード、ベット幅 10〜1,000、自分自身と Bot を拒否、`EnsureCasinoAccess` → `OpenGame`(挑戦者)→ `DefaultSessions().Open` → 公開メッセージに embed(挑戦者・相手・ベット)と「⚔️ 受ける」「🚫 断る」)。`ComponentHandler`(prefix `duel`): **押せるのは受け手だけ**(盤面に持たせた受け手 ID で判定。他人には ephemeral で「❌ この挑戦はあなた宛てではありません」)。受諾は `AcceptDuel` → 結果を編集(コイン・勝者・配当・両者の残高)、ボタン無効化。受け手のチップ不足は ephemeral で断り盤面を残す。辞退は `DeclineDuel` → 「🚫 挑戦は断られました」に編集。C-2 の掃除人の自動決着(3 分)は `DeclineDuel` と同じ扱い(挑戦者へ返金、「⌛ 時間切れ — 挑戦は取り下げられました」)。`duel_test.go`: 表示の純粋関数、所有者(受け手)判定、自分自身/Bot の拒否、精算が編集より先(fake responder で順序)、決着後の押下、時間切れの文言。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`

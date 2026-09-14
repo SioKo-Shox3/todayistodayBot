@@ -362,4 +362,11 @@ type casinoBank interface {
 	AddToEscrow(guildID, userID string, amount int64) error
 	SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error)
 	ViewAccount(guildID, userID string, now time.Time) (casino.AccountView, error)
+	// The duel settles two accounts at once and withdraws through its own
+	// route: AcceptDuel is the whole game in one transaction, and DeclineDuel
+	// is the refund that cannot fail on the chip cap (設計書 C-3b §4.5). They
+	// are on this interface rather than on a second one so that /duel keeps
+	// the same seam — and the same test doubles — as the other two games.
+	AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (casino.DuelSettlement, error)
+	DeclineDuel(guildID, challengerID string) error
 }
