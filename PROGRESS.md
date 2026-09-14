@@ -476,3 +476,34 @@
 - **評価者未実施**: 危険地帯の変更なので、区切りのレビューでは `AcceptDuel` / `SettleGame` の
   再入(`Update` のクロージャ内から公開メソッドを呼んでいないこと)と、`EscrowOpening` の隙間に
   誰も入れないことを重点に見てほしい。
+
+## 反復 3(C3B-14) — 2026-09-15
+
+- **Done**: C3B-14。未送達の挑戦(初回 `InteractionRespond` が失敗した `/duel`)の取り下げを
+  `withdrawUndeliveredChallenge` として切り出し、⚔️・🚫 と**同じ per-board ロックと `Hold`** の
+  内側で走らせ、`DeclineDuel` が**成功したときだけ** `Close` するようにした。ゲート 3 本とも
+  exit=0・全 8 パッケージ ok(`.harness/runs/20260915-080323/verify-C3B-14-{1,2,3}.txt`)。
+- **Next**: C3B-15(挑戦の開始時に受け手の進行中ゲームも断る。blocking 4、P2)。未完は C3B-15〜17 の 3 件。
+- **順序が本体、ロックは副次だった**: 2 つの欠陥のうち実際に**チップを取り残す**のは (b) の順序だけ。
+  (a) の競合は C3B-13 の印のおかげで誤精算にはならない — 受諾と返金はどちらも預かりを奪い合い、
+  後から着いた方が `ErrNoGameInProgress` で断られる(預かりそのものが札になっている)。
+  一方 (b) は、`Close` してから返金に失敗すると**盤面が消えた状態で預かりだけが残る**: 🚫 も
+  掃除人も届かず、再起動の `RefundStaleEscrows` まで口座が「進行中」で固まる。
+- **失敗したら盤面を残す = 掃除人が再試行の経路**(C2-10 と同じ形)。`Hold` が失われた盤面は
+  「もう他人のもの(受諾済み・辞退済み・掃除済み)」なので**何もしない** — 精算済みの預かりを
+  返金してはいけない。返金が `ErrNoGameInProgress` / `ErrEscrowMismatch` で断られた場合も盤面は
+  残すが、3 分後の巡回で `sweepIdleBoards` が同じ 2 つを「払うものが無い」として落とすので、
+  永久に居座ることはない(最大 3 分、次のゲームは開けない)。
+- **`Close` はホールド中でも通る**(`busy` を見ない)。受諾・辞退が既にそうしているのと同じで、
+  `Release` は消えた盤面を無視する。順序を「返金 → `Close`」にしても新しい規約は要らなかった。
+- **効き目の確認**: 後始末を旧実装(`Close` してから返金、ロック無し)へ戻すと
+  `TestDuelUndeliveredChallengeKeepsTheBoardUntilTheRefundLands` が
+  `0 challenges are live after a refused refund, want 1` で落ちる
+  (`mutation-C3B-14-close-before-refund.txt`)。**もう 1 本の競合テストはこの変異では落ちない** —
+  上に書いたとおり印が誤精算を止めるので、旧実装でも金額は合う。あれは「ロックで直列化されている」
+  という不変条件の番人であって、欠陥の再現ではない。
+- **残っている同型の穴(今回の `paths:` の外)**: `BindEscrowSession` が失敗したときの後始末は
+  今も `Close` → 返金の順。ただしこちらは印が `EscrowOpening` のままなので、盤面を残しても
+  掃除人の `SettleTimedOutBoard` は盤面 ID で `ErrEscrowMismatch` になり再試行にならない。
+  `NEXT_FINDINGS.md` の反復 2 所見 1(紐付け前の掃除)と同じ根で、直すなら
+  「紐付けが終わるまで掃除から守る」側。タスクとしてはまだ起きていない。
