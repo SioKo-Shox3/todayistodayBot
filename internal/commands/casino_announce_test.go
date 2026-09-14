@@ -797,3 +797,81 @@ func TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass(t *testin
 		t.Fatalf("the delivered result was posted again: %q", texts)
 	}
 }
+
+// twoClosedSeasonsFile is the C3B-08 state a month boundary produces while
+// the channel is unreachable: June was never posted and July closed on top
+// of it. LastSeason holds only the newer one — the queue is what still owes
+// both.
+const twoClosedSeasonsFile = `{"g1":{"announce_channel_id":"c1","rates":[],"last_announced":"",` +
+	`"season_month":"2026-08","last_season":{"month":"2026-07","players":1,"ranks":[` +
+	`{"user_id":"u9","net":400,"bonus":2500}]},"unannounced_seasons":[` +
+	`{"month":"2026-06","players":7,"ranks":[{"user_id":"u1","net":5000,"bonus":10000}]},` +
+	`{"month":"2026-07","players":1,"ranks":[{"user_id":"u9","net":400,"bonus":2500}]}],"users":{}}}`
+
+// 一度に複数の月が溜まりうる: each queued month is its own message, oldest
+// first, because each named a different podium and each is owed its ping.
+func TestStartAnnounceScheduler_CelebratesEveryQueuedSeason(t *testing.T) {
+	store := seededCasinoStore(t, twoClosedSeasonsFile)
+
+	embeds, texts, channels := runOneAnnouncePass(t, store, announceAt10())
+
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	if len(texts) != 2 {
+		t.Fatalf("got %d season messages, want 2 — both owed months: %q", len(texts), texts)
+	}
+	for i, want := range []string{"2026-06", "2026-07"} {
+		if !strings.Contains(texts[i], want) {
+			t.Fatalf("season message %d = %q, want the %s result (oldest first)", i, texts[i], want)
+		}
+		if channels[i] != "c1" {
+			t.Errorf("season message %d went to %q, want the announcement channel", i, channels[i])
+		}
+	}
+
+	// Both landed, so neither is owed again.
+	if _, texts, _ := runOneAnnouncePass(t, store, announceAt10().AddDate(0, 0, 1)); len(texts) != 0 {
+		t.Fatalf("a delivered result was posted again: %q", texts)
+	}
+}
+
+// 送信に成功した月だけ取り除く: the first message got through and the second
+// did not, so the next pass owes exactly the second — and does not ping the
+// podium that already landed.
+func TestStartAnnounceScheduler_AFailedSeasonDoesNotRetireTheOnesBeforeIt(t *testing.T) {
+	store := seededCasinoStore(t, twoClosedSeasonsFile)
+
+	var texts []string
+	failFrom := 1
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { return nil }
+	sendText := func(channelID, content string) error {
+		if len(texts) >= failFrom {
+			return errors.New("discord is down")
+		}
+		texts = append(texts, content)
+		return nil
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+	}
+
+	day1 := announceAt10()
+	pass(day1)
+	if len(texts) != 1 || !strings.Contains(texts[0], "2026-06") {
+		t.Fatalf("first pass delivered %q, want the June result alone", texts)
+	}
+
+	failFrom = 2 // the next message gets through
+	pass(day1.AddDate(0, 0, 1))
+	if len(texts) != 2 {
+		t.Fatalf("second pass: delivered %q, want July added", texts)
+	}
+	if !strings.Contains(texts[1], "2026-07") {
+		t.Fatalf("second pass delivered %q, want the July result — June was already posted", texts[1])
+	}
+}

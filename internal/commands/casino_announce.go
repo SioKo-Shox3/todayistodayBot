@@ -255,24 +255,31 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 				}
 			}
 			// 設計書 C-3b §4 掲示: a season that has closed since the last
-			// posting gets its own public message. Only a closed one — on
-			// every other morning SeasonClosed is nil and nothing is sent.
+			// posting gets its own public message. Only closed ones — on
+			// every other morning the queue is empty and nothing is sent.
+			// One message per queued month: each named a different podium
+			// and each is owed its ping.
 			//
-			// The mark is taken HERE, right after the confirmed send, and
-			// not by runAnnouncePass with the rest of the job: a failure
-			// must leave the result pending WITHOUT failing the job, because
-			// failing it would re-post the embed (and re-ping the lottery
-			// winner) on the next pass of the same day. Left unmarked, the
-			// result is carried by the next pass that reaches this guild,
-			// and it stays readable through /season in the meantime.
-			if job.SeasonClosed != nil {
-				if celebration := seasonAnnounceCelebration(job.SeasonClosed); celebration != "" {
+			// The mark is taken HERE, per month and right after that
+			// month's confirmed send, and not by runAnnouncePass with the
+			// rest of the job: a failure must leave the result pending
+			// WITHOUT failing the job, because failing it would re-post the
+			// embed (and re-ping the lottery winner) on the next pass of the
+			// same day. Left unmarked, the result is carried by the next
+			// pass that reaches this guild.
+			for i := range job.ClosedSeasons {
+				closed := &job.ClosedSeasons[i]
+				if celebration := seasonAnnounceCelebration(closed); celebration != "" {
 					if err := sendText(job.ChannelID, celebration); err != nil {
 						slog.Error("discord: ChannelMessageSend failed for a season result", "guild_id", job.GuildID, "error", err)
-						return nil // the embed is up; leave the season for the next pass
+						// Stop at the first failure rather than skipping
+						// ahead: the queue is oldest-first, and posting a
+						// later month before an earlier one would tell the
+						// channel the seasons happened out of order.
+						return nil // the embed is up; leave the rest for the next pass
 					}
 				}
-				if err := st.MarkSeasonAnnounced(job.GuildID, job.SeasonClosed.Month); err != nil {
+				if err := st.MarkSeasonAnnounced(job.GuildID, closed.Month); err != nil {
 					slog.Error("casino: MarkSeasonAnnounced failed", "guild_id", job.GuildID, "error", err)
 				}
 			}

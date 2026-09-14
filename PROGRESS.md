@@ -4,6 +4,14 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-08(未掲示のシーズン結果を月替わりで失わない)。証拠 `.harness/runs/20260915-064206/verify-C3B-08-{1,2,3,4}.txt`(4 本とも exit=0)。
+  **待ち行列は宝くじと同じ形にした(親の決定)** — `GuildEconomy.UnannouncedSeasons []SeasonResult`(上限 3、溢れたら**前から**落とす)。`rolloverSeasonLocked` が閉じた結果を**追記**し、取り除くのは `MarkSeasonAnnounced` = 送信が確認できた月だけ。`LastSeason` は `/season` の表示用に最新 1 件として残るが、**掲示はもう読まない** — 月替わりごとに無条件で上書きされる値だったのが所見 1 の原因そのもの。
+  **上限を 3 にしたのは宝くじの 7 と理由が違う**。1 件 1 件が表彰台を @メンションするので、溜めて一度に出すこと自体が費用。1 か月に 1 件しか増えないので 3 = 四半期分。
+  **表彰台が空の月は待ち行列に入れない**。祝いの本文が `""`(= 送らない)になる結果で、入れると静かな月ごとに 3 枠のうち 1 枠を食い、**本物の表彰台を前から押し出す**。`LastSeason` には従来どおり入るので `/season` の表示は変わらない。
+  **既存 JSON(キー無し)を落とさないための移行を入れた** — `migrateUnannouncedSeasonsLocked` は `rolloverSeasonLocked` の**先頭**で走る(早期 return より前)。上書きの直前に拾うのが要点で、月をまたいで止まっていたボットが 1 回の呼び出しで「6 月を待ち行列へ → 7 月を閉じる」の順に進む。判定は宝くじの移行と同じ `LastSeason.Month > LastSeasonAnnounced`、二度入れない保証は「待ち行列が空でなければ何もしない」。`LastSeasonAnnounced` の役目はこれだけになった(収集はもう見ない)。
+  **掲示側は月ごとに 1 通・古い順で、失敗したらそこで止める**。次の月を先に出すと回が前後して見えるので、`return nil`(embed は載っている)で残りを次の巡回へ回す。印は月ごとに `MarkSeasonAnnounced` で、`MarkAnnounced` と同じく `Month <= month` で剪定する(飛行中に閉じた回は後ろの月なので生き残る)。
+  **効き目の確認**(`.harness/runs/20260915-064206/mutation-C3B-08-no-queue.txt`): 追記 1 行を外すと新規 3 件が落ちる(7/31 の巡回で結果が運ばれない / 2 か月分が溜まらない / 上限の検査が 1 件しか見ない)。`NoChannelKeepsASeasonAcrossTheMonthBoundary` は移行だけでも通るので、この変異では落ちない。
+  **前の反復が未コミットで残していた `NEXT_FINDINGS.md` の反復 3 節は、先に単独でコミットした**(`395acca`)。混ぜると 1 コミット 1 論理変更が崩れる。
 - C3B-07(README・設計書の実測・`architecture.md` の追記案)。証拠 `.harness/runs/20260915-064206/verify-C3B-07-{1,2,3,4}.txt`(4 本とも exit=0。4 本目は実測の根拠にした 5 テストの `-v` 出力)。
   **実測の数字は全部テストから採った**(書いてから走らせたのではなく、走っているテストの期待値を写した): duel は 1,000+1,000 の 2 人が 200 を賭けて 1,200/800、保存ファイル上の `Chips + Escrow` 合計は 2,000 のまま(`TestAcceptDuel_MovesThePotToTheWinnerAndKeepsTheTwoAccountsSummedUnchanged`)。上限の例は `MaxChips − 100` の挑戦者が 400 ではなく 300 を受け取り `SeasonNet` は +100(`..._WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat`)。賞与は 1 ギルド 1 回の切り替えで最大 17,500 チップ、6 人の例で残高が 11,000/6,000/3,500(`TestStore_SeasonRollover_ClosesMonthPaysPodiumAndZeroesEveryAccount`)、上限に当たると `Bonus` は 3,000 / 0(`..._BonusCappedAtMaxChips_RecordsWhatLanded`)。
   **README の `/duel` は「どちらも3分間…」の行の後ろに置いた**。その行はハイ&ローとブラックジャックの 2 本を指しており、間に 3 本目を挟むと「どちらも」が誰を指すか壊れる。duel の 3 分は**受諾を待つ時間**で、他 2 本の「操作が無い時間」とは別物なので、duel 自身の箇条書きで書いた。
@@ -192,7 +200,8 @@
 - (なし)
 
 ## Next
-- **次は C3B-08 → C3B-09**(反復 2 の評価者所見を `TASKS.md` へ落とした 2 件)。C-3b の機能実装と文書はこれで閉じたので、残るのは掲示の取りこぼし 2 件だけ。**C3B-08 が先** — 2 件とも `announce.go` の収集条件を触るので、待ち行列の形を決める方(P1)を先に閉じないと C3B-09 の差分が二度手間になる。`NEXT_FINDINGS.md` の該当節は、対応するタスクを閉じるときに消す(いまは残してある — 再現手順が所見の側にしか無い)。
+- **次は C3B-09**(`TASKS.md` の最後の未完 = 反復 2 の所見 2「同日中の次の巡回では結果を再送できない」)。C3B-08 で待ち行列の形は決まったので、残るのは**収集の条件**だけ — `collectDailyAnnouncements` は `today <= LastAnnounced` でギルドごと飛ばすので、embed が載った日のうちは `UnannouncedSeasons` / `Lottery.Unannounced` に何が残っていても運ばれない。所見の再現手順(embed 成功・結果送信失敗 → 同日 11 時に再起動)は `NEXT_FINDINGS.md` の反復 2 節に残してある。**行番号は C3B-08 の差分でずれている**(`casino_announce.go:272` は今の `return nil` ではない)ので、参照は本文の記述で引くこと。
+- **旧: 次は C3B-08 → C3B-09**(反復 2 の評価者所見を `TASKS.md` へ落とした 2 件)。C-3b の機能実装と文書はこれで閉じたので、残るのは掲示の取りこぼし 2 件だけ。**C3B-08 が先** — 2 件とも `announce.go` の収集条件を触るので、待ち行列の形を決める方(P1)を先に閉じないと C3B-09 の差分が二度手間になる。`NEXT_FINDINGS.md` の該当節は、対応するタスクを閉じるときに消す(いまは残してある — 再現手順が所見の側にしか無い)。
 - **旧: 次は C3B-07**(README・設計書の実測・architecture の追記案)= `TASKS.md` の最後の未完。C-3b の実装は C3B-06 で全部閉じた。README のコマンド一覧に `/duel` と `/season` が無いのはここで拾う(下の残件と同じもの)。
 - **旧: 次は C3B-06**(9 時掲示のシーズン欄と結果の祝い)。表示側で残っているのは掲示だけ — `/season` と `/balance` は C3B-05 で閉じた。`SeasonStatus` と同じ数(上位 3 名・純利)を掲示が必要とするが、掲示は `AnnouncementJob` を組む側(`internal/casino/announce.go`)なので、`SeasonView` を再利用するのではなく `LastSeason` / `SeasonRanks` を直に読む形になる。
 - **`README.md` のコマンド一覧に `/duel` と `/season` はまだ無い**。C3B-05 の `paths:` に README が無かったので触っていない(`/help` はレジストリ生成なので自動で載る)。README を触るタスクで拾う。

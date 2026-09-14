@@ -48,16 +48,21 @@ type AnnouncementJob struct {
 	// 純利 0).
 	SeasonMonth string
 	SeasonTop   []SeasonRank
-	// SeasonClosed is the most recently closed season when its public result
-	// has NOT been posted yet, and nil otherwise — including on every
-	// ordinary morning of a month, since a season closes only once.
+	// ClosedSeasons is every closed season whose public result is still
+	// owed, oldest first — GuildEconomy.UnannouncedSeasons as it stood at
+	// collection time. It is empty on every ordinary morning, since a season
+	// closes only once a month, and holds more than one entry when an outage
+	// carried across a month boundary.
 	//
-	// Kept until a send succeeds, the discipline the lottery queue follows:
-	// MarkSeasonAnnounced is called only after a confirmed post, so an
-	// outage across the 1st leaves the result here and the next pass that
-	// reaches this guild posts it. The month it names is the month that
-	// CLOSED, not today's.
-	SeasonClosed *SeasonResult
+	// It is a QUEUE for the reason LotteryDraws is: a single slot lets the
+	// next month's close overwrite a result nobody ever saw, and that podium
+	// would then never be announced at all (C3B-08). The months it names are
+	// therefore not necessarily last month's, which is why the message
+	// prints each result's own Month rather than saying 「先月」.
+	//
+	// Kept until a send succeeds: MarkSeasonAnnounced is called only after a
+	// confirmed post, and only the month it names leaves the queue.
+	ClosedSeasons []SeasonResult
 }
 
 // collectDailyAnnouncements ensures every known guild's rate exists for
@@ -111,17 +116,16 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 				SeasonMonth:    economy.SeasonMonth,
 				SeasonTop:      seasonTop,
 			}
-			// A closed season is pending until its own mark catches up with
-			// it — `>` and not `!=`, the high-water rule LastAnnounced
-			// follows: a clock that steps back must not re-open a month that
-			// has already been celebrated and @mention its winners twice.
-			// Copied, slice included, for the reason LotteryDraws is: the
-			// value behind LastSeason belongs to the Data this Update is
-			// about to drop, and the job outlives it.
-			if last := economy.LastSeason; last != nil && last.Month > economy.LastSeasonAnnounced {
-				closed := *last
-				closed.Ranks = append([]SeasonRank(nil), last.Ranks...)
-				job.SeasonClosed = &closed
+			// Handed over whole, with no month filter of its own, for the
+			// reason the lottery queue below is: the queue already IS the
+			// list of results that have not been announced, and re-deriving
+			// that from LastSeason/LastSeasonAnnounced would re-introduce
+			// the one-pending-result assumption the queue exists to break.
+			// Copied, Ranks included, because the slices behind it belong to
+			// the Data this Update is about to drop and the job outlives it.
+			for _, closed := range economy.UnannouncedSeasons {
+				closed.Ranks = append([]SeasonRank(nil), closed.Ranks...)
+				job.ClosedSeasons = append(job.ClosedSeasons, closed)
 			}
 			// Handed over whole, with no date filter of its own: the queue
 			// already IS the list of draws that have not been announced, and
@@ -182,9 +186,17 @@ func (s *Store) MarkAnnounced(guildID, date string) error {
 }
 
 // MarkSeasonAnnounced records that guildID's closed season for `month`
-// ("2006-01") has been posted. Call ONLY after a confirmed successful send,
-// for MarkAnnounced's reason — leaving the mark behind is what makes the
-// next pass carry the result again (設計書 C-3b §4 掲示).
+// ("2006-01") has been posted and takes it out of the queue. Call ONLY after
+// a confirmed successful send, for MarkAnnounced's reason — leaving the
+// entry in the queue is what makes the next pass carry the result again
+// (設計書 C-3b §4 掲示).
+//
+// It retires ONE month rather than emptying the queue, and by `Month <=
+// month` rather than by equality: several results can be owed at once and
+// they are posted one message at a time, so a failure partway through must
+// leave the months that did not go out exactly where they were. A season
+// that closed WHILE the message was in flight carries a later month and
+// survives for the same reason a late lottery draw does.
 //
 // It is a SEPARATE call from MarkAnnounced, not a second field on it,
 // because the two messages fail independently: the daily embed goes out
@@ -203,6 +215,17 @@ func (s *Store) MarkSeasonAnnounced(guildID, month string) error {
 		economy := ensureGuildLocked(d, guildID)
 		if month > economy.LastSeasonAnnounced {
 			economy.LastSeasonAnnounced = month
+		}
+		kept := economy.UnannouncedSeasons[:0]
+		for _, closed := range economy.UnannouncedSeasons {
+			if closed.Month > month {
+				kept = append(kept, closed)
+			}
+		}
+		if len(kept) == 0 {
+			economy.UnannouncedSeasons = nil // keep omitempty's promise: no empty array on disk
+		} else {
+			economy.UnannouncedSeasons = kept
 		}
 		return nil
 	})

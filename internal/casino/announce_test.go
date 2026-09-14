@@ -1380,9 +1380,19 @@ func TestCollectDailyAnnouncements_CarriesTheRunningSeasonPodium(t *testing.T) {
 			t.Errorf("job.SeasonTop[%d] = %+v, want %+v", i, job.SeasonTop[i], rank)
 		}
 	}
-	if job.SeasonClosed != nil {
-		t.Errorf("job.SeasonClosed = %+v, want nil — no season has closed", job.SeasonClosed)
+	if len(job.ClosedSeasons) != 0 {
+		t.Errorf("job.ClosedSeasons = %+v, want empty — no season has closed", job.ClosedSeasons)
 	}
+}
+
+// oneClosedSeason returns the single season result the job is owed, failing
+// the test if the queue holds any other number.
+func oneClosedSeason(t *testing.T, job AnnouncementJob) SeasonResult {
+	t.Helper()
+	if len(job.ClosedSeasons) != 1 {
+		t.Fatalf("job.ClosedSeasons = %+v, want exactly 1 result", job.ClosedSeasons)
+	}
+	return job.ClosedSeasons[0]
 }
 
 // A month nobody has won or lost anything in is a normal morning, not a
@@ -1416,26 +1426,24 @@ func TestCollectDailyAnnouncements_ClosesTheMonthAndCarriesItsResult(t *testing.
 
 	job := oneJob(t, st, announceAt1000)
 
-	if job.SeasonClosed == nil {
-		t.Fatalf("job.SeasonClosed = nil, want the June season the pass just closed")
+	closed := oneClosedSeason(t, job)
+	if closed.Month != "2026-06" {
+		t.Errorf("closed.Month = %q, want %q (the month that CLOSED, not today's)", closed.Month, "2026-06")
 	}
-	if job.SeasonClosed.Month != "2026-06" {
-		t.Errorf("job.SeasonClosed.Month = %q, want %q (the month that CLOSED, not today's)", job.SeasonClosed.Month, "2026-06")
-	}
-	if job.SeasonClosed.Players != 4 {
-		t.Errorf("job.SeasonClosed.Players = %d, want 4", job.SeasonClosed.Players)
+	if closed.Players != 4 {
+		t.Errorf("closed.Players = %d, want 4", closed.Players)
 	}
 	want := []SeasonRank{
 		{UserID: "leader", Net: 1_200, Bonus: SeasonBonus(1)},
 		{UserID: "second", Net: 800, Bonus: SeasonBonus(2)},
 		{UserID: "third", Net: 300, Bonus: SeasonBonus(3)},
 	}
-	if len(job.SeasonClosed.Ranks) != len(want) {
-		t.Fatalf("job.SeasonClosed.Ranks = %+v, want %+v", job.SeasonClosed.Ranks, want)
+	if len(closed.Ranks) != len(want) {
+		t.Fatalf("closed.Ranks = %+v, want %+v", closed.Ranks, want)
 	}
 	for i, rank := range want {
-		if job.SeasonClosed.Ranks[i] != rank {
-			t.Errorf("Ranks[%d] = %+v, want %+v", i, job.SeasonClosed.Ranks[i], rank)
+		if closed.Ranks[i] != rank {
+			t.Errorf("Ranks[%d] = %+v, want %+v", i, closed.Ranks[i], rank)
 		}
 	}
 	if job.SeasonMonth != "2026-07" || len(job.SeasonTop) != 0 {
@@ -1451,22 +1459,20 @@ func TestCollectDailyAnnouncements_KeepsTheClosedSeasonUntilItIsAnnounced(t *tes
 	seedAnnounceGuild(t, st, "guild1", "chan1", "")
 	seedAnnounceSeason(t, st, "guild1", "2026-06", nil, map[string]int64{"leader": 1_200})
 
-	first := oneJob(t, st, announceAt1000)
-	if first.SeasonClosed == nil {
-		t.Fatalf("first pass: SeasonClosed = nil, want the closed June season")
+	if first := oneClosedSeason(t, oneJob(t, st, announceAt1000)); first.Month != "2026-06" {
+		t.Fatalf("first pass: closed season = %+v, want June", first)
 	}
 	// The send failed: nothing was marked.
-	retry := oneJob(t, st, announceAt1000)
-	if retry.SeasonClosed == nil || retry.SeasonClosed.Month != "2026-06" {
-		t.Fatalf("after a failed send: SeasonClosed = %+v, want the June season again", retry.SeasonClosed)
+	if retry := oneClosedSeason(t, oneJob(t, st, announceAt1000)); retry.Month != "2026-06" {
+		t.Fatalf("after a failed send: closed season = %+v, want the June season again", retry)
 	}
 
 	if err := st.MarkSeasonAnnounced("guild1", "2026-06"); err != nil {
 		t.Fatalf("MarkSeasonAnnounced returned error: %v", err)
 	}
 	after := oneJob(t, st, announceAt1000)
-	if after.SeasonClosed != nil {
-		t.Fatalf("after a confirmed send: SeasonClosed = %+v, want nil — the podium must not be pinged twice", after.SeasonClosed)
+	if len(after.ClosedSeasons) != 0 {
+		t.Fatalf("after a confirmed send: ClosedSeasons = %+v, want empty — the podium must not be pinged twice", after.ClosedSeasons)
 	}
 }
 
@@ -1475,7 +1481,12 @@ func TestCollectDailyAnnouncements_KeepsTheClosedSeasonUntilItIsAnnounced(t *tes
 func TestMarkSeasonAnnounced_DoesNotLetAClockRollbackRepostASeason(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAnnounceGuild(t, st, "guild1", "chan1", "")
-	seedAnnounceSeason(t, st, "guild1", "2026-07", &SeasonResult{Month: "2026-06", Players: 1}, nil)
+	// A podium, not a bare result: an empty one is never queued at all
+	// (queueClosedSeasonLocked), so the assertion below would hold for the
+	// wrong reason and the mark would not be under test.
+	seedAnnounceSeason(t, st, "guild1", "2026-07", &SeasonResult{
+		Month: "2026-06", Players: 1, Ranks: []SeasonRank{{UserID: "leader", Net: 1_200, Bonus: SeasonBonus(1)}},
+	}, nil)
 
 	if err := st.MarkSeasonAnnounced("guild1", "2026-06"); err != nil {
 		t.Fatalf("MarkSeasonAnnounced returned error: %v", err)
@@ -1493,8 +1504,8 @@ func TestMarkSeasonAnnounced_DoesNotLetAClockRollbackRepostASeason(t *testing.T)
 	if got := readGuild(t, path, "guild1").LastSeasonAnnounced; got != "2026-06" {
 		t.Fatalf("LastSeasonAnnounced = %q after an empty mark, want %q", got, "2026-06")
 	}
-	if job := oneJob(t, st, announceAt1000); job.SeasonClosed != nil {
-		t.Fatalf("SeasonClosed = %+v, want nil — 2026-06 is already announced", job.SeasonClosed)
+	if job := oneJob(t, st, announceAt1000); len(job.ClosedSeasons) != 0 {
+		t.Fatalf("ClosedSeasons = %+v, want empty — 2026-06 is already announced", job.ClosedSeasons)
 	}
 }
 
@@ -1520,8 +1531,108 @@ func TestCollectDailyAnnouncements_NoChannelKeepsTheClosedSeasonPending(t *testi
 		t.Fatalf("LastSeasonAnnounced = %q, want empty — nothing was posted", economy.LastSeasonAnnounced)
 	}
 
+	if queue := economy.UnannouncedSeasons; len(queue) != 1 || queue[0].Month != "2026-06" {
+		t.Fatalf("persisted UnannouncedSeasons = %+v, want the June result waiting for a channel", queue)
+	}
+
 	seedAnnounceGuild(t, st, "guild1", "chan1", "")
-	if job := oneJob(t, st, announceAt1000); job.SeasonClosed == nil || job.SeasonClosed.Month != "2026-06" {
-		t.Fatalf("after configuring a channel: SeasonClosed = %+v, want the June result", job.SeasonClosed)
+	if closed := oneClosedSeason(t, oneJob(t, st, announceAt1000)); closed.Month != "2026-06" {
+		t.Fatalf("after configuring a channel: closed season = %+v, want the June result", closed)
+	}
+}
+
+// C3B-08 の回帰: the month boundary must not eat a result the channel never
+// received. 7/31 closes nothing, but 8/1 closes July right on top of June —
+// and with LastSeason as the only slot, June's podium was overwritten and
+// never announced by any later pass.
+func TestCollectDailyAnnouncements_AMonthRolloverDoesNotDropAnUnannouncedSeason(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	seedAnnounceSeason(t, st, "guild1", "2026-06", nil, map[string]int64{"leader": 1_200, "second": 800})
+
+	// 7/31: June closes here and the result is owed. The send failed, so
+	// nothing is marked.
+	july31 := time.Date(2026, 7, 31, 10, 0, 0, 0, jst)
+	if closed := oneClosedSeason(t, oneJob(t, st, july31)); closed.Month != "2026-06" {
+		t.Fatalf("7/31: closed season = %+v, want June", closed)
+	}
+
+	// 8/1: the pass closes July — nobody played it, so it has no podium of
+	// its own — and June must still be owed.
+	august1 := time.Date(2026, 8, 1, 10, 0, 0, 0, jst)
+	closed := oneClosedSeason(t, oneJob(t, st, august1))
+	if closed.Month != "2026-06" {
+		t.Fatalf("8/1: closed season = %+v, want June again — the July rollover overwrote it", closed)
+	}
+	if len(closed.Ranks) != 2 || closed.Ranks[0].UserID != "leader" {
+		t.Fatalf("8/1: June's podium = %+v, want the two players it closed with", closed.Ranks)
+	}
+	// LastSeason really was overwritten: the queue is what survived it.
+	economy := readGuild(t, path, "guild1")
+	if economy.LastSeason == nil || economy.LastSeason.Month != "2026-07" {
+		t.Fatalf("LastSeason = %+v, want the July result the rollover wrote", economy.LastSeason)
+	}
+
+	if err := st.MarkSeasonAnnounced("guild1", "2026-06"); err != nil {
+		t.Fatalf("MarkSeasonAnnounced returned error: %v", err)
+	}
+	if job := oneJob(t, st, august1); len(job.ClosedSeasons) != 0 {
+		t.Fatalf("after the confirmed send: ClosedSeasons = %+v, want empty", job.ClosedSeasons)
+	}
+}
+
+// 掲示チャンネル未設定のまま月をまたいでも同じ: the queue is filled by the
+// rollover, which every pass reaches whether or not there is anywhere to
+// post — so the day a channel is configured, the old podium is still there.
+func TestCollectDailyAnnouncements_NoChannelKeepsASeasonAcrossTheMonthBoundary(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAnnounceSeason(t, st, "guild1", "2026-06", nil, map[string]int64{"leader": 1_200})
+
+	for _, at := range []time.Time{
+		time.Date(2026, 7, 31, 10, 0, 0, 0, jst),
+		time.Date(2026, 8, 1, 10, 0, 0, 0, jst),
+	} {
+		jobs, err := st.collectDailyAnnouncements(at)
+		if err != nil {
+			t.Fatalf("collectDailyAnnouncements(%v) returned error: %v", at, err)
+		}
+		if len(jobs) != 0 {
+			t.Fatalf("got %d jobs, want 0 — the guild has no announcement channel", len(jobs))
+		}
+	}
+
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	job := oneJob(t, st, time.Date(2026, 8, 2, 10, 0, 0, 0, jst))
+	if closed := oneClosedSeason(t, job); closed.Month != "2026-06" {
+		t.Fatalf("after configuring a channel: closed season = %+v, want the June result", closed)
+	}
+}
+
+// Several months can be owed at once, and posting one of them retires only
+// that one: the queue is drained a message at a time, so a failure partway
+// through leaves the rest exactly where they were.
+func TestMarkSeasonAnnounced_RetiresOnlyTheMonthThatWasPosted(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	seedAnnounceSeason(t, st, "guild1", "2026-06", nil, map[string]int64{"leader": 1_200})
+	// June closes on the 7/31 pass, July on the 8/1 one — with a player in
+	// each month, so both have a podium to post.
+	oneJob(t, st, time.Date(2026, 7, 31, 10, 0, 0, 0, jst))
+	seedAnnounceSeason(t, st, "guild1", "2026-07", nil, map[string]int64{"second": 500})
+	august1 := time.Date(2026, 8, 1, 10, 0, 0, 0, jst)
+	if job := oneJob(t, st, august1); len(job.ClosedSeasons) != 2 ||
+		job.ClosedSeasons[0].Month != "2026-06" || job.ClosedSeasons[1].Month != "2026-07" {
+		t.Fatalf("ClosedSeasons = %+v, want June then July, oldest first", job.ClosedSeasons)
+	}
+
+	// June got through, July did not.
+	if err := st.MarkSeasonAnnounced("guild1", "2026-06"); err != nil {
+		t.Fatalf("MarkSeasonAnnounced returned error: %v", err)
+	}
+	if closed := oneClosedSeason(t, oneJob(t, st, august1)); closed.Month != "2026-07" {
+		t.Fatalf("closed season = %+v, want July still owed", closed)
+	}
+	if got := readGuild(t, path, "guild1").LastSeasonAnnounced; got != "2026-06" {
+		t.Fatalf("LastSeasonAnnounced = %q, want %q", got, "2026-06")
 	}
 }

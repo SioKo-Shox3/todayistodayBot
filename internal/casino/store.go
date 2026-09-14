@@ -1356,6 +1356,12 @@ func (s *Store) ensureSeasonMonthLocked(economy *GuildEconomy) {
 //
 // Caller must already hold the Store's lock.
 func rolloverSeasonLocked(economy *GuildEconomy, month string) {
+	// BEFORE the early returns, and therefore before the overwrite below: an
+	// upgrading file's one pending result has to reach the queue on the pass
+	// that reads it, whatever that pass then decides about the month. A bot
+	// that was down across the 1st comes back to a single call that both
+	// migrates June and closes July, in that order.
+	migrateUnannouncedSeasonsLocked(economy)
 	if month == "" || economy.SeasonMonth >= month {
 		return
 	}
@@ -1404,7 +1410,9 @@ func rolloverSeasonLocked(economy *GuildEconomy, month string) {
 		// to that accident.
 		ranks[i].Bonus = creditChipsCappedLocked(account, SeasonBonus(i+1))
 	}
-	economy.LastSeason = &SeasonResult{Month: economy.SeasonMonth, Ranks: ranks, Players: players}
+	result := SeasonResult{Month: economy.SeasonMonth, Ranks: ranks, Players: players}
+	economy.LastSeason = &result
+	queueClosedSeasonLocked(economy, result)
 	// Zero EVERY account, not just the ones that ranked: a new season starts
 	// from a clean board for everybody, and leaving a non-ranked account's
 	// 純利 behind would carry last month's losses into this month's ranking.
@@ -1415,6 +1423,79 @@ func rolloverSeasonLocked(economy *GuildEconomy, month string) {
 		account.SeasonNet = 0
 	}
 	economy.SeasonMonth = month
+}
+
+// seasonUnannouncedLimit caps GuildEconomy.UnannouncedSeasons. Three is a
+// quarter of outage — far longer than any believable one — and, unlike the
+// lottery's seven days, each entry here @mentions a podium: posting a stack
+// of them at once is itself a cost, so the queue is deliberately short.
+const seasonUnannouncedLimit = 3
+
+// queueClosedSeasonLocked puts a closed season in line for the 9am posting.
+//
+// A result with an EMPTY podium is not queued: nobody placed, so there is
+// nothing to celebrate and nobody to ping (internal/commands renders it as
+// the empty string and sends nothing). Queueing it anyway would spend one of
+// the three slots every quiet month and could push a real podium off the
+// front of the queue — the one entry that had to survive.
+//
+// The entry is a COPY down to its Ranks slice, the discipline
+// migrateUnannouncedLocked follows: LastSeason and the queue entry are two
+// independent records of one month, and only the latter is retired by a
+// confirmed send.
+// Caller must already hold the Store's lock.
+func queueClosedSeasonLocked(economy *GuildEconomy, result SeasonResult) {
+	if len(result.Ranks) == 0 {
+		return
+	}
+	result.Ranks = append([]SeasonRank(nil), result.Ranks...)
+	economy.UnannouncedSeasons = append(economy.UnannouncedSeasons, result)
+	if n := len(economy.UnannouncedSeasons); n > seasonUnannouncedLimit {
+		// Drop from the FRONT, for the reason drawLotteryLocked does: the
+		// oldest podium is the one least worth posting months late. Copying
+		// into the same backing array is safe because the destination index
+		// is always lower than the source.
+		economy.UnannouncedSeasons = append(economy.UnannouncedSeasons[:0], economy.UnannouncedSeasons[n-seasonUnannouncedLimit:]...)
+	}
+}
+
+// migrateUnannouncedSeasonsLocked lifts a pre-C3B-08 file's one pending
+// result into the announcement queue. Before C3B-08 the 9am posting read
+// LastSeason directly; the queue replaced it, and collectDailyAnnouncements
+// now reads nothing else. A casino.json written by the older build therefore
+// holds a closed season in LastSeason and no "unannounced_seasons" key at
+// all — and if the upgrade landed between the close and the next 09:00, that
+// podium would never be posted by this pass or any later one.
+//
+// It runs from the TOP of rolloverSeasonLocked, i.e. before the very
+// overwrite this task exists to survive, and every command and the
+// announcement sweep reach it — so the old result is queued whether the bot
+// comes back on the 31st or the 1st.
+//
+// "Not posted yet" is LastSeason.Month > LastSeasonAnnounced, exactly the
+// test the queue replaced. A file that already HAS a queue is a post-C3B-08
+// file and is left alone: there the queue is authoritative, and re-deriving
+// an entry from LastSeason would repost a month MarkSeasonAnnounced has
+// retired (LastSeason deliberately survives that retirement, so /season
+// keeps showing the last real result). That empty-queue guard is also what
+// makes this idempotent — the entry it migrates is itself the reason the
+// next pass does nothing. A result with no podium is not queued for
+// queueClosedSeasonLocked's reason.
+//
+// AnnounceChannelID is deliberately NOT part of this test, as in
+// migrateUnannouncedLocked: whether a result is worth KEEPING and whether
+// there is somewhere to post it today are two different questions, and only
+// collectDailyAnnouncements answers the second.
+// Caller must already hold the Store's lock.
+func migrateUnannouncedSeasonsLocked(economy *GuildEconomy) {
+	if len(economy.UnannouncedSeasons) > 0 {
+		return
+	}
+	last := economy.LastSeason
+	if last == nil || last.Month <= economy.LastSeasonAnnounced {
+		return
+	}
+	queueClosedSeasonLocked(economy, *last)
 }
 
 // DuelSettlement is what AcceptDuel left behind — everything

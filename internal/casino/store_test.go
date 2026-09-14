@@ -5265,6 +5265,104 @@ func TestStore_SeasonRollover_AcceptDuelAcrossTheBoundaryBooksIntoTheNewMonth(t 
 	})
 }
 
+// --- 未掲示シーズンの待ち行列 (C3B-08) ---------------------------------------
+
+// closeMonthsWithAPodium runs one rollover per month, each closing the
+// previous one with a real podium — the setup every queue assertion below
+// needs, since a month nobody placed in is deliberately never queued.
+func closeMonthsWithAPodium(economy *GuildEconomy, months ...string) {
+	for _, month := range months {
+		for _, account := range economy.Users {
+			account.SeasonNet = 100
+		}
+		rolloverSeasonLocked(economy, month)
+	}
+}
+
+// The queue is bounded: a podium months late is the entry least worth
+// posting, so the oldest is the one that goes when a fourth result arrives.
+func TestRolloverSeason_TheQueueKeepsTheThreeNewestResults(t *testing.T) {
+	economy := &GuildEconomy{SeasonMonth: "2026-01", Users: map[string]*UserAccount{"leader": {Chips: 1_000}}}
+
+	closeMonthsWithAPodium(economy, "2026-02", "2026-03", "2026-04", "2026-05")
+
+	want := []string{"2026-02", "2026-03", "2026-04"}
+	if len(economy.UnannouncedSeasons) != len(want) {
+		t.Fatalf("UnannouncedSeasons = %+v, want %d entries", economy.UnannouncedSeasons, len(want))
+	}
+	for i, month := range want {
+		if got := economy.UnannouncedSeasons[i].Month; got != month {
+			t.Errorf("UnannouncedSeasons[%d].Month = %q, want %q — the queue drops from the front", i, got, month)
+		}
+	}
+}
+
+// A month nobody placed in has no podium to ping, so it must not spend one
+// of the three slots — doing so would push a real podium off the front.
+func TestRolloverSeason_AQuietMonthDoesNotEnterTheQueue(t *testing.T) {
+	economy := &GuildEconomy{SeasonMonth: "2026-01", Users: map[string]*UserAccount{"idle": {Chips: 1_000}}}
+	closeMonthsWithAPodium(economy, "2026-02")
+
+	rolloverSeasonLocked(economy, "2026-03") // nobody's SeasonNet moved in February
+
+	if len(economy.UnannouncedSeasons) != 1 || economy.UnannouncedSeasons[0].Month != "2026-01" {
+		t.Fatalf("UnannouncedSeasons = %+v, want only the January result", economy.UnannouncedSeasons)
+	}
+	if economy.LastSeason == nil || economy.LastSeason.Month != "2026-02" {
+		t.Fatalf("LastSeason = %+v, want the quiet February result /season still shows", economy.LastSeason)
+	}
+}
+
+// The queue entry and LastSeason are two independent records of one month:
+// retiring the queue entry must not disturb what /season reads, and a later
+// edit of one must not show up in the other.
+func TestRolloverSeason_TheQueueEntryIsACopyOfLastSeason(t *testing.T) {
+	economy := &GuildEconomy{SeasonMonth: "2026-01", Users: map[string]*UserAccount{"leader": {Chips: 1_000}}}
+	closeMonthsWithAPodium(economy, "2026-02")
+
+	if len(economy.UnannouncedSeasons) != 1 || economy.LastSeason == nil {
+		t.Fatalf("setup: queue = %+v / LastSeason = %+v", economy.UnannouncedSeasons, economy.LastSeason)
+	}
+	economy.UnannouncedSeasons[0].Ranks[0].Bonus = 1
+	if got := economy.LastSeason.Ranks[0].Bonus; got != SeasonBonus(1) {
+		t.Fatalf("LastSeason's podium followed the queue entry: Bonus = %d, want %d", got, SeasonBonus(1))
+	}
+}
+
+// A pre-C3B-08 file holds its one pending result in LastSeason and has no
+// queue at all. The upgrade must lift it into the queue BEFORE the next
+// rollover overwrites it — and must not queue it twice.
+func TestMigrateUnannouncedSeasons_LiftsAPreQueueFilesPendingResult(t *testing.T) {
+	pending := func() *GuildEconomy {
+		return &GuildEconomy{
+			SeasonMonth: "2026-07",
+			LastSeason: &SeasonResult{Month: "2026-06", Players: 1,
+				Ranks: []SeasonRank{{UserID: "leader", Net: 1_200, Bonus: SeasonBonus(1)}}},
+			Users: map[string]*UserAccount{},
+		}
+	}
+
+	economy := pending()
+	rolloverSeasonLocked(economy, "2026-08") // the very rollover that used to eat it
+	if len(economy.UnannouncedSeasons) != 1 || economy.UnannouncedSeasons[0].Month != "2026-06" {
+		t.Fatalf("UnannouncedSeasons = %+v, want the migrated June result", economy.UnannouncedSeasons)
+	}
+	// Idempotent: the entry it migrated is why the next pass does nothing.
+	rolloverSeasonLocked(economy, "2026-09")
+	if len(economy.UnannouncedSeasons) != 1 {
+		t.Fatalf("UnannouncedSeasons = %+v, want June alone — it was migrated twice", economy.UnannouncedSeasons)
+	}
+
+	// Already celebrated: LastSeason survives MarkSeasonAnnounced's pruning,
+	// and re-deriving from it would ping the podium a second time.
+	announced := pending()
+	announced.LastSeasonAnnounced = "2026-06"
+	rolloverSeasonLocked(announced, "2026-08")
+	if len(announced.UnannouncedSeasons) != 0 {
+		t.Fatalf("UnannouncedSeasons = %+v, want empty — 2026-06 was already posted", announced.UnannouncedSeasons)
+	}
+}
+
 // --- /season の読み取り (設計書 C-3b §5) -----------------------------------
 
 // The table is truncated to SeasonTopLimit but the CALLER's place is not:

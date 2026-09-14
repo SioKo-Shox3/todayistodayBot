@@ -53,18 +53,37 @@ type GuildEconomy struct {
 	// month without paying a prize — there was nothing to rank).
 	SeasonMonth string `json:"season_month"`
 	// LastSeason is the single most recently CLOSED season, kept so /season
-	// and the 9am posting can show last month's winners. Only one is retained
-	// — the file is a live state snapshot, not a history — and omitempty plus
-	// the nil zero is what makes a pre-C-3b file read back as "nothing closed
-	// yet" rather than as an empty result with a blank month.
+	// can show last month's winners. Only one is retained — the file is a
+	// live state snapshot, not a history — and omitempty plus the nil zero is
+	// what makes a pre-C-3b file read back as "nothing closed yet" rather
+	// than as an empty result with a blank month.
+	//
+	// It is NOT what the 9am posting reads: rolloverSeasonLocked overwrites
+	// it at every month boundary, so a result the channel never received
+	// would be gone the moment the next month closed on top of it (C3B-08).
+	// UnannouncedSeasons is the posting's source.
 	LastSeason *SeasonResult `json:"last_season,omitempty"`
+	// UnannouncedSeasons is every closed season whose public result has not
+	// been posted yet, oldest first. It is the same queue Lottery.Unannounced
+	// is, and it exists for the same reason: a single slot loses the older
+	// result as soon as a second one closes on top of it, and a month nobody
+	// announced is a podium nobody was ever told about. rolloverSeasonLocked
+	// APPENDS here, and only MarkSeasonAnnounced — i.e. a confirmed send —
+	// takes entries back out.
+	//
+	// Capped at seasonUnannouncedLimit and dropped from the FRONT when it
+	// overflows, the rule the lottery queue follows: a podium several months
+	// late is the entry least worth posting.
+	//
+	// Absent from a pre-C3B-08 file, which is what
+	// migrateUnannouncedSeasonsLocked repairs at the read point.
+	UnannouncedSeasons []SeasonResult `json:"unannounced_seasons,omitempty"`
 	// LastSeasonAnnounced is the month ("2006-01") of the last closed season
-	// whose public result actually went out, and it exists for the reason
-	// Lottery.Unannounced exists: a result that could not be posted must not
-	// be lost. The lottery keeps a QUEUE because several draws can pile up
-	// between postings; a season closes once a month, so a single high-water
-	// mark is enough — LastSeason holds the one pending result, and this says
-	// whether the channel has already seen it.
+	// whose public result actually went out. With the queue carrying what is
+	// still owed, this has one job left: it is how
+	// migrateUnannouncedSeasonsLocked tells an upgrading file's pending
+	// LastSeason from one the channel has already seen, so the upgrade
+	// cannot re-ping a podium that was celebrated before it.
 	//
 	// It is separate from LastAnnounced rather than derived from it because
 	// the two mark different messages: the daily embed and the season's own
