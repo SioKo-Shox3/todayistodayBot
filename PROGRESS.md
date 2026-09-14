@@ -37,12 +37,17 @@
 
 - C2-06 の評価者指摘 4 件(反復 6 の `NEEDS_WORK`)= 242f72c。(1) 精算が拒まれても盤面は「未払い」を覚え、次の押下が**ゲームを繰り返さずに支払いだけ**やり直す(🔁 のボタン 1 個を残す)。(2) 未配達の盤面の返金は `Close` が `true` を返したときだけ — 通信エラーが届くころには次のゲームの預かりに変わっていることがある。(3) `boardLocks`(盤面ごとのロック)を `casino_shared.go` に置き、手の適用から応答までを直列化した(セッション共通ロックは Discord 呼び出しをまたげない)。(4) 開始順序を完了条件どおり `EnsureCasinoAccess → OpenGame → Open` に直し、`Open` が失敗したら返金する。検証出力: `.harness/runs/20260914-121315/verify-C2-07-{1,4,5,6}.txt`(build+vet clean / TestHighLow・TestBalance 26 PASS / `go test ./...` 8 パッケージ ok / gofmt clean)。
 - C2-07(`/blackjack` コマンド・ボタン・表示)= d5d30a5。`internal/commands/blackjack.go`: `/blackjack <bet>` は /highlow と同じガードと同じ順序、ナチュラルは配布時に精算して祝いを出す(応答は `ChannelMessageWithSource`、押下は `UpdateMessage`)。ボタンは 🃏 ヒット / ✋ スタンド / ⏫ ダブル、ダブルは「最初の判断」かつ「残高が 2 枚目の掛け金を賄える」ときだけ有効。ダブルは `CanDouble` → `AddToEscrow` → `Double` の順。検証出力: `.harness/runs/20260914-121315/verify-C2-07-{1,2,3}.txt`(build+vet clean / TestBlackjack 23 PASS / commands 全体 ok)。
+- C2-07 の評価者指摘(反復 7 の `NEEDS_WORK`)= 284c633。開始応答が失敗したときの `Close` → 返金が盤面ロックを取っていなかったため、⏫ ダブルの `AddToEscrow` と盤面適用の隙間に割り込むと追加ベットが返らなかった。`closeUndeliveredHand` が押下と同じ per-board ロックを取ってから閉じる — ダブルは必ず手を終わらせるので、押下が先に済めば `Close` は false を返して二重に払わない。回帰テストはチャネルでその順序を固定する(`stakeWatchingBank` が `AddToEscrow` の直後で止める)。ロックを外した木で 5/5 落ちることを確認済み: `.harness/runs/20260914-154156/finding-7-3-mutation.txt`。検証出力: 同ディレクトリの `finding-7-{1,2}.txt`(build+vet clean / `go test ./...` 8 パッケージ ok)。
+- C2-08(起動時の返金・Sweep goroutine・help・文書)= f3cdb69。`cmd/bot/main.go` は接続後に `casino.Default().RefundStaleEscrows(time.Now())` を呼んで件数をログし、掃除人 goroutine を 9 時掲示と同じ ctx で起動して、掲示と同じ理由でセッションを閉じる前に終了を待つ。本体は `internal/commands/casino_sessions.go`: 30 秒ごとに `Sweep` → `AutoResolve` → `SettleGame` → メッセージを「⌛ 時間切れ — 自動決着」に編集(チップが先、表示が後。編集失敗はログのみ)。`/help` は登録レジストリを読むので 2 本は自動で載る — `help_test.go` がそれを固定した。README にカジノ節を追加。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、正本への追記案を `blocked/C2-08.md` に置いた(**人が MyWorkflow 側へ写して再展開する**)。検証出力: `.harness/runs/20260914-154156/verify-C2-08-{1,2,3}.txt`(build+vet clean / `go test ./...` 8 パッケージ ok / `go build -o bin/todayistodaybot ./cmd/bot` exit=0)。
 
 ## In progress
 - (なし)
 
 ## Next
-- **次は C2-08**(起動時の返金・放置の Sweep goroutine・help・文書)。`TASKS.md` の未完はこれ 1 件。Sweep を書くときは下の Notes「未払いの精算と Sweep」を先に読むこと — 決着した盤面は `WithSession(done=true)` で即座にマネージャから外れるので Sweep とは競合しないが、`AddToEscrow` と `Double` の隙間だけは Sweep が割り込める。
+- **次は C2-09**(README のコマンド一覧に C-1 のカジノ 7 コマンドを足す)。C2-08 で `/highlow` `/blackjack` だけを載せたので、`/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` が README から抜けたままになっている。文書のみ。
+- **C-2 の機能は C2-08 で全部着地した** — 次の区切りで評価者(Astra、`codex exec -m gpt-6-astra -s read-only`)を通す。危険地帯は escrow の保存則と二重決着(掃除人・ダブル・未送達の盤面の 3 経路)。
+- **`blocked/C2-08.md` は人への申し送り**: `Docs/agent-guide/architecture.md` は展開コピーなので、C-2 の追記(レイヤー表・`DefaultSessions` の所有権・依存方向・危険地帯 5 点目)は MyWorkflow の正本へ写して再展開する必要がある。
+- (済)~~次は C2-08~~(起動時の返金・放置の Sweep goroutine・help・文書)。`TASKS.md` の未完はこれ 1 件。Sweep を書くときは下の Notes「未払いの精算と Sweep」を先に読むこと — 決着した盤面は `WithSession(done=true)` で即座にマネージャから外れるので Sweep とは競合しないが、`AddToEscrow` と `Double` の隙間だけは Sweep が割り込める。
 - (済)~~次は C2-07~~(`/blackjack` コマンド・ボタン・表示)。C2-06 と同じ骨格をなぞれる: `interactionResponder` + `respondVia`(`casino_shared.go`)、`snapshotHighLow` に相当する盤面スナップショット、`highLowButtonsOf` などのテスト補助(`highlow_test.go`。流用するなら共有ファイルへ出す)。ダブルは `CanDouble` を見てから `AddToEscrow`(C2-04 の Notes)。
 - (済)~~次は C2-06~~(`/highlow` コマンド・ボタン・表示)。材料は揃った: `HighLowGame`(C2-03)・`BuildCustomID`/`RegisterComponent`/`requireSessionOwner`(C2-01)・`OpenGame`/`SettleGame`(C2-02)・`SessionManager`(C2-05、`RegisterComponent` はまだ登録者ゼロ)。順序の規律は Notes の「預け入れと Open の順序」を守る。
 - (済)~~次は C2-05~~(セッション管理と放置の自動決着)。`internal/casino` の純粋ロジック 2 つ(`HighLowGame` / `BlackjackGame`)は揃った — どちらも `AutoResolve() int64` を持つので、セッション管理はこの 1 メソッドだけを知っていればよい。`internal/commands` 側の配線は C2-06 以降。
@@ -54,6 +59,10 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **掃除人はゲームを知らない(C2-08)**: 掃除人が知っているのは `casino.AutoResolver` 1 メソッドだけ。だから時間切れの編集はゲーム固有の盤面を描き直さず、`⌛ 時間切れ — 自動決着` + 配当/残高の embed に差し替えてボタンを**消す**。設計書 §4 の「決着後のボタンは無効化して残す」から外れる唯一の場所 — ボタンのラベルはゲームの持ち物(手札や倍率が入る)で、掃除人が組み直すには全ゲームの描画を知る必要がある。
+- **掃除人の順序(C2-08)**: `Sweep` が期限判定と削除を同じクリティカルセクションでやるので、返ってきた盤面はこの goroutine だけのもの(ロック無しで `AutoResolve` してよい)。精算が失敗した盤面は**編集しない** — 払われていないのに「決着しました」と出すのが最悪。預かりは口座に残り、次の起動の `RefundStaleEscrows` が返す。
+- **`main.go` の shutdown(C2-08)**: 掃除人も 9 時掲示と同じく `session.Close()` の前に終了を待つ(`sweeperDone`)。編集の最中にセッションを閉じると use-after-close になる。掃除人の周期は `commands.CasinoSweepInterval`(30 秒)= 時間切れの player が余分に待つ上限。
+- **未送達の盤面を閉じる経路もロックを取る(反復 7 の指摘)**: `Close` は「盤面を消す」だけに見えて、返金額の判断を伴う。⏫ ダブルが `AddToEscrow` をマネージャのロックの外で行う以上、閉じる側も押下と同じ per-board ロックを取らないと預かりの総額が読めない。
 - **未払いの精算(C2-07 / 反復 6 の指摘 1)**: `Store.SettleGame` が拒んだとき、盤面は既にセッションから消えている。`boardLock.pending` がその「確定した配当」を持ち、次の押下は所有者検査のあと**支払いだけ**やり直す(`settle` は `lock.pending` の唯一の書き手で、チップが着いた瞬間に nil にする)。`boardLocks.release` は待ち手が 0 でも `pending` が残っていれば map から消さない — その記録が再試行そのもの。誰も押さないまま終わったプロセスでは記録ごと消えるが、預かりは次回起動の `RefundStaleEscrows` が返す。
 - **盤面ごとのロック(C2-07 / 反復 6 の指摘 3)**: `SessionManager.mu` は全盤面を守るので Discord 呼び出しをまたげない(危険地帯)。その隙間で同じ盤面の 2 押下が「手は順番どおり・応答は逆順」になり、決着表示が遊べる盤面で上書きされる。`boardLocks` は**盤面ごと**のロックで、手の適用から応答までずっと握る。ロック順序は acquire が `b.mu → (解放) → lock.mu`、release が `lock.mu 保持のまま b.mu` — acquire は `lock.mu` を待つ前に `b.mu` を放すので逆転しない。効き目は `TestHighLowSerializesThePressesOfOneBoard` をロック無しの木で落として確認済み。
 - **`casinoBank` の seam(C2-07)**: 「配当は確定したがチップは動かなかった」状態は経済側からは作れない(固定の山が上限を破る配当を配らない)。`casino_shared.go` の `casinoBank` インターフェースで `*casino.Store` を包み、テストだけが `SettleGame` を拒ませる(`interactionResponder` と同じ流儀)。
