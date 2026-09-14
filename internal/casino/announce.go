@@ -63,6 +63,23 @@ type AnnouncementJob struct {
 	// Kept until a send succeeds: MarkSeasonAnnounced is called only after a
 	// confirmed post, and only the month it names leaves the queue.
 	ClosedSeasons []SeasonResult
+	// DailyOwed reports whether TODAY'S EMBED still has to go out. False
+	// means the embed already landed earlier today and this job exists ONLY
+	// to carry ClosedSeasons — the caller must post the season results and
+	// nothing else.
+	//
+	// The two are separated because they fail independently (C3B-09, 所見
+	// 2): the embed goes out first and a season result follows it, so a
+	// result that could not be delivered has to be retried on the same day's
+	// next pass WITHOUT re-posting the embed that already landed. Before
+	// this flag existed, the LastAnnounced gate dropped the whole guild the
+	// moment the embed succeeded, and the owed result could not move again
+	// until the next calendar day.
+	//
+	// A false DailyOwed also suppresses LotteryDraws below and MarkAnnounced
+	// in runAnnouncePass: both belong to the embed's posting, which is not
+	// happening on this pass.
+	DailyOwed bool
 }
 
 // collectDailyAnnouncements ensures every known guild's rate exists for
@@ -82,12 +99,23 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			// handler goroutine, kills the whole process (§3.3).
 			economy := ensureGuildLocked(d, guildID)
 			rate := ensureTodayRateLocked(economy, now, s.rng)
-			// `>=`, not `!=`: MarkAnnounced only ever moves LastAnnounced
+			if economy.AnnounceChannelID == "" {
+				continue
+			}
+			// `>`, not `!=`: MarkAnnounced only ever moves LastAnnounced
 			// FORWARD, so a clock that rolls back would otherwise make every
 			// pass of the earlier day look unannounced and re-post it (the
 			// boundary can never catch up again). Comparing as a high-water
 			// mark keeps the two sides of the invariant in step.
-			if economy.AnnounceChannelID == "" || today <= economy.LastAnnounced {
+			dailyOwed := today > economy.LastAnnounced
+			// TWO independent reasons to wake a guild, and the second is not
+			// gated by the first (C3B-09, 所見 2). LastAnnounced answers
+			//「今日の embed は出したか」 alone; a season result owed by the
+			// queue is owed whatever that mark says, because the embed and
+			// the result are two messages that fail separately. Skipping the
+			// guild on the embed's mark is what made a failed result wait a
+			// whole day instead of the same day's next pass.
+			if !dailyOwed && len(economy.UnannouncedSeasons) == 0 {
 				continue
 			}
 			recent := economy.Rates
@@ -115,6 +143,7 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 				LotteryTickets: sold,
 				SeasonMonth:    economy.SeasonMonth,
 				SeasonTop:      seasonTop,
+				DailyOwed:      dailyOwed,
 			}
 			// Handed over whole, with no month filter of its own, for the
 			// reason the lottery queue below is: the queue already IS the
@@ -133,7 +162,11 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			// very assumption (one pending draw, dated after the last
 			// posting) the queue exists to break. Copied because the slice
 			// behind it belongs to the Data this Update is about to drop.
-			if pending := economy.Lottery.Unannounced; len(pending) > 0 {
+			//
+			// Left empty on a results-only pass: the celebrations ride with
+			// the embed and that posting already happened today, so carrying
+			// them here would ping the same winners a second time.
+			if pending := economy.Lottery.Unannounced; dailyOwed && len(pending) > 0 {
 				job.LotteryDraws = append([]LotteryDraw(nil), pending...)
 			}
 			jobs = append(jobs, job)
@@ -321,6 +354,13 @@ func runAnnouncePass(ctx context.Context, st *Store, callback AnnounceCallback, 
 		if err := callback(job); err != nil {
 			slog.Error("casino: announcement callback failed", "guild_id", job.GuildID, "error", err)
 			continue // leave LastAnnounced untouched so a later pass retries
+		}
+		if !job.DailyOwed {
+			// A results-only pass: the day is already marked, and re-marking
+			// it would prune the lottery queue against a posting this pass
+			// did not make. MarkSeasonAnnounced, taken per month by the
+			// callback itself, is what retires the results.
+			continue
 		}
 		if err := st.MarkAnnounced(job.GuildID, job.Today.Date); err != nil {
 			slog.Error("casino: MarkAnnounced failed", "guild_id", job.GuildID, "error", err)

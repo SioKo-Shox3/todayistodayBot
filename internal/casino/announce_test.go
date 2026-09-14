@@ -1636,3 +1636,70 @@ func TestMarkSeasonAnnounced_RetiresOnlyTheMonthThatWasPosted(t *testing.T) {
 		t.Fatalf("LastSeasonAnnounced = %q, want %q", got, "2026-06")
 	}
 }
+
+// TestCollectDailyAnnouncements_CarriesAnOwedSeasonAfterTodayIsMarked is the
+// regression for 反復 2 の所見 2: the embed landed at 10:00 and the season
+// result that follows it did not, so LastAnnounced reads today while the
+// queue still owes a month. The 11:00 pass must still reach this guild —
+// with DailyOwed false, so the caller posts the result ALONE.
+//
+// Before C3B-09 the LastAnnounced gate dropped the whole guild here and the
+// owed result could not move again until the next calendar day.
+func TestCollectDailyAnnouncements_CarriesAnOwedSeasonAfterTodayIsMarked(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate was drawn by the 10:00 pass, not by this one"}
+	seedAnnounceGuild(t, st, "guild1", "chan1", announceDay) // the embed already went out today
+	// A draw queued alongside it: it rode with the embed, so this pass must
+	// not carry it again and re-ping the winner.
+	posted := LotteryDraw{Date: announceDay, WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, "guild1")
+		economy.Rates = []DailyRate{{Date: announceDay, Rate: 100}}
+		economy.SeasonMonth = "2026-07"
+		economy.Lottery.DrawDate = announceDay
+		economy.Lottery.Unannounced = []LotteryDraw{posted}
+		economy.UnannouncedSeasons = []SeasonResult{{
+			Month: "2026-06", Players: 1,
+			Ranks: []SeasonRank{{UserID: "u1", Net: 5_000, Bonus: 10_000}},
+		}}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding the owed result: %v", err)
+	}
+
+	job := oneJob(t, st, time.Date(2026, 7, 10, 11, 0, 0, 0, jst))
+
+	if job.DailyOwed {
+		t.Fatalf("job.DailyOwed = true, want false — today's embed already landed and must not be posted twice")
+	}
+	if closed := oneClosedSeason(t, job); closed.Month != "2026-06" {
+		t.Fatalf("closed season = %+v, want the June result still owed", closed)
+	}
+	if len(job.LotteryDraws) != 0 {
+		t.Fatalf("job.LotteryDraws = %+v, want empty — the celebrations rode with the embed", job.LotteryDraws)
+	}
+}
+
+// The separation cuts one way only: with nothing owed, a guild whose embed
+// already landed today is still skipped outright. Otherwise every pass of an
+// ordinary afternoon would hand the caller a job with nothing in it.
+func TestCollectDailyAnnouncements_AnnouncedTodayWithNothingOwedStaysSkipped(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "today's rate was drawn by the 10:00 pass, not by this one"}
+	seedAnnounceGuild(t, st, "guild1", "chan1", announceDay)
+	if err := st.Update(func(d *Data) error {
+		ensureGuildLocked(d, "guild1").Rates = []DailyRate{{Date: announceDay, Rate: 100}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding today's rate: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(time.Date(2026, 7, 10, 11, 0, 0, 0, jst))
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("got %d jobs, want 0 (announced today, nothing owed): %+v", len(jobs), jobs)
+	}
+}

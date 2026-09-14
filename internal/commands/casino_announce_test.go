@@ -875,3 +875,58 @@ func TestStartAnnounceScheduler_AFailedSeasonDoesNotRetireTheOnesBeforeIt(t *tes
 		t.Fatalf("second pass delivered %q, want the July result — June was already posted", texts[1])
 	}
 }
+
+// TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay is the
+// regression for 反復 2 の所見 2. The 10:00 pass gets the embed out and loses
+// the result behind it; the 11:00 pass of the SAME day must deliver the
+// result and nothing else.
+//
+// 「同じ日の次の巡回」 is the whole point: LastAnnounced now reads today, and
+// before C3B-09 that mark dropped the guild from the sweep entirely, so the
+// owed result could not move again until 7/11. The embed count is the other
+// half of the assertion — carrying the result must not cost the channel a
+// second copy of the morning's posting.
+func TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay(t *testing.T) {
+	store := seededCasinoStore(t, closedJuneSeasonFile)
+
+	var embeds int
+	var texts []string
+	fail := true
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { embeds++; return nil }
+	sendText := func(channelID, content string) error {
+		if fail {
+			return errors.New("discord is down")
+		}
+		texts = append(texts, content)
+		return nil
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+	}
+
+	tenAM := announceAt10()
+	pass(tenAM)
+	if embeds != 1 || len(texts) != 0 {
+		t.Fatalf("10:00 pass: %d embeds / %d results delivered, want 1/0", embeds, len(texts))
+	}
+
+	// 11:00, the same day: sending is back and the result is still owed.
+	fail = false
+	pass(tenAM.Add(time.Hour))
+	if embeds != 1 {
+		t.Fatalf("11:00 pass: %d embeds in total, want 1 — the morning's posting must not be repeated", embeds)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "2026-06") {
+		t.Fatalf("11:00 pass delivered %q, want the June result", texts)
+	}
+
+	// Delivered, so no later pass of the day owes it again.
+	pass(tenAM.Add(2 * time.Hour))
+	if embeds != 1 || len(texts) != 1 {
+		t.Fatalf("12:00 pass: %d embeds / %q results, want 1 embed and the one result", embeds, texts)
+	}
+}

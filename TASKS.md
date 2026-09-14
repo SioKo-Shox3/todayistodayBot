@@ -443,7 +443,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 評価者(反復 2)の所見 1。`NEXT_FINDINGS.md` の該当節を、このタスクを閉じるときに消す。
 
 ## C3B-09: 掲示済みの日でも未掲示のシーズン結果だけを再送する(所見 2、P2)
-- status: todo
+- status: done
 - done-when: embed 成功・結果送信失敗のあと、同じ日の次の巡回で結果だけが再送される。日次掲示の除外条件(`LastAnnounced`)と結果の収集条件を分け、embed を二重に出さずに結果だけ運ぶ。回帰テスト: 7/10 10 時に embed 成功・結果失敗 → 同日 11 時の巡回で「embed 累計 1 件・結果 1 件」。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
@@ -451,3 +451,20 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/announce.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go
 - notes: 評価者(反復 2)の所見 2。C3B-08 と同じ経路を触るので、C3B-08 を先に閉じる。
+
+## C3B-10: 月末に結果送信だけ失敗した場合の再送を回帰テストで押さえる(反復 4 の所見 1、P2)
+- status: todo
+- done-when: C3B-08 の done-when が名指しした経路(送信の失敗を実際に起こし、embed 成功による `LastAnnounced` 更新も通す)を掲示側のテストで再現する。7/31 の巡回で結果送信だけ失敗 → 8/1 の巡回で `LastSeason` が 7 月へ移っても 6 月の結果が送られ、成功後は再送されない。既存の送信失敗テストにケースを足す形でよい。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/casino_announce_test.go, internal/casino/announce_test.go
+- notes: 評価者(反復 4)の所見 1。実装の不具合は見つかっておらず、足りないのは検証。閉じるときに `NEXT_FINDINGS.md` の反復 4 節を消す。
+
+## C3B-11: duel のゼロサムと全口座を触る経路の説明を実装に合わせる(反復 3 の所見 1・2、P2)
+- status: todo
+- done-when: (1) `README.md` の duel が「勝者はベットの 2 倍を必ず受け取る」と読めないようにし、残高上限による切り捨てを明記する(`TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat` が実測)。(2) `blocked/C3B-07.md` の危険地帯 7 点目を「上限による切り捨てが無い場合にゼロサム」に直し、「全口座を触る唯一の書き込み」「他はすべて 1〜2 口座」の断定を消す(`SeasonStatus` は月替わりが無くても全口座を正規化して保存し、`RefundStaleEscrows` は全ギルドの対象口座をまとめて返金する)。公開物なので過程を書かない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./... -count=1`
+- paths: README.md, blocked/C3B-07.md
+- notes: 評価者(反復 3)の所見 1・2。コードは変えない — 文書が実装に追いついていないだけ。閉じるときに `NEXT_FINDINGS.md` の反復 3 節を消す。

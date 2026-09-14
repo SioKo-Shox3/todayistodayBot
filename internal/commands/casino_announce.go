@@ -229,29 +229,37 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 	go func() {
 		defer close(done)
 		casino.RunAnnounceScheduler(ctx, st, func(job casino.AnnouncementJob) error {
-			// The embed decides the job: its error propagates, so
-			// runAnnouncePass leaves LastAnnounced untouched and a later
-			// pass retries the whole posting.
-			if err := send(job.ChannelID, buildAnnouncementEmbed(job)); err != nil {
-				return err
-			}
-			// The celebration is posted AFTER, and only on success, for
-			// exactly that reason: posting it first would re-post it on
-			// every retry of a failing embed, @mentioning the winners
-			// again each time. One message per queued draw: each named a
-			// different winner and each is owed their ping.
-			for i := range job.LotteryDraws {
-				celebration := lotteryAnnounceCelebration(&job.LotteryDraws[i])
-				if celebration == "" {
-					continue
+			// DailyOwed false means today's embed already landed and this
+			// job was collected ONLY to carry a season result that could not
+			// be delivered with it (C3B-09). Re-posting the embed and the
+			// lottery celebrations here is exactly what the separation
+			// exists to prevent: the channel would get a second copy of the
+			// morning's posting and the winners a second ping.
+			if job.DailyOwed {
+				// The embed decides the job: its error propagates, so
+				// runAnnouncePass leaves LastAnnounced untouched and a later
+				// pass retries the whole posting.
+				if err := send(job.ChannelID, buildAnnouncementEmbed(job)); err != nil {
+					return err
 				}
-				if err := sendText(job.ChannelID, celebration); err != nil {
-					// Log only, and keep going. The draws are already committed
-					// to the store and the announcement is already up; failing
-					// the job here would re-post the embed tomorrow morning and
-					// still could not un-lose this message. The results stay
-					// visible via /lottery status (設計書 C-3a §3).
-					slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+				// The celebration is posted AFTER, and only on success, for
+				// exactly that reason: posting it first would re-post it on
+				// every retry of a failing embed, @mentioning the winners
+				// again each time. One message per queued draw: each named a
+				// different winner and each is owed their ping.
+				for i := range job.LotteryDraws {
+					celebration := lotteryAnnounceCelebration(&job.LotteryDraws[i])
+					if celebration == "" {
+						continue
+					}
+					if err := sendText(job.ChannelID, celebration); err != nil {
+						// Log only, and keep going. The draws are already committed
+						// to the store and the announcement is already up; failing
+						// the job here would re-post the embed tomorrow morning and
+						// still could not un-lose this message. The results stay
+						// visible via /lottery status (設計書 C-3a §3).
+						slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+					}
 				}
 			}
 			// 設計書 C-3b §4 掲示: a season that has closed since the last
@@ -266,7 +274,10 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 			// WITHOUT failing the job, because failing it would re-post the
 			// embed (and re-ping the lottery winner) on the next pass of the
 			// same day. Left unmarked, the result is carried by the next
-			// pass that reaches this guild.
+			// pass that reaches this guild — which, since C3B-09, can be
+			// later the SAME day: collectDailyAnnouncements keeps carrying
+			// an owed result after the embed is marked, with DailyOwed
+			// false.
 			for i := range job.ClosedSeasons {
 				closed := &job.ClosedSeasons[i]
 				if celebration := seasonAnnounceCelebration(closed); celebration != "" {
