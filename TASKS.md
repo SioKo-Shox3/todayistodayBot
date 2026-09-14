@@ -51,7 +51,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 反復の中で設計を再検討せず、矛盾を見つけたら `blocked/<task>.md` に書いて止まる。R 系(C-1 レビュー対応)は完了済み。
 
 ## C2-01: ボタン基盤 — `ComponentHandler` の自己登録・dispatch・所有者検査(§4)
-- status: todo
+- status: done
 - done-when: `internal/commands/components.go` に `custom_id` 規約 `casino:<game>:<sessionID>:<action>` の生成 `BuildCustomID(game, sessionID, action)` と解析 `ParseCustomID(id) (game, sessionID, action string, ok bool)`(100 文字超・要素不足は `ok=false`)、`ComponentHandler` インターフェース(`Prefix()` / `HandleComponent(s, i, sessionID, action) error`)、`RegisterComponent(h)`(重複 prefix は panic)、`DispatchComponent(s, i) error`(未知の prefix は ephemeral の「❌ このボタンは無効です」)、所有者検査ヘルパー `requireSessionOwner(i, ownerID) string`(不一致なら「❌ これはあなたのゲームではありません」を返す。ephemeral で送るのは呼び出し側)を書く。`cmd/bot/main.go` の `InteractionCreate` ハンドラに `InteractionMessageComponent` の分岐を 1 つ足して `DispatchComponent` へ渡す(`main.go` の変更はこの 1 点。起動時返金と Sweep は C2-08)。`internal/commands/components_test.go`: custom_id の往復・境界(100 文字・要素不足)、重複 prefix の panic、未知 prefix の応答文、所有者不一致の文言。テスト用の `resetComponentsForTest()` を既存の `resetForTest()` に倣って置く。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestBuildCustomID|TestParseCustomID|TestRegisterComponent|TestDispatchComponent|TestRequireSessionOwner" -count=1`

@@ -13,16 +13,22 @@
 - R-003 の評価者指摘(反復 3 の `NEEDS_WORK`)= 3da727f。(1) ハンドラの戻り値も秘匿する: `cmd/bot` が `Handle` の戻り値をそのまま `slog` に渡すので、`internal/commands` の 19 箇所の `s.InteractionRespond` を共通の `respond(s, interaction, resp)` へ寄せ、返すエラーを `redactInteractionError` に通した。(2) `*url.Error` は `Op` と原因の**型**だけにした(原因のメッセージにもトークンが入りうる)。回帰は `respond_test.go` — 戻り値をハンドラ経由で `slog` に流す検査と、`s.InteractionRespond` 直呼びを禁じるソース走査。検証出力: `.harness/runs/20260914-105906/verify-R-003fix-{1,2,3}.txt`(build+vet clean / 該当テスト 6+2+1 PASS / `go test ./...` 8 パッケージ ok)。
 - R-004(配備先で `data/` に書けない)= 3d829b4。unit に `ReadWritePaths=/opt/todayistodaybot/data`、Dockerfile に `WORKDIR /app` + `botuser` 所有の `/app/data` + `VOLUME`、README に「データ保存先（配備時）」節。検証出力: `.harness/runs/20260914-105906/verify-R-004-{1,2,3}.txt`。
 
+- C2-01(ボタン基盤: `custom_id` の生成/解析・`ComponentHandler` の自己登録・`DispatchComponent`・所有者検査)。`internal/commands/components.go` と `components_test.go`、`cmd/bot/main.go` に `InteractionMessageComponent` の分岐 1 つ。検証出力: `.harness/runs/20260914-121315/verify-C2-01-{1,2,3,4}.txt`(build+vet clean / 対象テスト 32 PASS・FAIL 0 / `./cmd/...` ok / `go test ./...` 8 パッケージ ok)。
+
 ## In progress
 - (なし)
 
 ## Next
+- **次は C2-02**(`internal/casino/session.go` の `SessionManager`)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-04)。
 - **C-2 開始(2026-09-14)**: 仕様 `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`、タスク C2-01〜C2-08(`TASKS.md`)。ブランチ `feat/casino-c2`。順に消化する。
 - **C-1 は完了**(2026-09-14: R-001〜R-004 着地、Astra 2 周目 PASS、`main` へ ff マージ)。次は稼働(トークンと実行場所はユーザー判断)か C-2(ボタン基盤+ハイ&ロー+ブラックジャック、未設計 → M1 から)。
 - `TASKS.md` の未完は無し(R-001〜R-004 すべて done)。次は R-003 修正差分の評価者 2 周目(前回指摘への対応差分だけを見る)。
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **ボタン基盤の規律(C2-01 で決めた)**: `custom_id` は `BuildCustomID/ParseCustomID` 以外で組み立てない。`ParseCustomID` は 100 文字超・要素数 4 以外(過不足とも)・名前空間違い・空要素をすべて `ok=false` にする。`DispatchComponent` は `i.MessageComponentData()` ではなく `i.Data` のカンマ ok 型アサーションを使う(前者は component 以外の Interaction で panic する)。未知のボタンに無言で返さない — 無応答は押した人に「この操作は失敗しました」と出る。
+- **所有者検査の形**: `requireSessionOwner(i, ownerID)` は不一致の文言を返すだけ(`requireGuildContext` / `requireAdministrator` と同じ流儀)。ephemeral で送るのは呼び出し側。押した人の ID は既存の `resolveUserID(i)`(guild は `Member.User`、DM は `User`)。どちらかが空文字なら不一致扱い(`"" == ""` で他人に盤面を渡さない)。
+- **ボタンのテストの取り方**: 応答の中身は、204 を返して直近のリクエストボディを保持する `capturingTransport`(`components_test.go`)で実際に送った JSON を読む。ビルダ関数を単体で見るより配線ごと確かめられる。
 - **2 周目で残った non-blocking(残課題)**: 掲示送信成功〜`MarkAnnounced` 保存の間の障害で再掲示 / 送信中 cancel の停止期限なし / 時計巻き戻り時の掲示見出しと履歴末尾のずれ(表示のみ)/ 実配備での書き込み確認と Docker ビルドは未検証(この PC に Docker 無し)。
 - **応答の規律(R-003 修正で決めた)**: `internal/commands` のハンドラは `s.InteractionRespond` を直接呼ばず `respond()` を通す。`cmd/bot` が戻り値をログへ出すので、直呼びはトークンをログへ戻す。`respond_test.go` の `TestNoDirectInteractionRespond` がソース走査で禁じている(`casino_shared.go` だけ除外 — そこが実装)。
 - **配備の前提(R-004)**: 保存先は作業ディレクトリ相対の `data/` 固定(上書きする環境変数は無い)。systemd は `/opt/todayistodaybot/data` を**人が先に作って chown する**必要がある(unit は作らない。`StateDirectory=` にするならコード側に保存先の環境変数が要る — C-2 の判断)。`systemd-analyze verify` はこの PC では `ExecStart` のバイナリが無いので必ず `exit=1` になる。構文だけ見るときは `ExecStart` を `/bin/true` に差し替えた写しを検証する。

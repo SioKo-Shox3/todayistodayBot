@@ -41,6 +41,14 @@ func main() {
 	all := commands.All()
 
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		// フェーズC-2: ボタン押下はゲーム側の ComponentHandler へ渡す
+		// (どのゲームを足しても main.go は変わらない)。
+		if i.Type == discordgo.InteractionMessageComponent {
+			if err := commands.DispatchComponent(s, i); err != nil {
+				slog.Error("component handler returned an error", "error", err)
+			}
+			return
+		}
 		if i.Type != discordgo.InteractionApplicationCommand {
 			return
 		}
