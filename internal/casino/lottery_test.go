@@ -174,3 +174,64 @@ func TestLotteryDrawDate_KeysOffTheMostRecentNineAM(t *testing.T) {
 		})
 	}
 }
+
+// TestNextLotteryDrawAt_NeverAnswersADrawThatHasAlreadyRun pins the reason
+// the lottery does not use nextRunAt directly: a request whose clock reading
+// predates the 09:00 draw it lands after must be told about the NEXT draw —
+// the one its tickets are actually in — not the one that just settled.
+func TestNextLotteryDrawAt_NeverAnswersADrawThatHasAlreadyRun(t *testing.T) {
+	justBeforeNine := time.Date(2026, 9, 14, 8, 59, 59, 0, jst)
+	tests := []struct {
+		name         string
+		lastDrawDate string
+		now          time.Time
+		want         time.Time
+	}{
+		// The bug: 09:00 on the 14th has already been drawn, so a reading
+		// from one second earlier must still answer the 15th.
+		{
+			name: "today's draw already settled", lastDrawDate: "2026-09-14", now: justBeforeNine,
+			want: time.Date(2026, 9, 15, 9, 0, 0, 0, jst),
+		},
+		// The ordinary case, unchanged: yesterday's draw is the last one, so
+		// the schedule alone gives the right answer.
+		{
+			name: "yesterday's draw was the last", lastDrawDate: "2026-09-13", now: justBeforeNine,
+			want: time.Date(2026, 9, 14, 9, 0, 0, 0, jst),
+		},
+		// Never drawn: nothing to push the answer past, so the plain schedule.
+		{
+			name: "never drawn", lastDrawDate: "", now: justBeforeNine,
+			want: time.Date(2026, 9, 14, 9, 0, 0, 0, jst),
+		},
+		// The stored date is far in the PAST — the bot was down for a week.
+		// The schedule is the later of the two and must win, or the answer
+		// would be an instant days gone by.
+		{
+			name: "a stale draw date never drags the answer backwards", lastDrawDate: "2026-09-01", now: justBeforeNine,
+			want: time.Date(2026, 9, 14, 9, 0, 0, 0, jst),
+		},
+		// Month end: the day after 09-30 is 10-01, not 09-31.
+		{
+			name: "the draw date is the last day of the month", lastDrawDate: "2026-09-30",
+			now:  time.Date(2026, 9, 30, 8, 59, 59, 0, jst),
+			want: time.Date(2026, 10, 1, 9, 0, 0, 0, jst),
+		},
+		// A hand-edited file cannot make the answer nonsense: an unparseable
+		// date falls back to the schedule rather than to a zero time.
+		{
+			name: "a corrupt draw date falls back to the schedule", lastDrawDate: "not-a-date", now: justBeforeNine,
+			want: time.Date(2026, 9, 14, 9, 0, 0, 0, jst),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nextLotteryDrawAt(tc.lastDrawDate, tc.now)
+			if !got.Equal(tc.want) {
+				t.Fatalf("nextLotteryDrawAt(%q, %s) = %s, want %s",
+					tc.lastDrawDate, tc.now.Format(time.RFC3339), got, tc.want)
+			}
+		})
+	}
+}

@@ -258,7 +258,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 掲示の文言(「昨日の当選」)は日付が今日とは限らなくなるので、`LastDraw.Date` を使う表現(例「9/13 の当選」)へ合わせる。掲示チャンネル未設定のギルドは従来どおり対象外。
 
 ## C3-09: 「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す(所見 3)
-- status: todo
+- status: done
 - done-when: `BuyLotteryTickets` と `LotteryStatus`(`internal/casino/store.go` 1181 / 1219 付近)は `nextRunAt(now)` をそのまま返すため、9 時直前に受け付けた要求が 9 時の抽選の後に処理されると、**既に済んだ 09:00 を「次回」と表示する**(券は正しく次回分に入る)。ロールオーバー後の `lottery.DrawDate` から次回を出す — `nextLotteryDrawAt(lastDrawDate string, now time.Time) time.Time`(`internal/casino/lottery.go` か `announce.go`)を足し、`nextRunAt(now)` と「`lastDrawDate` の翌日 09:00 JST」の**遅い方**を返す。両方の呼び出しをこれに差し替える。`store_test.go`: 9/14 08:59:59 の `now` で、`DrawDate` が既に 9/14 のときの購入・status がどちらも 9/15 09:00 を返す / 通常(`DrawDate` が 9/13)は 9/14 09:00 を返す / 一度も抽選していない(`DrawDate == ""`)ときは `nextRunAt(now)` のまま。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestLottery|TestNextRunAt|TestNextLotteryDraw|TestBuyLottery" -count=1`

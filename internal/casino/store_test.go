@@ -3233,3 +3233,75 @@ func TestLotteryDraw_WinnerAtTheChipCapSendsTheRemainderToTheJackpot(t *testing.
 		t.Fatalf("the pool gained %d on day 2, want 5 (the house's cut alone)", got)
 	}
 }
+
+// TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn closes the gap
+// between the two clocks a request crosses: the `now` a command captured, and
+// the state that request finds when the store's lock finally lets it in. The
+// 09:00 announcement scheduler draws in between, so a purchase read at
+// 08:59:59 lands on a guild whose draw for today is already settled. The
+// tickets are right — drawLotteryLocked declines to re-draw, so they join
+// tomorrow's pot — and it is only the instant reported back that used to be
+// wrong: today's 09:00, an instant already in the past. Both entry points are
+// checked, because /lottery status re-reads the same field a moment later and
+// a fix to only one of them would contradict the other on screen.
+func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
+	// The draw under test has already run before this test starts; an empty
+	// script makes any draw these calls perform fail loudly right here.
+	const guildID, userID = "guild1", "u1"
+	justBeforeNine := time.Date(2026, 7, 11, 8, 59, 59, 0, jst) // fixedNow is 12:00 on the 10th
+	today, tomorrow := time.Date(2026, 7, 11, 9, 0, 0, 0, jst), time.Date(2026, 7, 12, 9, 0, 0, 0, jst)
+
+	tests := []struct {
+		name         string
+		lastDrawDate string
+		want         time.Time
+	}{
+		// The bug: the 11th's 09:00 draw ran while this request was in
+		// flight, so the tickets are in the 12th's.
+		{name: "the 09:00 draw ran while the request was in flight", lastDrawDate: "2026-07-11", want: tomorrow},
+		// The ordinary path, which must not move: the last draw was
+		// yesterday's, so today's 09:00 is still ahead.
+		{name: "the last draw was yesterday", lastDrawDate: "2026-07-10", want: today},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, _ := newTempStore(t)
+			st.rng = &lotteryRand{t: t, float: 0.5}
+			seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+			if err := st.Update(func(d *Data) error {
+				ensureGuildLocked(d, guildID).Lottery.DrawDate = tc.lastDrawDate
+				return nil
+			}); err != nil {
+				t.Fatalf("seeding DrawDate: %v", err)
+			}
+
+			purchase, err := st.BuyLotteryTickets(guildID, userID, 2, justBeforeNine)
+			if err != nil {
+				t.Fatalf("BuyLotteryTickets: %v", err)
+			}
+			if !purchase.NextDrawAt.Equal(tc.want) {
+				t.Fatalf("purchase.NextDrawAt = %s, want %s — the buyer was pointed at the wrong draw",
+					purchase.NextDrawAt, tc.want)
+			}
+			// The tickets themselves were never in question: they are in the
+			// pot the answer above now names.
+			if purchase.UserTickets != 2 || purchase.TicketsSold != 2 {
+				t.Fatalf("purchase = %+v, want 2 tickets held and 2 sold into the open pot", purchase)
+			}
+
+			view, err := st.LotteryStatus(guildID, userID, justBeforeNine)
+			if err != nil {
+				t.Fatalf("LotteryStatus: %v", err)
+			}
+			if !view.NextDrawAt.Equal(tc.want) {
+				t.Fatalf("view.NextDrawAt = %s, want %s — status contradicts the purchase confirmation",
+					view.NextDrawAt, tc.want)
+			}
+			if view.UserTickets != 2 {
+				t.Fatalf("view.UserTickets = %d, want 2 — the pot named by NextDrawAt is not the one holding the tickets",
+					view.UserTickets)
+			}
+		})
+	}
+}

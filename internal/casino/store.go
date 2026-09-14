@@ -1118,7 +1118,7 @@ type LotteryPurchase struct {
 	TicketsSold int       // every buyer's tickets for the next draw
 	Buyers      int       // distinct buyers in the next draw
 	Prize       int64     // what the next draw pays as of this purchase
-	NextDrawAt  time.Time // the next 09:00 JST
+	NextDrawAt  time.Time // the 09:00 JST these tickets are drawn at
 }
 
 // BuyLotteryTickets buys `count` tickets for guildID/userID at
@@ -1182,7 +1182,7 @@ func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Ti
 			Count: count, Cost: cost, Balance: account.Chips,
 			UserTickets: lottery.Tickets[userID],
 			TicketsSold: sold, Buyers: buyers, Prize: prize,
-			NextDrawAt: nextRunAt(now),
+			NextDrawAt: nextLotteryDrawAt(lottery.DrawDate, now),
 		}
 		return nil
 	})
@@ -1202,7 +1202,7 @@ type LotteryView struct {
 	TicketsSold int       // tickets in the next draw
 	Buyers      int       // distinct buyers in the next draw
 	UserTickets int       // the asking user's own tickets
-	NextDrawAt  time.Time // the next 09:00 JST
+	NextDrawAt  time.Time // the 09:00 JST these tickets are drawn at
 	LastDraw    *LotteryDraw
 }
 
@@ -1220,7 +1220,7 @@ func (s *Store) LotteryStatus(guildID, userID string, now time.Time) (LotteryVie
 		result = LotteryView{
 			Prize: prize, TicketsSold: sold, Buyers: buyers,
 			UserTickets: lottery.Tickets[userID],
-			NextDrawAt:  nextRunAt(now),
+			NextDrawAt:  nextLotteryDrawAt(lottery.DrawDate, now),
 		}
 		if lottery.LastDraw != nil {
 			// Hand back a COPY: the pointer belongs to the Data this Update

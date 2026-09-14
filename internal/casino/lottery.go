@@ -35,6 +35,42 @@ func lotteryDrawDate(t time.Time) string {
 	return jt.Format("2006-01-02")
 }
 
+// nextLotteryDrawAt returns the instant the tickets being sold RIGHT NOW are
+// drawn at: the LATER of the next 09:00 JST after `now` and the 09:00 that
+// follows the draw already settled as `lastDrawDate`. Pass the DrawDate read
+// after the rollover, not before.
+//
+// nextRunAt(now) alone is wrong whenever a request's clock reading is older
+// than the state it lands on. A purchase read at 08:59:59 that reaches the
+// store after 09:00 — the announcement scheduler drew in between — finds
+// DrawDate already stamped for today, and drawLotteryLocked correctly
+// declines to re-draw (the reading's own draw date is still yesterday), so
+// the tickets join TOMORROW's pot. But nextRunAt(08:59:59) is today's 09:00,
+// an instant that has just passed: the buyer would be pointed at a draw that
+// is over while their ticket sits in the next one.
+//
+// lastDrawDate == "" (never drawn) and anything that is not a JST calendar
+// date (a hand-edited file) fall back to nextRunAt(now): with no trustworthy
+// record of a settled draw there is nothing to push the answer past, and
+// guessing from a corrupt string would be worse than the plain schedule.
+func nextLotteryDrawAt(lastDrawDate string, now time.Time) time.Time {
+	next := nextRunAt(now)
+	if lastDrawDate == "" {
+		return next
+	}
+	day, err := time.ParseInLocation("2006-01-02", lastDrawDate, jst)
+	if err != nil {
+		return next
+	}
+	// time.Date normalises a day past the end of the month, so no month-end
+	// special case is needed here.
+	after := time.Date(day.Year(), day.Month(), day.Day()+1, LotteryDrawHourJST, 0, 0, 0, jst)
+	if after.After(next) {
+		return after
+	}
+	return next
+}
+
 // LotteryPrize splits `sales` into the winner's prize and the house's cut,
 // and adds `carryover` (the pot rolled forward from draws nobody entered) to
 // the prize: prize = floor(sales*90/100) + carryover, house = sales - that
