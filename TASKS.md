@@ -78,7 +78,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 倍率の整数式はここで固定し、テストの期待値もこれで計算する。乱数は既存の `randSource` インターフェースに合わせる。
 
 ## C2-04: ブラックジャックの純粋ロジック(§7)
-- status: todo
+- status: done
 - done-when: `internal/casino/blackjack.go`: `BlackjackGame`(6 デッキのシュー・両手・ベット・状態・ダブル可否)、`NewBlackjack(bet, rng)`(初期配布とナチュラル判定。両者ナチュラルはプッシュ、プレイヤーのみは即 3:2、ディーラーのみは即負け)、`Hit()`, `Stand()`, `Double()`(最初の判断でだけ。1 枚引いて自動スタンド)、ディーラーは 17 以上で止まる(ソフト 17 も止まる)、`Settle() int64`(勝ち 2×総ベット、プッシュ 総ベット、負け 0、ナチュラル `bet + floor(bet*3/2)`)、`AutoResolve()`(= Stand)、手札の値(A は 11 か 1)。`blackjack_test.go`: 固定シューでの各分岐(ナチュラル 3 通り、バースト、ディーラーバースト、プッシュ、ソフト 17 で止まる、ダブル後は 1 枚で止まる、バースト後は Hit 不可、ダブルは 2 手目以降不可)、境界(配当は総ベットの 2.5 倍を超えない)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestBlackjack|TestHandValue" -count=1`
