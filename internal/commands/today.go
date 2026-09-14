@@ -104,7 +104,7 @@ func (c *TodayCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 		parsed, err := c.parseDateArg(dateArg)
 		if err != nil {
 			content := todayDateErrorMessage(err)
-			return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			return respond(s, i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{Content: content},
 			})
@@ -114,7 +114,7 @@ func (c *TodayCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 
 	result := c.todayClient.GetTodayInfo(context.Background(), targetDate)
 
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: result},
 	})

@@ -130,7 +130,7 @@ func (c *ScheduleResultCommand) Handle(s *discordgo.Session, i *discordgo.Intera
 		respData.Embeds = []*discordgo.MessageEmbed{embed}
 	}
 
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: respData,
 	})

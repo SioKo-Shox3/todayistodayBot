@@ -95,7 +95,7 @@ func (c *RateCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 			content = buildRateMessage(history)
 		}
 	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: content},
 	})

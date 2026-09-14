@@ -72,7 +72,7 @@ func (c *WeatherCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCr
 		}
 	}
 
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: c.buildResponseContent(cityName)},
 	})

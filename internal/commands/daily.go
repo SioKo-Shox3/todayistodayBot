@@ -61,7 +61,7 @@ func (c *DailyCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 			}
 		}
 	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: content}, // 公開(設計書)
 	})

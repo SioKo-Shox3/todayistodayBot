@@ -219,17 +219,24 @@ func TestRedactInteractionError_DropsTokens(t *testing.T) {
 		{
 			name:        "url.Error from InteractionRespond",
 			err:         &url.Error{Op: "Post", URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback", Err: errors.New("connection reset")},
-			wantContain: "connection reset",
+			wantContain: "Post:",
 		},
 		{
 			name:        "url.Error from a webhook edit",
 			err:         &url.Error{Op: "Patch", URL: "https://discord.com/api/v9/webhooks/1/TEST_TOKEN/messages/@original", Err: errors.New("timeout")},
-			wantContain: "timeout",
+			wantContain: "Patch:",
 		},
 		{
 			name:        "wrapped url.Error",
 			err:         fmt.Errorf("reveal: %w", &url.Error{Op: "Post", URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback", Err: errors.New("EOF")}),
-			wantContain: "EOF",
+			wantContain: "Post:",
+		},
+		{
+			// The cause net/http wraps can quote the request itself, so the
+			// URL is not the only place a token can hide inside *url.Error.
+			name:        "url.Error whose cause carries the token",
+			err:         &url.Error{Op: "Post", URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback", Err: errors.New("request token TEST_TOKEN")},
+			wantContain: "*errors.errorString",
 		},
 		{
 			name:        "plain error quoting an interaction path",

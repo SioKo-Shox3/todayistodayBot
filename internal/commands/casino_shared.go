@@ -163,19 +163,36 @@ var discordTokenInPath = regexp.MustCompile(`(/(?:interactions|webhooks)/[^/\s]+
 // token is short-lived and is not the bot token, but it authorises replies to
 // that interaction for its lifetime and there is no reason to keep it.
 //
-// *url.Error is reduced to its Op plus the redacted cause; the URL is
-// dropped entirely. Anything else keeps its message with the token segment of
-// any embedded path replaced by [redacted], because errors from other layers
-// (discordgo's own RESTError, a wrapped fmt.Errorf) can quote a path too.
-// Every log site in this package passes its error through here, so no call
-// site has to decide whether its error could contain a URL.
+// *url.Error is reduced to its Op plus the Go type of its cause; both the URL
+// and the cause's own message are dropped, because net/http wraps whatever the
+// transport produced and that message can quote the request — including the
+// token — in a shape no path pattern matches. The type still says what went
+// wrong (*net.OpError, *tls.CertificateVerificationError, …). Anything else
+// keeps its message with the token segment of any embedded path replaced by
+// [redacted], because errors from other layers (discordgo's own RESTError, a
+// wrapped fmt.Errorf) can quote a path too. Every log site in this package
+// passes its error through here, so no call site has to decide whether its
+// error could contain a URL.
 func redactInteractionError(err error) string {
 	if err == nil {
 		return "<nil>"
 	}
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		return urlErr.Op + ": " + redactInteractionError(urlErr.Err)
+		return fmt.Sprintf("%s: %T", urlErr.Op, urlErr.Err)
 	}
 	return discordTokenInPath.ReplaceAllString(err.Error(), "${1}[redacted]")
+}
+
+// respond sends resp for the interaction and returns a token-free error.
+// cmd/bot logs whatever Handle returns straight to slog, so returning the raw
+// transport error would put the interaction token in the log from every
+// command at once. Handlers in this package call this instead of
+// s.InteractionRespond; the returned error is a plain message (nothing
+// unwraps it) that has already been through redactInteractionError.
+func respond(s *discordgo.Session, i *discordgo.Interaction, resp *discordgo.InteractionResponse) error {
+	if err := s.InteractionRespond(i, resp); err != nil {
+		return errors.New(redactInteractionError(err))
+	}
+	return nil
 }

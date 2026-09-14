@@ -120,7 +120,7 @@ func (c *ExchangeCommand) Handle(s *discordgo.Session, i *discordgo.InteractionC
 			}
 		}
 	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return respond(s, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: content},
 	})

@@ -143,7 +143,7 @@ func (c *SlotCommand) runReveal(responder slotResponder, interaction *discordgo.
 
 func (c *SlotCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	if msg := requireGuildContext(i); msg != "" {
-		return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		return respond(s, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{Content: msg},
 		})
@@ -156,7 +156,7 @@ func (c *SlotCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 		}
 	}
 	if bet < 10 || bet > 1000 { // defense in depth — Discord's MinValue/MaxValue already enforce this client-side
-		return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		return respond(s, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{Content: "❌ ベットは10〜1,000チップです"},
 		})
@@ -165,7 +165,7 @@ func (c *SlotCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 	userID := resolveUserID(i)
 	if err := c.store.EnsureCasinoAccess(i.GuildID, userID, time.Now()); err != nil { // §3.8
 		slog.Error("casino: EnsureCasinoAccess failed", "command", "slot", "error", redactInteractionError(err))
-		return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		return respond(s, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{Content: "❌ カジノの初期化に失敗しました。"},
 		})
@@ -173,7 +173,7 @@ func (c *SlotCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreat
 
 	result, err := c.store.Spin(i.GuildID, userID, bet)
 	if err != nil {
-		return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		return respond(s, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{Content: translateSlotError(err)},
 		})

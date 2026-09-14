@@ -297,6 +297,7 @@ func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
 	tests := []struct {
 		name      string
 		responder *fakeSlotResponder
+		wantLog   string
 	}{
 		{
 			name: "initial respond fails",
@@ -305,6 +306,7 @@ func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
 				URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback",
 				Err: errors.New("connection reset by peer"),
 			}},
+			wantLog: "Post: *errors.errorString",
 		},
 		{
 			name: "a reveal edit fails",
@@ -313,6 +315,19 @@ func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
 				URL: "https://discord.com/api/v9/webhooks/1/TEST_TOKEN/messages/@original",
 				Err: errors.New("connection reset by peer"),
 			}},
+			wantLog: "Patch: *errors.errorString",
+		},
+		{
+			// The token does not only live in the URL: net/http wraps
+			// whatever the transport produced, and that cause can quote the
+			// request. Only the type of the cause is logged.
+			name: "the wrapped cause carries the token",
+			responder: &fakeSlotResponder{respondErr: &url.Error{
+				Op:  "Post",
+				URL: "https://discord.com/api/v9/interactions/1/TEST_TOKEN/callback",
+				Err: errors.New("request token TEST_TOKEN"),
+			}},
+			wantLog: "Post: *errors.errorString",
 		},
 	}
 	for _, tc := range tests {
@@ -325,8 +340,8 @@ func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
 			}
 
 			out := logged.String()
-			if !strings.Contains(out, "connection reset by peer") {
-				t.Fatalf("the Discord failure was not logged at all: %q", out)
+			if !strings.Contains(out, tc.wantLog) {
+				t.Fatalf("the log line does not say which call failed and why: %q, want %q", out, tc.wantLog)
 			}
 			if strings.Contains(out, "TEST_TOKEN") {
 				t.Fatalf("the interaction token reached the log: %q", out)
