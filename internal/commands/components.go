@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -30,8 +31,12 @@ func BuildCustomID(game, sessionID, action string) string {
 // 100 characters (Discord would have rejected it on the way out), a part
 // count other than 4 (too few *or* too many — no game, session ID or
 // action of ours contains the separator), or an empty element.
+//
+// The length is counted in characters, not bytes: Discord's limit is 100
+// characters, so a multi-byte ID that Discord accepts must survive the
+// round trip here too.
 func ParseCustomID(id string) (game, sessionID, action string, ok bool) {
-	if len(id) > componentIDMaxLen {
+	if utf8.RuneCountInString(id) > componentIDMaxLen {
 		return "", "", "", false
 	}
 	parts := strings.Split(id, componentIDSeparator)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -52,6 +53,18 @@ func TestParseCustomID_Boundaries(t *testing.T) {
 	}
 	overLimit := atLimit + "a"
 
+	// The same boundary in multi-byte characters: Discord counts characters,
+	// so a 100-character / 260-byte ID is legal and must round trip. A
+	// byte-counting limit would reject it.
+	multibyteAtLimit := BuildCustomID("highlow", strings.Repeat("あ", componentIDMaxLen-len(prefix)-len(suffix)), "high")
+	if got := utf8.RuneCountInString(multibyteAtLimit); got != componentIDMaxLen {
+		t.Fatalf("test setup: multibyteAtLimit is %d characters, want %d", got, componentIDMaxLen)
+	}
+	if len(multibyteAtLimit) <= componentIDMaxLen {
+		t.Fatalf("test setup: multibyteAtLimit is %d bytes, want more than %d", len(multibyteAtLimit), componentIDMaxLen)
+	}
+	multibyteOverLimit := BuildCustomID("highlow", strings.Repeat("あ", componentIDMaxLen-len(prefix)-len(suffix)+1), "high")
+
 	tests := []struct {
 		name string
 		id   string
@@ -59,6 +72,8 @@ func TestParseCustomID_Boundaries(t *testing.T) {
 	}{
 		{name: "exactly 100 characters", id: atLimit, ok: true},
 		{name: "101 characters", id: overLimit, ok: false},
+		{name: "exactly 100 multibyte characters", id: multibyteAtLimit, ok: true},
+		{name: "101 multibyte characters", id: multibyteOverLimit, ok: false},
 		{name: "too few parts", id: "casino:highlow:8f3a", ok: false},
 		{name: "one part", id: "casino", ok: false},
 		{name: "empty", id: "", ok: false},
