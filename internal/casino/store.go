@@ -702,17 +702,33 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 // The pool is HOUSE money, not anyone's balance: it is funded from the edge
 // the payout table already keeps, so it takes part in no account's
 // Chips + Escrow conservation law. Its own law, which store_test.go pins
-// down, is that economy.Jackpot moves ONLY by an accrual (accrueJackpotLocked)
-// or by a 7️⃣7️⃣7️⃣ firing in Spin — nothing else in this package writes it.
+// down, is that economy.Jackpot moves ONLY by a credit through
+// creditJackpotCappedLocked — the slot accrual (accrueJackpotLocked), the
+// lottery house cut and the prize a capped winner could not take
+// (drawLotteryLocked) — or by a 7️⃣7️⃣7️⃣ firing in Spin, which pays the pool
+// out and resets it to JackpotSeed. Nothing else in this package writes it,
+// and the one credit helper is what bounds it to [JackpotSeed, MaxJackpot].
 
-// seedJackpotLocked raises a pool below JackpotSeed back up to the seed, so
-// no reader ever sees an unseeded 0. Every pre-C-3a data/casino.json
-// unmarshals to Jackpot 0, and that is the case this exists for; the
-// comparison is `<` rather than `== 0` because no legitimate sequence can
-// produce anything in between — the pool is seeded at JackpotSeed, only ever
-// grows, and is reset to JackpotSeed when it fires — so a value in (0, seed)
-// can only come from a hand edit or a partial write, and repairing it here is
-// the same discipline ensureTodayRateIndexLocked applies to a corrupt rate.
+// seedJackpotLocked is the pool's normalisation point: after it returns,
+// economy.Jackpot is in [JackpotSeed, MaxJackpot] no matter what was on
+// disk. Every writer below depends on that range, so every writer calls it
+// first.
+//
+// It raises a pool below JackpotSeed back up to the seed, so no reader ever
+// sees an unseeded 0. Every pre-C-3a data/casino.json unmarshals to
+// Jackpot 0, and that is the case this exists for; the comparison is `<`
+// rather than `== 0` because no legitimate sequence can produce anything in
+// between — the pool is seeded at JackpotSeed, only ever grows, and is reset
+// to JackpotSeed when it fires — so a value in (0, seed) can only come from a
+// hand edit or a partial write, and repairing it here is the same discipline
+// ensureTodayRateIndexLocked applies to a corrupt rate.
+//
+// It also truncates a pool ABOVE MaxJackpot back down to the cap. No
+// legitimate sequence reaches that either, since creditJackpotCappedLocked
+// never lets a credit cross it; the case that matters is the hand-edited or
+// half-written file holding something like math.MaxInt64, which would make
+// the very next credit wrap. Clamping on the way in means the arithmetic
+// below never sees such a value at all.
 //
 // The carry is normalised at the same time: a NEGATIVE JackpotAccum (again,
 // only reachable by hand edit) would make accrueJackpotLocked's division
@@ -723,9 +739,43 @@ func seedJackpotLocked(economy *GuildEconomy) {
 	if economy.Jackpot < JackpotSeed {
 		economy.Jackpot = JackpotSeed
 	}
+	if economy.Jackpot > MaxJackpot {
+		economy.Jackpot = MaxJackpot
+	}
 	if economy.JackpotAccum < 0 {
 		economy.JackpotAccum = 0
 	}
+}
+
+// creditJackpotCappedLocked is the ONLY way chips enter the pool. It seeds
+// first, then credits `amount` as far as MaxJackpot allows and reports what
+// it actually moved.
+//
+// What does not fit is DROPPED, deliberately, and this is the one place
+// C-3a's conservation law gives ground: the pool's cap is the only leak in
+// the system, and everywhere else nothing is destroyed. That is the same
+// contract creditChipsCappedLocked already has at MaxChips — a cap you
+// cannot exceed is worth more than a chip you cannot lose, because a wrapped
+// pool is negative money that the next 7️⃣7️⃣7️⃣ hands to a player.
+//
+// A non-positive amount moves nothing rather than shrinking the pool: the
+// callers' addends are differences (house + (prize - paid)) computed from
+// values that a hand-edited file can push negative, and a draw must never be
+// able to drain the pool. Caller must already hold the Store's lock.
+func creditJackpotCappedLocked(economy *GuildEconomy, amount int64) int64 {
+	seedJackpotLocked(economy)
+	if amount <= 0 {
+		return 0
+	}
+	headroom := MaxJackpot - economy.Jackpot // in [0, MaxJackpot-JackpotSeed] after the seed
+	if headroom <= 0 {
+		return 0
+	}
+	if amount > headroom {
+		amount = headroom
+	}
+	economy.Jackpot += amount
+	return amount
 }
 
 // accrueJackpotLocked seeds the pool if needed, then feeds it this spin's
@@ -739,7 +789,10 @@ func seedJackpotLocked(economy *GuildEconomy) {
 func accrueJackpotLocked(economy *GuildEconomy, bet int64) {
 	seedJackpotLocked(economy)
 	economy.JackpotAccum += bet * JackpotContributionPercent
-	economy.Jackpot += economy.JackpotAccum / jackpotAccumScale
+	// The carry is spent either way: at the cap the whole chips it converted
+	// to are dropped rather than held back, so a full pool does not silently
+	// bank an accrual that the next 7️⃣7️⃣7️⃣ reset would release all at once.
+	creditJackpotCappedLocked(economy, economy.JackpotAccum/jackpotAccumScale)
 	economy.JackpotAccum %= jackpotAccumScale
 }
 
@@ -1018,6 +1071,12 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 //	winner's Chips gained     == prize   (== floor(Sales*90/100) + carryover)
 //	economy.Jackpot gained    == house   (== Sales - floor(Sales*90/100))
 //
+// The third line holds while the pool has room, which is the only qualifier
+// the law carries: what MaxJackpot cannot fit is dropped by
+// creditJackpotCappedLocked. So the law is not "chips never disappear" but
+// "chips disappear ONLY where the pool's cap refuses them" — everywhere
+// else, including the remainder below, they are conserved exactly.
+//
 // creditChipsCappedLocked credits `amount` chips as far as MaxChips allows
 // and reports what it actually moved. It exists for the one credit in this
 // package that has no error to return: the draw runs inside
@@ -1088,16 +1147,18 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 		return
 	}
 	paid := creditChipsCappedLocked(ensureAccountLocked(economy, winner), prize)
-	// The house's cut feeds the slot jackpot pool (設計書 C-3a §3). Seed
-	// first: adding to a pool still sitting at a pre-C-3a 0 and only then
-	// raising it to the seed would swallow the cut.
-	seedJackpotLocked(economy)
-	// prize-paid is 0 on every normal draw; it is non-zero only when the
-	// winner was at MaxChips. That remainder goes down the same path as the
-	// house's cut instead of carrying over: a carryover would hand THIS
-	// winner's prize to whoever wins the NEXT draw, someone else. Nothing is
-	// destroyed either — the pool pays back out on 7️⃣7️⃣7️⃣.
-	economy.Jackpot += house + (prize - paid)
+	// The house's cut feeds the slot jackpot pool (設計書 C-3a §3), and so
+	// does prize-paid: that remainder is 0 on every normal draw and non-zero
+	// only when the winner was at MaxChips. It goes down the same path as the
+	// cut instead of carrying over, because a carryover would hand THIS
+	// winner's prize to whoever wins the NEXT draw, someone else. The pool
+	// pays it back out on 7️⃣7️⃣7️⃣, so it is not destroyed — unless the pool
+	// is itself at MaxJackpot, the single exception the cap buys us.
+	//
+	// creditJackpotCappedLocked seeds before it adds, which is what keeps a
+	// pool still sitting at a pre-C-3a 0 from swallowing the cut when the
+	// raise to the seed happens after the addition rather than before.
+	creditJackpotCappedLocked(economy, house+(prize-paid))
 	lottery.LastDraw = &LotteryDraw{
 		Date: drawDate, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
 	}

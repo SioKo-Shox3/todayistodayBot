@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2747,7 +2748,10 @@ func TestBuyLotteryTickets_RefusesAndPersistsNothingWhenChipsAreShort(t *testing
 // conservation law of 設計書 C-3a §3, checked end to end across one draw:
 // the buyers' chips fall by exactly the sales, the winner's rise by exactly
 // the prize, and the jackpot pool rises by exactly the house's cut. Nothing
-// is created and nothing is destroyed.
+// is created, and the only chips that can be destroyed are the ones
+// MaxJackpot refuses to let into the pool — not reachable here, where the
+// pool sits at the seed, and pinned separately by the MaxJackpot tests
+// below.
 func TestLotteryDraw_PaysTheWinnerFeedsTheJackpotAndConservesChips(t *testing.T) {
 	st, path := newTempStore(t)
 	// Roll 5 falls in u3's range (u1 [0,1), u2 [1,4), u3 [4,10)).
@@ -2804,6 +2808,157 @@ func TestLotteryDraw_PaysTheWinnerFeedsTheJackpotAndConservesChips(t *testing.T)
 	if drawn.Lottery.LastDraw == nil || *drawn.Lottery.LastDraw != want {
 		t.Fatalf("LastDraw = %+v, want %+v", drawn.Lottery.LastDraw, want)
 	}
+}
+
+// TestJackpotCap_CreditsUpToTheCapAndDropsTheRest pins creditJackpotCappedLocked,
+// the single door into the pool. The property being fixed is not any one
+// arithmetic result but the INVARIANT: whatever the stored pool and whatever
+// the addend — including an addend that has already wrapped upstream — the
+// pool it leaves behind is inside [JackpotSeed, MaxJackpot]. That is what
+// makes the overflow the C3-07 evaluation found unreachable rather than
+// merely unlikely, so the table deliberately includes values no legitimate
+// sequence can produce.
+func TestJackpotCap_CreditsUpToTheCapAndDropsTheRest(t *testing.T) {
+	cases := []struct {
+		name                   string
+		pool, amount           int64
+		wantCredited, wantPool int64
+	}{
+		{"well below the cap credits in full", 5_000, 100, 100, 5_100},
+		{"a pre-C-3a zero is seeded before the credit, not after", 0, 50, 50, JackpotSeed + 50},
+		{"a credit straddling the cap is truncated to the headroom", MaxJackpot - 10, 50, 10, MaxJackpot},
+		{"a pool already at the cap takes nothing", MaxJackpot, 100, 0, MaxJackpot},
+		{"a hand-edited MaxInt64 pool is clamped, not wrapped", math.MaxInt64, 100, 0, MaxJackpot},
+		{"a hand-edited MinInt64 pool is raised to the seed", math.MinInt64, 100, 100, JackpotSeed + 100},
+		{"a negative addend never drains the pool", 5_000, -100, 0, 5_000},
+		{"an addend bigger than the whole cap lands exactly on it", JackpotSeed, math.MaxInt64, MaxJackpot - JackpotSeed, MaxJackpot},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			economy := &GuildEconomy{Jackpot: tc.pool}
+			if credited := creditJackpotCappedLocked(economy, tc.amount); credited != tc.wantCredited {
+				t.Fatalf("credited %d, want %d", credited, tc.wantCredited)
+			}
+			if economy.Jackpot != tc.wantPool {
+				t.Fatalf("pool = %d, want %d", economy.Jackpot, tc.wantPool)
+			}
+			if economy.Jackpot < JackpotSeed || economy.Jackpot > MaxJackpot {
+				t.Fatalf("pool = %d, outside [%d, %d] — the invariant the cap exists for",
+					economy.Jackpot, JackpotSeed, MaxJackpot)
+			}
+		})
+	}
+}
+
+// TestStore_JackpotCapStopsADrawAndASpinAtMaxJackpot walks the two real
+// credit paths — the lottery house cut and the slot accrual — into a pool
+// with less headroom than they want, through the Store rather than the
+// helper. The draw's 50-chip cut meets 10 chips of room: 10 land and 40 are
+// dropped, which is the one place C-3a's conservation law gives ground. The
+// player side must NOT give ground with it: the winner is still paid in full,
+// because the cap costs the house its cut and never a balance.
+func TestStore_JackpotCapStopsADrawAndASpinAtMaxJackpot(t *testing.T) {
+	st, path := newTempStore(t)
+	// Roll 5 falls in u3's range (u1 [0,1), u2 [1,4), u3 [4,10)).
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{5}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 1_000, "u2": 1_000, "u3": 1_000})
+	for userID, count := range map[string]int{"u1": 1, "u2": 3, "u3": 6} {
+		if _, err := st.BuyLotteryTickets(guildID, userID, count, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets(%s, %d): %v", userID, count, err)
+		}
+	}
+	seedJackpot(t, st, guildID, MaxJackpot-10, 0)
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate: %v", err)
+	}
+
+	drawn := readGuild(t, path, guildID)
+	if drawn.Jackpot != MaxJackpot {
+		t.Fatalf("pool after the draw = %d, want exactly MaxJackpot %d (the 50-chip cut had 10 chips of room)",
+			drawn.Jackpot, MaxJackpot)
+	}
+	// u3 bought 6 of the 10 tickets (300 chips) and won the 450-chip prize.
+	if got := drawn.Users["u3"].Chips; got != 1_150 {
+		t.Fatalf("winner u3 holds %d chips, want 1150 (1000 - 300 spent + 450 prize): the pool's cap must not touch a payout", got)
+	}
+
+	// Now the accrual path, against a pool that is already full.
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 50_000})
+	st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+	result, err := st.at(daysAfter(1)).Spin(guildID, "u1", 1_000)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+	if result.JackpotPool != MaxJackpot {
+		t.Fatalf("JackpotPool after the spin = %d, want MaxJackpot %d", result.JackpotPool, MaxJackpot)
+	}
+	spun := readGuild(t, path, guildID)
+	if spun.Jackpot != MaxJackpot {
+		t.Fatalf("persisted pool after the spin = %d, want MaxJackpot %d — the 20-chip accrual must be dropped, not added",
+			spun.Jackpot, MaxJackpot)
+	}
+	if spun.JackpotAccum < 0 || spun.JackpotAccum >= jackpotAccumScale {
+		t.Fatalf("JackpotAccum = %d, want [0, %d): the carry is spent at the cap too, not banked",
+			spun.JackpotAccum, jackpotAccumScale)
+	}
+}
+
+// TestStore_JackpotCapNormalisesAHandEditedPool is the other half: the values
+// that can only reach the file by a hand edit or a half-finished write, which
+// is exactly how the C3-07 evaluation reproduced the wrap. Both cases here
+// wrapped the pool into a large NEGATIVE number before the cap existed — and
+// a negative pool is not a cosmetic problem, it is money the next 7️⃣7️⃣7️⃣
+// would hand to a player.
+func TestStore_JackpotCapNormalisesAHandEditedPool(t *testing.T) {
+	t.Run("a MaxInt64 pool is clamped at the read point, before the accrual", func(t *testing.T) {
+		st, path := newTempStore(t)
+		seedAccount(t, st, "guild1", "u1", UserAccount{Chips: 50_000})
+		seedJackpot(t, st, "guild1", math.MaxInt64, 0)
+		st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+
+		if _, err := st.Spin("guild1", "u1", 1_000); err != nil {
+			t.Fatalf("Spin returned error: %v", err)
+		}
+		economy := readGuild(t, path, "guild1")
+		if economy.Jackpot != MaxJackpot {
+			t.Fatalf("pool = %d, want MaxJackpot %d — seedJackpotLocked must clamp before accrueJackpotLocked adds",
+				economy.Jackpot, MaxJackpot)
+		}
+	})
+
+	t.Run("a carryover that overflows the prize cannot drain the pool", func(t *testing.T) {
+		// LotteryPrize computes share+carryover, which wraps NEGATIVE here.
+		// creditChipsCappedLocked then pays 0, so house+(prize-paid) is a
+		// large negative addend — the second reproduction in the C3-07
+		// evaluation, which used to SHRINK the pool by it.
+		st, path := newTempStore(t)
+		st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+		const guildID, userID = "guild1", "u1"
+		seedLotteryChips(t, st, guildID, map[string]int64{userID: 1_000})
+		if _, err := st.BuyLotteryTickets(guildID, userID, 2, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets: %v", err)
+		}
+		if err := st.Update(func(d *Data) error {
+			ensureGuildLocked(d, guildID).Lottery.Carryover = math.MaxInt64 - 40
+			return nil
+		}); err != nil {
+			t.Fatalf("seeding the overflowing carryover: %v", err)
+		}
+		seedJackpot(t, st, guildID, 5_000, 0)
+
+		if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+			t.Fatalf("EnsureTodayRate: %v", err)
+		}
+		economy := readGuild(t, path, guildID)
+		if economy.Jackpot != 5_000 {
+			t.Fatalf("pool = %d, want 5000 unchanged: a wrapped, negative addend must move nothing", economy.Jackpot)
+		}
+		if economy.Jackpot < JackpotSeed || economy.Jackpot > MaxJackpot {
+			t.Fatalf("pool = %d, outside [%d, %d]", economy.Jackpot, JackpotSeed, MaxJackpot)
+		}
+	})
 }
 
 // TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult covers

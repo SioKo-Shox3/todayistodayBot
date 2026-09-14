@@ -108,4 +108,8 @@ internal/commands/slot.go / casino_announce.go   ジャックポット行・宝�
 ## 8. 危険地帯
 
 - `Spin` と日次ロールオーバー(`Update` の内側で複数の口座とプールを動かす)— 資金の保存則: プールへの積立と賞金の支払い以外で通貨が湧かない。
+  消える側は 1 か所だけ — **プールの上限(`MaxJackpot` = 1e12)で入り切らない分が捨てられる**。それ以外の経路では通貨は消えない。
+  プールへの加算は必ず `creditJackpotCappedLocked` を通し、読み取り点の `seedJackpotLocked` が `Jackpot` を
+  `[JackpotSeed, MaxJackpot]` に正規化する。この 2 つがあるので、手編集で `math.MaxInt64` が入っていても加算が桁あふれしない
+  (上限を超える加算は加える前に余裕ぶんへ切り詰められる)。口座側の `MaxChips` が超過分を捨てるのと同じ契約で、事故ではなく仕様。
   別文脈の評価者を通す(`--evaluate feature`)。

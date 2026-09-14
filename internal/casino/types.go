@@ -127,9 +127,22 @@ type UserAccount struct {
 // the exchange intermediate at MaxCoins*140*97 = 1.358e16, i.e. 65,413x and
 // 679x below math.MaxInt64 (9.223e18) respectively. As long as every credit
 // path enforces these caps, no arithmetic in this package can wrap.
+//
+// MaxJackpot bounds the slot jackpot pool by the same reasoning, and the
+// same value: the pool is house money rather than an account balance, but
+// an unbounded pool is the one place left where a hand-edited casino.json
+// could wrap int64 (the house's lottery cut and the slot accrual both add
+// to it every day and nothing ever subtracted an upper bound). Because
+// seedJackpotLocked pins the pool into [JackpotSeed, MaxJackpot] at every
+// read, the headroom MaxJackpot-Jackpot is itself in [0, 1e12] and cannot
+// wrap, and creditJackpotCappedLocked truncates every credit to that
+// headroom BEFORE adding. So the pool stays in range whatever the addend
+// is — even one that has already wrapped somewhere upstream. The overflow
+// is not merely unlikely here, it is unreachable.
 const (
-	MaxChips int64 = 1_000_000_000_000 // 1e12
-	MaxCoins int64 = 1_000_000_000_000 // 1e12
+	MaxChips   int64 = 1_000_000_000_000 // 1e12
+	MaxCoins   int64 = 1_000_000_000_000 // 1e12
+	MaxJackpot int64 = MaxChips          // the slot jackpot pool obeys the account cap
 )
 
 // randSource is the minimal randomness surface economy.go and slot.go need
