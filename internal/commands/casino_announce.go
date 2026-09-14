@@ -73,33 +73,41 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 	}
 }
 
-// lotteryAnnounceLines renders the 🎟️ 宝くじ field's body: this morning's
-// settled draw on the first line, and on the second the pot that is open for
+// lotteryAnnounceLines renders the 🎟️ 宝くじ field's body: one line per
+// settled draw still waiting to be announced, then the pot that is open for
 // buying right now (設計書 C-3a §3 掲示).
 //
 // The winner is mentioned with <@id> exactly as /lottery status does
 // (lottery.go's lotteryLastDrawLine) — two renderings of one draw must not
 // disagree.
 //
-// A nil LotteryDraw is not a missing value, it is what a day nobody entered
-// looks like: drawLotteryLocked leaves LastDraw untouched then and rolls the
+// An EMPTY LotteryDraws is not a missing value, it is what a day nobody
+// entered looks like: drawLotteryLocked queues nothing then and rolls the
 // entire prize forward, so 「繰り越し」 is literally what happened and the
-// second line's amount IS that carried-over prize. Tickets read 0 枚 at 09:00
+// last line's amount IS that carried-over prize. Tickets read 0 枚 at 09:00
 // on every normal morning — the draw just emptied the pot — and only climb
 // above 0 here when the announcement is a late catch-up posted after people
 // have already started buying into the new pot.
 //
-// The heading carries the draw's OWN date, not 「昨日」: the job now delivers
-// every draw that has not been announced yet, so a bot that was down at 09:00
-// posts the missed day's winner the next morning, and calling that 「昨日」
-// would be a lie about which draw the numbers belong to.
+// Every line carries its draw's OWN date, not 「昨日」, and there can be more
+// than one: an outage that swallowed a posting leaves the older draw queued
+// while the next morning settles on top of it, and the channel is owed both.
+// Calling either of them 「昨日」 would be a lie about which draw the numbers
+// belong to.
 func lotteryAnnounceLines(job casino.AnnouncementJob) string {
-	result := "🏆 前回の当選: 該当者なし — 賞金は繰り越し"
-	if d := job.LotteryDraw; d != nil && d.WinnerID != "" {
-		result = fmt.Sprintf("🏆 %s の当選: <@%s> が %dチップ 獲得(%d枚 / %d人)",
-			lotteryDrawDateLabel(d.Date), d.WinnerID, d.Prize, d.TicketsSold, d.Buyers)
+	lines := make([]string, 0, len(job.LotteryDraws)+1)
+	for _, d := range job.LotteryDraws {
+		if d.WinnerID == "" {
+			continue // a hand-edited queue entry naming nobody has nothing to report
+		}
+		lines = append(lines, fmt.Sprintf("🏆 %s の当選: <@%s> が %dチップ 獲得(%d枚 / %d人)",
+			lotteryDrawDateLabel(d.Date), d.WinnerID, d.Prize, d.TicketsSold, d.Buyers))
 	}
-	return fmt.Sprintf("%s\n💰 本日の賞金: %dチップ / 🎫 売れた枚数: %d枚", result, job.LotteryPrize, job.LotteryTickets)
+	if len(lines) == 0 {
+		lines = append(lines, "🏆 前回の当選: 該当者なし — 賞金は繰り越し")
+	}
+	lines = append(lines, fmt.Sprintf("💰 本日の賞金: %dチップ / 🎫 売れた枚数: %d枚", job.LotteryPrize, job.LotteryTickets))
+	return strings.Join(lines, "\n")
 }
 
 // lotteryDrawDateLabel renders a stored draw date ("2006-01-02") as the M/D
@@ -164,19 +172,22 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 			}
 			// The celebration is posted AFTER, and only on success, for
 			// exactly that reason: posting it first would re-post it on
-			// every retry of a failing embed, @mentioning the winner again
-			// each time.
-			celebration := lotteryAnnounceCelebration(job.LotteryDraw)
-			if celebration == "" {
-				return nil
-			}
-			if err := sendText(job.ChannelID, celebration); err != nil {
-				// Log only, and return nil. The draw is already committed
-				// to the store and the announcement is already up; failing
-				// the job here would re-post the embed tomorrow morning and
-				// still could not un-lose this message. The result stays
-				// visible via /lottery status (設計書 C-3a §3).
-				slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+			// every retry of a failing embed, @mentioning the winners
+			// again each time. One message per queued draw: each named a
+			// different winner and each is owed their ping.
+			for i := range job.LotteryDraws {
+				celebration := lotteryAnnounceCelebration(&job.LotteryDraws[i])
+				if celebration == "" {
+					continue
+				}
+				if err := sendText(job.ChannelID, celebration); err != nil {
+					// Log only, and keep going. The draws are already committed
+					// to the store and the announcement is already up; failing
+					// the job here would re-post the embed tomorrow morning and
+					// still could not un-lose this message. The results stay
+					// visible via /lottery status (設計書 C-3a §3).
+					slog.Error("discord: ChannelMessageSend failed for a lottery celebration", "guild_id", job.GuildID, "error", err)
+				}
 			}
 			return nil
 		}, now, sleep)

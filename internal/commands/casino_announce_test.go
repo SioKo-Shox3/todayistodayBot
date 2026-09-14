@@ -257,7 +257,7 @@ func lotteryField(t *testing.T, embed *discordgo.MessageEmbed) *discordgo.Messag
 func TestBuildAnnouncementEmbed_LotteryFieldShowsTheWinnerUnderTheDrawsOwnDate(t *testing.T) {
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	job := announceJob(history, nil)
-	job.LotteryDraw = &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}
+	job.LotteryDraws = []casino.LotteryDraw{{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}}
 	// The pot the draw just emptied and reopened reads 0/0 on a normal morning.
 	embed := buildAnnouncementEmbed(job)
 	want := "🏆 7/10 の当選: <@u1> が 900チップ 獲得(20枚 / 3人)\n💰 本日の賞金: 0チップ / 🎫 売れた枚数: 0枚"
@@ -273,7 +273,7 @@ func TestBuildAnnouncementEmbed_LotteryFieldShowsTheWinnerUnderTheDrawsOwnDate(t
 func TestBuildAnnouncementEmbed_LotteryFieldDatesACaughtUpDraw(t *testing.T) {
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	job := announceJob(history, nil)
-	job.LotteryDraw = &casino.LotteryDraw{Date: "2026-09-03", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}
+	job.LotteryDraws = []casino.LotteryDraw{{Date: "2026-09-03", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}}
 	job.LotteryPrize, job.LotteryTickets = 120, 1
 	embed := buildAnnouncementEmbed(job)
 	want := "🏆 9/3 の当選: <@u1> が 900チップ 獲得(20枚 / 3人)"
@@ -288,7 +288,7 @@ func TestBuildAnnouncementEmbed_LotteryFieldNoWinnerRollsOver(t *testing.T) {
 	// still show the carried-over amount against 0 tickets.
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	job := announceJob(history, nil)
-	job.LotteryDraw = nil
+	job.LotteryDraws = nil
 	job.LotteryPrize, job.LotteryTickets = 500, 0
 	embed := buildAnnouncementEmbed(job)
 	want := "🏆 前回の当選: 該当者なし — 賞金は繰り越し\n💰 本日の賞金: 500チップ / 🎫 売れた枚数: 0枚"
@@ -304,7 +304,7 @@ func TestBuildAnnouncementEmbed_LotteryFieldShowsTodaysOpenPot(t *testing.T) {
 	// the 0/0 a punctual 09:00 posting shows.
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	job := announceJob(history, nil)
-	job.LotteryDraw = &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}
+	job.LotteryDraws = []casino.LotteryDraw{{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}}
 	job.LotteryPrize, job.LotteryTickets = 315, 7
 	got := lotteryField(t, buildAnnouncementEmbed(job)).Value
 	if !strings.Contains(got, "💰 本日の賞金: 315チップ / 🎫 売れた枚数: 7枚") {
@@ -504,5 +504,78 @@ func TestStartAnnounceScheduler_CelebratesAWinnerWhoWasCreditedNothing(t *testin
 	}
 	if channels[0] != "c1" {
 		t.Fatalf("the celebration went to %q, want the announce channel", channels[0])
+	}
+}
+
+// TestBuildAnnouncementEmbed_LotteryFieldListsEveryQueuedDraw is the embed
+// half of 反復 2 の指摘: when an outage left one morning unposted, the next
+// posting owes the channel BOTH winners, each under its own date. One line per
+// draw, then the open pot.
+func TestBuildAnnouncementEmbed_LotteryFieldListsEveryQueuedDraw(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.LotteryDraws = []casino.LotteryDraw{
+		{Date: "2026-09-13", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3},
+		{Date: "2026-09-14", WinnerID: "u2", Prize: 450, TicketsSold: 10, Buyers: 2},
+	}
+	job.LotteryPrize, job.LotteryTickets = 120, 1
+	want := strings.Join([]string{
+		"🏆 9/13 の当選: <@u1> が 900チップ 獲得(20枚 / 3人)",
+		"🏆 9/14 の当選: <@u2> が 450チップ 獲得(10枚 / 2人)",
+		"💰 本日の賞金: 120チップ / 🎫 売れた枚数: 1枚",
+	}, "\n")
+	if got := lotteryField(t, buildAnnouncementEmbed(job)).Value; got != want {
+		t.Fatalf("unexpected lottery field:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStartAnnounceScheduler_CelebratesEveryQueuedWinner is the celebration
+// half: two winners were queued, so two @mentioning messages go out. Driven
+// through a REAL store so the queue under test is the one the rollovers
+// actually built.
+func TestStartAnnounceScheduler_CelebratesEveryQueuedWinner(t *testing.T) {
+	store := newTestCasinoStore(t)
+	if err := store.SetAnnounceChannel("g1", "c1"); err != nil {
+		t.Fatalf("SetAnnounceChannel: %v", err)
+	}
+	at := announceAt10()
+	// u1 buys the day before: the 7/10 09:00 draw is theirs. u2 buys at 7/10
+	// 10:00, whose rollover settles that draw WITHOUT anybody announcing it
+	// (the outage), and joins the 7/11 pot.
+	if _, err := store.BuyLotteryTickets("g1", "u1", 2, at.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("BuyLotteryTickets(u1): %v", err)
+	}
+	if _, err := store.BuyLotteryTickets("g1", "u2", 2, at); err != nil {
+		t.Fatalf("BuyLotteryTickets(u2): %v", err)
+	}
+
+	embeds, texts, channels := runOneAnnouncePass(t, store, at.AddDate(0, 0, 1))
+
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	field := lotteryField(t, embeds[0]).Value
+	for _, want := range []string{
+		"🏆 7/10 の当選: <@u1> が 90チップ 獲得(2枚 / 1人)",
+		"🏆 7/11 の当選: <@u2> が 90チップ 獲得(2枚 / 1人)",
+	} {
+		if !strings.Contains(field, want) {
+			t.Fatalf("the embed field does not report every queued draw:\n got: %q\nwant it to contain: %q", field, want)
+		}
+	}
+	want := []string{
+		"🎉🎉🎉 <@u1> が 🎟️ 宝くじに当選!! 90 チップ 獲得!! 🎉🎉🎉",
+		"🎉🎉🎉 <@u2> が 🎟️ 宝くじに当選!! 90 チップ 獲得!! 🎉🎉🎉",
+	}
+	if len(texts) != len(want) {
+		t.Fatalf("got %d celebration messages, want %d — every queued winner is owed their ping: %q", len(texts), len(want), texts)
+	}
+	for i := range want {
+		if texts[i] != want[i] {
+			t.Fatalf("celebration %d:\n got: %q\nwant: %q", i, texts[i], want[i])
+		}
+		if channels[i] != "c1" {
+			t.Fatalf("celebration %d went to %q, want the announce channel", i, channels[i])
+		}
 	}
 }

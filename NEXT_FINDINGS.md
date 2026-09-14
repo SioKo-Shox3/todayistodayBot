@@ -31,32 +31,6 @@ C3-07 で「当選者がいた回の繰り越し」は無くなったのに、�
 `seedJackpotLocked` の順序、残額の移送先、`Carryover = 0`、`LastDraw.Prize = paid`、表示側に旧繰り越しへの
 動作上の依存が無いこと、追加テストがトートロジーでないこと(mutation で落ちることまで確認済み)。
 
-## 反復 2 — 評価者(codex)の判定: NEEDS_WORK
-
-対象: C3-08 掲示できなかった回の当選を、次の掲示で取りこぼさない(所見 2)
-
-**[P2] 次の抽選が発生すると、未掲示の当選が上書きされます。** `done-when` の「前日分を次の掲示で取りこぼさない」が未達です。
-
-[announce.go:84](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce.go:84) の条件変更は指定どおりですが、その前の `ensureTodayRateLocked` が抽選を実行し、[store.go:1101](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store.go:1101) で `LastDraw` を置き換えます。
-
-再現手順（コード読解で確認、実行再現は未実施）:
-
-1. `LastAnnounced = 2026-09-12`。14日8時に復旧し、13日付の当選者u1を精算する。9時前なので掲示されない。
-2. 14日8時30分にu2が宝くじを購入する。
-3. 14日9時の収集で当日分が抽選され、`LastDraw` がu2に置き換わる。jobにはu2だけが入り、13日のu1は永久に失われる。
-
-[追加テスト](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce_test.go:841) は次回の購入券が空のケースに限定され、この経路を検証していません。
-
-修正候補は、未掲示の抽選結果を `LastDraw` とは別に永続保持し、送信成功した結果だけを消すことです。上記の購入を挟む回帰テストも追加してください。保存構造の変更には対象パスの拡張が必要です。
-
-保存された `verify-C3-08-{1,2,3,4}` と `recheck-C3-08-2-{1,2,3}` は実ファイルを確認し、すべて `exit=0`。旧条件へのmutationは追加テストが失敗して `exit=1`。実装変更は指定4ファイル内です。
-
-再検証できなかったコマンド（いずれも一時ディレクトリ作成時の `Access is denied`。合格には算入していません）:
-
-- `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
-- `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced" -count=1`
-- `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement" -count=1`
-
 ## 反復 3 — 評価者(codex)の判定: NEEDS_WORK
 
 対象: C3-09 「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す(所見 3)
@@ -75,3 +49,27 @@ C3-07 で「当選者がいた回の繰り越し」は無くなったのに、�
 - `go test ./internal/casino/... -run "TestLottery|TestNextRunAt|TestNextLotteryDraw|TestBuyLottery" -count=1`
 
 `go test ./... -count=1` は再実行せず、保存出力のみ確認しました。
+
+## 反復 2 — 評価者(codex)の判定: NEEDS_WORK
+
+対象: C3-11 ジャックポットのプールに上限を敷き、桁あふれを構造的に不可能にする(C3-07 の差し戻し)
+
+**[P2] プールに空きがあっても、桁あふれした賞金が消えます。** `done-when` の所見1の解消と「上限で入り切らない分だけが消える」を満たしません。[加算箇所](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store.go:1161)
+
+追加テストと同じ `Sales=100`、`Carryover=math.MaxInt64-40`、`Jackpot=5000`、当選者残高900で、コード読解とPythonの64ビット演算から以下を確認しました。
+
+- `LotteryPrize` の加算があふれ、賞金は `-9223372036854775759`。
+- 当選者への入金もプールへの入金も0。
+- `Carryover` と `Sales` は0になり、プールに空きがあるまま賞金・ハウス分が消失。
+
+[追加テスト](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store_test.go:2955)は、この状態を「プール5000のまま」として合格させています。
+
+最小修正候補は、賞金計算と残額の合算で桁あふれを防ぎ、口座・プールの空きへ配分してから超過分だけを捨てることです。同テストで当選者への入金とプールへの移送も検証してください。
+
+差分は許可範囲内です。証拠の `verify-C3-11-{1,2,3}.txt` と `recheck-C3-11-2-{1,2,3}.txt` は開いて確認し、すべて `exit=0`、全8パッケージ `ok` でした。
+
+再検証できなかったコマンド（すべて一時ディレクトリ作成時の `Access is denied`。合格には算入していません）:
+
+- `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
+- `go test ./internal/casino/... -run "TestJackpot|TestStore|TestLottery|TestSpin" -count=1`
+- `go test ./... -count=1`

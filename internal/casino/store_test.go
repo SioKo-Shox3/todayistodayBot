@@ -2999,6 +2999,10 @@ func TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult(t *testin
 		t.Fatalf("LastDraw = %+v, want the untouched %+v — a quiet day must not blank out the last real result",
 			quiet.Lottery.LastDraw, older)
 	}
+	// Nothing to announce: the queue is for draws that NAMED somebody.
+	if len(quiet.Lottery.Unannounced) != 0 {
+		t.Fatalf("Unannounced = %+v, want empty — a draw nobody entered has no winner to post", quiet.Lottery.Unannounced)
+	}
 
 	// The carryover now rides on the next draw that does have a buyer.
 	if _, err := st.BuyLotteryTickets(guildID, userID, 1, daysAfter(1)); err != nil {
@@ -3013,6 +3017,9 @@ func TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult(t *testin
 	want := LotteryDraw{Date: jstDate(daysAfter(2)), WinnerID: userID, Prize: wantPrize, TicketsSold: 1, Buyers: 1}
 	if paid.Lottery.LastDraw == nil || *paid.Lottery.LastDraw != want {
 		t.Fatalf("LastDraw = %+v, want %+v (the carryover must be part of the prize)", paid.Lottery.LastDraw, want)
+	}
+	if len(paid.Lottery.Unannounced) != 1 || paid.Lottery.Unannounced[0] != want {
+		t.Fatalf("Unannounced = %+v, want [%+v] — a paid draw is queued for the 9am posting", paid.Lottery.Unannounced, want)
 	}
 	if paid.Lottery.Carryover != 0 {
 		t.Fatalf("Carryover after a paid draw = %d, want 0 — it was handed to the winner", paid.Lottery.Carryover)
@@ -3458,5 +3465,52 @@ func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
 					view.UserTickets)
 			}
 		})
+	}
+}
+
+// TestLotteryDraw_UnannouncedQueueKeepsOnlyTheLatestSeven pins the bound on
+// the announcement backlog. A guild whose announce channel was deleted never
+// calls MarkAnnounced, so without the cap every draw it ever runs would stay
+// in casino.json forever. Overflow costs the ANNOUNCEMENT only — the prizes
+// below are already in the winners' accounts.
+func TestLotteryDraw_UnannouncedQueueKeepsOnlyTheLatestSeven(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID = "guild1"
+	// Nine purchases, one per day, each by a different buyer. The purchase on
+	// day n rolls over first, settling day n-1's single-buyer pot: day 0's
+	// draw finds an empty pot (no winner, nothing queued) and days 1..8 each
+	// name the previous day's buyer — eight queued draws for a cap of seven.
+	chips := map[string]int64{}
+	for day := 0; day <= 8; day++ {
+		chips[fmt.Sprintf("u%d", day)] = 1000
+	}
+	seedLotteryChips(t, st, guildID, chips)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0, 0, 0, 0, 0, 0, 0, 0}} // one buyer per draw
+
+	for day := 0; day <= 8; day++ {
+		if _, err := st.BuyLotteryTickets(guildID, fmt.Sprintf("u%d", day), 1, daysAfter(day)); err != nil {
+			t.Fatalf("BuyLotteryTickets on day %d: %v", day, err)
+		}
+	}
+
+	queue := readGuild(t, path, guildID).Lottery.Unannounced
+	// 7 is written out rather than read from lotteryUnannouncedLimit: the
+	// bound is the contract (設計書 §3「最大 7 件」), and a test that quotes
+	// the constant back to itself passes for any value somebody types there.
+	if len(queue) != 7 {
+		t.Fatalf("Unannounced holds %d draws, want 7: %+v", len(queue), queue)
+	}
+	// Eight draws ran (days 1..8); the oldest, day 1's, is the one dropped.
+	if got, want := queue[0].Date, jstDate(daysAfter(2)); got != want {
+		t.Fatalf("the queue starts at %s, want %s — the OLDEST entry must be the one dropped", got, want)
+	}
+	if got, want := queue[len(queue)-1].Date, jstDate(daysAfter(8)); got != want {
+		t.Fatalf("the queue ends at %s, want %s — the newest draw must always be kept", got, want)
+	}
+	for i, draw := range queue {
+		if draw.WinnerID != fmt.Sprintf("u%d", i+1) {
+			t.Fatalf("queue[%d] was won by %q, want u%d — the surviving entries are out of order: %+v",
+				i, draw.WinnerID, i+1, queue)
+		}
 	}
 }

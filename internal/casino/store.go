@@ -1159,8 +1159,21 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 	// pool still sitting at a pre-C-3a 0 from swallowing the cut when the
 	// raise to the seed happens after the addition rather than before.
 	creditJackpotCappedLocked(economy, house+(prize-paid))
-	lottery.LastDraw = &LotteryDraw{
+	draw := LotteryDraw{
 		Date: drawDate, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
+	}
+	lottery.LastDraw = &draw
+	// The announcement queue is APPENDED to, never overwritten: two draws can
+	// settle before either is posted (a bot down at 09:00 settles the missed
+	// day at startup, then settles the new one the next morning), and the
+	// first must not be lost. Only MarkAnnounced — i.e. a confirmed send —
+	// takes entries back out.
+	lottery.Unannounced = append(lottery.Unannounced, draw)
+	if n := len(lottery.Unannounced); n > lotteryUnannouncedLimit {
+		// Drop from the FRONT: the oldest announcement is the one least worth
+		// posting weeks late. Copying into the same backing array is safe
+		// because the destination index is always lower than the source.
+		lottery.Unannounced = append(lottery.Unannounced[:0], lottery.Unannounced[n-lotteryUnannouncedLimit:]...)
 	}
 	// Carryover belongs to the no-winner path alone: a draw that named a
 	// winner always reopens the pot empty.

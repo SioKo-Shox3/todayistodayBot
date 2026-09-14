@@ -20,19 +20,19 @@ type AnnouncementJob struct {
 	// seedJackpotLocked), so a guild that has never spun is shown the real
 	// JackpotSeed rather than a pool of 0.
 	JackpotPool int64
-	// LotteryDraw is the most recent settled draw that has NOT been announced
-	// yet (LastDraw.Date > LastAnnounced), or nil when there is no such draw.
+	// LotteryDraws is every settled draw still waiting to be announced,
+	// oldest first — Lottery.Unannounced as it stood at collection time. It
+	// is empty on a morning nobody entered, and holds more than one entry
+	// when an outage left an older draw unposted while the next morning's
+	// draw settled on top of it.
 	//
-	// The filter is "not yet announced" rather than "settled today" on
-	// purpose. A bot that is down at 09:00 and comes back up the next morning
-	// settles the missed day at startup, and a today-only filter would drop
-	// that winner on the floor — they would never be announced or celebrated
-	// at all. Comparing against LastAnnounced still stops a draw from being
-	// repeated: MarkAnnounced writes LastAnnounced only after a confirmed
-	// send, so a draw survives a failed send and is retired by a successful
-	// one. The date is therefore not necessarily yesterday's, which is why
-	// the embed prints LastDraw.Date instead of saying 「昨日」.
-	LotteryDraw *LotteryDraw
+	// The queue is the whole point: a single slot would let the second draw
+	// overwrite the first, and that winner would never be announced or
+	// celebrated at all. The dates are therefore not necessarily yesterday's,
+	// which is why the embed prints each draw's own Date instead of saying
+	// 「昨日」. Entries are retired by MarkAnnounced alone, which the
+	// scheduler calls only after a confirmed send.
+	LotteryDraws []LotteryDraw
 	// LotteryPrize / LotteryTickets describe the draw that is now OPEN (the
 	// one the readers can still buy into), read after the rollover cleared
 	// the settled pot — so they are today's fresh numbers, which for a guild
@@ -77,13 +77,14 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 				LotteryPrize:   prize,
 				LotteryTickets: sold,
 			}
-			// last.Date > LastAnnounced == "this draw has not been announced".
-			// Both are "YYYY-MM-DD", so the lexicographic order IS the
-			// chronological one, and the zero value "" (never announced)
-			// correctly sorts before every real date.
-			if last := economy.Lottery.LastDraw; last != nil && last.Date > economy.LastAnnounced {
-				draw := *last // copy: the Data behind the pointer is dropped with this Update
-				job.LotteryDraw = &draw
+			// Handed over whole, with no date filter of its own: the queue
+			// already IS the list of draws that have not been announced, and
+			// re-filtering it here by LastAnnounced would re-introduce the
+			// very assumption (one pending draw, dated after the last
+			// posting) the queue exists to break. Copied because the slice
+			// behind it belongs to the Data this Update is about to drop.
+			if pending := economy.Lottery.Unannounced; len(pending) > 0 {
+				job.LotteryDraws = append([]LotteryDraw(nil), pending...)
 			}
 			jobs = append(jobs, job)
 		}
@@ -92,12 +93,31 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 	return jobs, err
 }
 
-// MarkAnnounced records guildID as announced for `date`. Call ONLY after a
-// confirmed successful send — leave LastAnnounced untouched on failure so
-// tomorrow's 9am wake naturally retries (設計書: 送信失敗はログして継続).
+// MarkAnnounced records guildID as announced for `date` and retires every
+// lottery draw that posting covered. Call ONLY after a confirmed successful
+// send — leave both untouched on failure so tomorrow's 9am wake naturally
+// retries (設計書: 送信失敗はログして継続).
+//
+// The queue is pruned by `Date <= date` rather than emptied outright: a draw
+// that settled WHILE the message was in flight carries a later date and must
+// survive to be posted next time. Both sides are "YYYY-MM-DD", so the
+// lexicographic order is the calendar one.
 func (s *Store) MarkAnnounced(guildID, date string) error {
 	return s.Update(func(d *Data) error {
-		ensureGuildLocked(d, guildID).LastAnnounced = date
+		economy := ensureGuildLocked(d, guildID)
+		economy.LastAnnounced = date
+		lottery := &economy.Lottery
+		kept := lottery.Unannounced[:0]
+		for _, draw := range lottery.Unannounced {
+			if draw.Date > date {
+				kept = append(kept, draw)
+			}
+		}
+		if len(kept) == 0 {
+			lottery.Unannounced = nil // keep omitempty's promise: no empty array on disk
+		} else {
+			lottery.Unannounced = kept
+		}
 		return nil
 	})
 }

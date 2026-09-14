@@ -17,6 +17,13 @@ const (
 	LotteryDrawHourJST       int   = 9  // the draw runs at 09:00 JST, with the 9am announcement
 )
 
+// lotteryUnannouncedLimit caps Lottery.Unannounced. Seven is one week of
+// backlog — long enough that any outage a running bot recovers from keeps
+// every winner, short enough that a guild whose announce channel was deleted
+// cannot grow casino.json forever. Overflow costs the announcement only: the
+// prize was credited at draw time and /lottery status still shows LastDraw.
+const lotteryUnannouncedLimit = 7
+
 // lotteryDrawDate returns the JST calendar date of the most recent draw due
 // at or before t — t's own date from 09:00 JST onwards, the day BEFORE it
 // until then. The lottery is drawn at 09:00 (設計書 C-3a §3), not at

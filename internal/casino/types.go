@@ -72,6 +72,25 @@ type Lottery struct {
 	// keeps showing the last real result instead of blanking out on the first
 	// quiet day.
 	LastDraw *LotteryDraw `json:"last_draw,omitempty"`
+	// Unannounced is every drawn-with-a-winner result that the 9am posting
+	// has not delivered yet, oldest first. LastDraw answers 「直近の結果は」
+	// for /lottery status and is therefore a single slot; this queue answers
+	// 「まだ知らせていない回は」, which is NOT the same question. A bot that
+	// is down at 09:00 settles the missed day at startup and can settle the
+	// NEXT day before the posting goes out, and a single slot would let the
+	// second draw overwrite the first — the missed winner would never be
+	// announced or celebrated at all.
+	//
+	// Entries are appended by drawLotteryLocked and removed by MarkAnnounced,
+	// i.e. only by a CONFIRMED send: a failed posting leaves the queue intact
+	// and the next pass retries it. The length is capped at
+	// lotteryUnannouncedLimit so an announce channel that is broken for
+	// months cannot grow the file without bound — the prize was already paid
+	// at draw time, so a dropped entry costs the announcement, never chips.
+	//
+	// omitempty + a nil zero value is what makes a pre-C3-12 casino.json
+	// (which has no "unannounced" key) read back as an empty queue.
+	Unannounced []LotteryDraw `json:"unannounced,omitempty"`
 }
 
 // LotteryDraw is one completed draw's result, kept for the 9am announcement

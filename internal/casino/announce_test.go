@@ -775,8 +775,8 @@ func TestCollectDailyAnnouncements_CarriesTheMorningLotteryDraw(t *testing.T) {
 
 	job := jobs[0]
 	want := LotteryDraw{Date: announceDay, WinnerID: "u1", Prize: 90, TicketsSold: 2, Buyers: 1}
-	if job.LotteryDraw == nil || *job.LotteryDraw != want {
-		t.Fatalf("job.LotteryDraw = %+v, want %+v — the sweep must settle and report the morning's draw", job.LotteryDraw, want)
+	if len(job.LotteryDraws) != 1 || job.LotteryDraws[0] != want {
+		t.Fatalf("job.LotteryDraws = %+v, want exactly [%+v] — the sweep must settle and report the morning's draw", job.LotteryDraws, want)
 	}
 	if job.LotteryPrize != 0 || job.LotteryTickets != 0 {
 		t.Fatalf("job.LotteryPrize/LotteryTickets = %d/%d, want 0/0 — these describe the pot that is now OPEN, which the draw just emptied",
@@ -820,8 +820,8 @@ func TestCollectDailyAnnouncements_OmitsAnAlreadyAnnouncedDrawAndCarriesTheOpenP
 	}
 
 	job := jobs[0]
-	if job.LotteryDraw != nil {
-		t.Fatalf("job.LotteryDraw = %+v, want nil — the draw from %s was already announced", job.LotteryDraw, stale.Date)
+	if len(job.LotteryDraws) != 0 {
+		t.Fatalf("job.LotteryDraws = %+v, want empty — the draw from %s was already announced and is no longer queued", job.LotteryDraws, stale.Date)
 	}
 	if job.LotteryPrize != 590 || job.LotteryTickets != 2 {
 		t.Fatalf("job.LotteryPrize/LotteryTickets = %d/%d, want 590/2 (floor(100*90/100) + 500 carried over, 2 tickets)",
@@ -848,6 +848,7 @@ func TestCollectDailyAnnouncements_CarriesADrawTheOutageNeverAnnounced(t *testin
 		lottery := &ensureGuildLocked(d, "guild1").Lottery
 		lottery.DrawDate = announceDay // 7/10's draw ran; its announcement never did
 		lottery.LastDraw = &missed
+		lottery.Unannounced = []LotteryDraw{missed}
 		return nil
 	}); err != nil {
 		t.Fatalf("seeding the lottery state: %v", err)
@@ -860,9 +861,9 @@ func TestCollectDailyAnnouncements_CarriesADrawTheOutageNeverAnnounced(t *testin
 	if len(jobs) != 1 {
 		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
 	}
-	if jobs[0].LotteryDraw == nil || *jobs[0].LotteryDraw != missed {
-		t.Fatalf("job.LotteryDraw = %+v, want %+v — the draw the outage swallowed must still be announced",
-			jobs[0].LotteryDraw, missed)
+	if len(jobs[0].LotteryDraws) != 1 || jobs[0].LotteryDraws[0] != missed {
+		t.Fatalf("job.LotteryDraws = %+v, want exactly [%+v] — the draw the outage swallowed must still be announced",
+			jobs[0].LotteryDraws, missed)
 	}
 
 	// The send succeeds, so 7/11 becomes the last announced day. The morning
@@ -878,7 +879,127 @@ func TestCollectDailyAnnouncements_CarriesADrawTheOutageNeverAnnounced(t *testin
 	if len(jobs) != 1 {
 		t.Fatalf("got %d jobs on the following morning, want 1: %+v", len(jobs), jobs)
 	}
-	if jobs[0].LotteryDraw != nil {
-		t.Fatalf("job.LotteryDraw = %+v, want nil — an announced draw must not be announced twice", jobs[0].LotteryDraw)
+	if len(jobs[0].LotteryDraws) != 0 {
+		t.Fatalf("job.LotteryDraws = %+v, want empty — an announced draw must not be announced twice", jobs[0].LotteryDraws)
+	}
+}
+
+// TestCollectDailyAnnouncements_QueuesADrawThatSettlesOnTopOfAnUnpostedOne is
+// the regression for 反復 2 の指摘: a single LastDraw slot let the NEXT
+// morning's draw overwrite one that had never been posted, and that winner was
+// then lost for good. The sequence is the evaluator's: 7/10's draw settles
+// without an announcement, somebody buys into the new pot, and 7/11's sweep
+// settles a SECOND draw. Both must ride out on that morning's posting.
+func TestCollectDailyAnnouncements_QueuesADrawThatSettlesOnTopOfAnUnpostedOne(t *testing.T) {
+	st, _ := newTempStore(t)
+	// Two draws, one buyer each: PickLotteryWinner walks a one-entry
+	// cumulative sum, so roll 0 names that buyer both times.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0, 0}}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-07-09")
+
+	// u1 buys on 7/9, so the 7/10 09:00 draw is theirs.
+	if _, err := st.BuyLotteryTickets("guild1", "u1", 2, announceAt1000.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("BuyLotteryTickets(u1): %v", err)
+	}
+	// u2 buys at 7/10 10:00. The rollover inside the purchase settles 7/10's
+	// draw (u1 wins) — and nothing announces it, exactly as an outage at
+	// 09:00 leaves things. u2's tickets join the 7/11 pot.
+	if _, err := st.BuyLotteryTickets("guild1", "u2", 2, announceAt1000); err != nil {
+		t.Fatalf("BuyLotteryTickets(u2): %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(announceNextDay900)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+
+	want := []LotteryDraw{
+		{Date: announceDay, WinnerID: "u1", Prize: 90, TicketsSold: 2, Buyers: 1},
+		{Date: jstDate(announceNextDay900), WinnerID: "u2", Prize: 90, TicketsSold: 2, Buyers: 1},
+	}
+	got := jobs[0].LotteryDraws
+	if len(got) != len(want) {
+		t.Fatalf("job.LotteryDraws = %+v, want %+v — the unposted 7/10 winner must not be overwritten by 7/11's draw", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("job.LotteryDraws[%d] = %+v, want %+v (whole queue: %+v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestCollectDailyAnnouncements_KeepsTheQueueUntilASendSucceeds pins the
+// retry: the queue is emptied by MarkAnnounced alone, so a posting that failed
+// (the scheduler skips MarkAnnounced then) leaves every draw in place for the
+// next pass to carry.
+func TestCollectDailyAnnouncements_KeepsTheQueueUntilASendSucceeds(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-07-09")
+	missed := LotteryDraw{Date: announceDay, WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, "guild1").Lottery
+		lottery.DrawDate = announceDay
+		lottery.LastDraw = &missed
+		lottery.Unannounced = []LotteryDraw{missed}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the lottery state: %v", err)
+	}
+
+	// Pass 1: the job carries the draw, but the send fails — no MarkAnnounced.
+	jobs, err := st.collectDailyAnnouncements(announceNextDay900)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 || len(jobs[0].LotteryDraws) != 1 {
+		t.Fatalf("first pass: %+v, want one job carrying one draw", jobs)
+	}
+
+	// Pass 2, the following morning: the same draw is still owed.
+	jobs, err = st.collectDailyAnnouncements(time.Date(2026, 7, 12, 9, 0, 0, 0, jst))
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs on the following morning, want 1: %+v", len(jobs), jobs)
+	}
+	if len(jobs[0].LotteryDraws) != 1 || jobs[0].LotteryDraws[0] != missed {
+		t.Fatalf("job.LotteryDraws = %+v, want [%+v] — a failed send must not retire a draw", jobs[0].LotteryDraws, missed)
+	}
+}
+
+// TestMarkAnnounced_RetiresThePostedDrawsAndKeepsLaterOnes covers both halves
+// of the prune. Draws dated on or before the posted date were in the message
+// that just went out; a draw dated AFTER it settled while that message was in
+// flight and has never been shown to anybody.
+func TestMarkAnnounced_RetiresThePostedDrawsAndKeepsLaterOnes(t *testing.T) {
+	st, path := newTempStore(t)
+	queued := []LotteryDraw{
+		{Date: "2026-07-10", WinnerID: "u1", Prize: 90, TicketsSold: 2, Buyers: 1},
+		{Date: "2026-07-11", WinnerID: "u2", Prize: 180, TicketsSold: 4, Buyers: 2},
+		{Date: "2026-07-12", WinnerID: "u3", Prize: 270, TicketsSold: 6, Buyers: 3},
+	}
+	if err := st.Update(func(d *Data) error {
+		ensureGuildLocked(d, "guild1").Lottery.Unannounced = append([]LotteryDraw(nil), queued...)
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the queue: %v", err)
+	}
+
+	if err := st.MarkAnnounced("guild1", "2026-07-11"); err != nil {
+		t.Fatalf("MarkAnnounced: %v", err)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	got := economy.Lottery.Unannounced
+	if len(got) != 1 || got[0] != queued[2] {
+		t.Fatalf("Unannounced = %+v, want [%+v] — only the draws that posting covered are retired", got, queued[2])
+	}
+	if economy.LastAnnounced != "2026-07-11" {
+		t.Fatalf("LastAnnounced = %q, want 2026-07-11", economy.LastAnnounced)
 	}
 }
