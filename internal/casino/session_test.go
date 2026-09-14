@@ -443,3 +443,97 @@ var (
 	_ AutoResolver = (*HighLowGame)(nil)
 	_ AutoResolver = (*BlackjackGame)(nil)
 )
+
+// --- 評価者の指摘(反復 1): 操作中の盤面は掃除しない -----------------------
+
+// A press cannot hold the manager's lock across the disk I/O its move needs
+// (Store.AddToEscrow for the ⏫ double), and LastActionAt is only refreshed
+// when WithSession returns. Hold is what keeps the sweeper off the board in
+// between, so the press — not the sweeper — settles the stake it just took.
+func TestSessionSweepSkipsAHeldBoard(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	held, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("opening the held board: %v", err)
+	}
+	idle, err := m.Open("guild-1", "user-2", GameBlackjack, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("opening the idle board: %v", err)
+	}
+
+	copied, ok := m.Hold(held.ID)
+	if !ok {
+		t.Fatal("Hold refused a live board")
+	}
+	if copied.ID != held.ID || copied.UserID != "user-1" {
+		t.Errorf("Hold returned %+v, want the bookkeeping copy of the held board", copied)
+	}
+
+	clock.advance(time.Minute)
+	expired := m.Sweep(clock.Now())
+
+	if len(expired) != 1 || expired[0].ID != idle.ID {
+		t.Fatalf("Sweep returned %d board(s), want only the unheld one", len(expired))
+	}
+	if _, live := m.Get(held.ID); !live {
+		t.Error("the held board was swept away from the press that holds it")
+	}
+
+	// Released and still idle: the next pass takes it. A hold that outlived
+	// its press would strand the board until the next restart.
+	m.Release(held.ID)
+	if expired := m.Sweep(clock.Now()); len(expired) != 1 || expired[0].ID != held.ID {
+		t.Fatalf("after Release, Sweep returned %d board(s), want the formerly held one", len(expired))
+	}
+}
+
+// Hold is the caller's "is this board still there?" as well as its guard, so
+// a board that is already gone must refuse it rather than hand back a zero
+// session the press would then work on.
+func TestSessionHoldRefusesAGoneBoard(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	session, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !m.Close(session.ID) {
+		t.Fatal("Close did not remove a live board")
+	}
+
+	if _, ok := m.Hold(session.ID); ok {
+		t.Error("Hold accepted a board that is already gone")
+	}
+	m.Release(session.ID) // must not panic: the counter went with the board
+}
+
+// Two presses can be in flight on different boards at once, and each must
+// hold only its own. The counter also has to survive nesting: one board held
+// twice stays out of the sweep until BOTH holds end.
+func TestSessionHoldCountsEveryOperation(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	session, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok := m.Hold(session.ID); !ok {
+			t.Fatalf("Hold %d refused a live board", i+1)
+		}
+	}
+	clock.advance(time.Minute)
+
+	m.Release(session.ID)
+	if expired := m.Sweep(clock.Now()); len(expired) != 0 {
+		t.Fatalf("Sweep took a board that is still held once (%d returned)", len(expired))
+	}
+	m.Release(session.ID)
+	if expired := m.Sweep(clock.Now()); len(expired) != 1 {
+		t.Fatalf("Sweep returned %d board(s) after the last Release, want 1", len(expired))
+	}
+}

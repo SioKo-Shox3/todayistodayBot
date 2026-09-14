@@ -59,6 +59,12 @@ type Session struct {
 	State        any
 	LastActionAt time.Time
 	Ref          MessageRef
+
+	// busy counts the operations currently running on this board (Hold /
+	// Release). Guarded by the manager's mutex like every other mutable
+	// field, and deliberately unexported: it is the manager's bookkeeping,
+	// not part of the board a caller reads out of Get.
+	busy int
 }
 
 // AutoResolver is the single method the sweeper needs from a game board:
@@ -224,6 +230,45 @@ func (m *SessionManager) WithSession(id string, fn func(*Session) (done bool, er
 	return nil
 }
 
+// Hold marks a board as being operated on and returns the same bookkeeping
+// copy Get does. It is the other half of "a press and the sweeper must not
+// both own one board": Sweep skips a held board entirely, so the gaps a
+// press unavoidably leaves outside the manager's lock — the ⏫ double stakes
+// its second bet with Store.AddToEscrow, which is disk I/O and therefore
+// forbidden inside WithSession — can no longer be swept into an auto-resolve
+// that settles the smaller hand and drops the extra stake.
+//
+// The deadline test and the removal both happen under mu, and so does this,
+// so a Hold that succeeds cannot be raced by the sweep that was about to
+// take the board. false means the board is already gone (settled, swept, or
+// lost to a restart) and the caller must answer "この盤面はもう終了しています".
+//
+// Every successful Hold must be paired with Release, normally via defer.
+func (m *SessionManager) Hold(id string) (Session, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[id]
+	if !ok {
+		return Session{}, false
+	}
+	session.busy++
+	return *session, true
+}
+
+// Release ends the operation a successful Hold started. A board that the
+// press itself finished is already out of the maps, and its counter goes
+// with it — IDs are 16 random bytes, so the lookup below cannot land on a
+// different board.
+func (m *SessionManager) Release(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if session, ok := m.sessions[id]; ok && session.busy > 0 {
+		session.busy--
+	}
+}
+
 // Touch extends a session's life without changing the board — for the
 // interactions that redraw a message but take no game action. Unknown IDs
 // are ignored (the session may have just been settled).
@@ -236,7 +281,8 @@ func (m *SessionManager) Touch(id string, now time.Time) {
 	}
 }
 
-// Sweep removes every session idle for longer than the TTL and returns them.
+// Sweep removes every session idle for longer than the TTL, EXCEPT the ones a
+// press is holding (Hold), and returns them.
 // Removal happens inside the same critical section as the deadline test, so
 // a session is handed to exactly one caller, once: the sweep goroutine can
 // settle it (AutoResolve → SettleGame → edit the message) outside the lock
@@ -251,6 +297,13 @@ func (m *SessionManager) Sweep(now time.Time) []*Session {
 
 	var expired []*Session
 	for _, session := range m.sessions {
+		if session.busy > 0 {
+			// A press owns this board right now. Its LastActionAt is only
+			// refreshed when WithSession returns, so the board can look idle
+			// in the middle of an operation — sweeping it there would settle
+			// a hand the press is still adding chips to.
+			continue
+		}
 		if now.Sub(session.LastActionAt) >= m.ttl {
 			expired = append(expired, session)
 		}

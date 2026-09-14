@@ -766,6 +766,11 @@ type flakyBank struct {
 	*casino.Store
 	settleErr error
 	settles   int
+	// afterAddToEscrow runs once, immediately after a stake has landed on
+	// disk. That is the gap 反復 1 の指摘 2 names — AddToEscrow is disk I/O, so
+	// it cannot run inside WithSession — and this is how a test gets to act
+	// inside it (drive a sweep) instead of hoping to hit it by timing.
+	afterAddToEscrow func()
 }
 
 func (b *flakyBank) SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error) {
@@ -774,6 +779,17 @@ func (b *flakyBank) SettleGame(guildID, userID string, payout int64) (casino.Set
 		return casino.SettleResult{}, b.settleErr
 	}
 	return b.Store.SettleGame(guildID, userID, payout)
+}
+
+func (b *flakyBank) AddToEscrow(guildID, userID string, amount int64) error {
+	if err := b.Store.AddToEscrow(guildID, userID, amount); err != nil {
+		return err
+	}
+	if hook := b.afterAddToEscrow; hook != nil {
+		b.afterAddToEscrow = nil // once — the hook must not re-enter its own stake
+		hook()
+	}
+	return nil
 }
 
 // newHighLowCommandOnBank is newHighLowCommandForTest with a store the test

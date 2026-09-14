@@ -487,10 +487,18 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 		return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseUpdateMessage)
 	}
 
-	session, ok := c.sessions.Get(sessionID)
+	// Hold, not Get: the board lock above serializes PRESSES, but the idle
+	// sweeper does not take it. ⏫ stakes its second bet with AddToEscrow —
+	// disk I/O, so it cannot run inside WithSession — and a sweep landing in
+	// that gap would auto-resolve the 100-chip hand while 200 sit in escrow.
+	// Hold marks the board busy under the manager's own lock, which is the
+	// lock Sweep's deadline test takes (反復 1 の指摘 2).
+	session, ok := c.sessions.Hold(sessionID)
 	if !ok {
 		return respondVia(r, i.Interaction, ephemeralResponse(blackjackSessionOverMessage))
 	}
+	defer c.sessions.Release(sessionID)
+
 	if msg := requireSessionOwner(i, session.UserID); msg != "" {
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}

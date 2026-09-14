@@ -804,3 +804,59 @@ func TestBlackjackDoesNotCloseAHandWhileADoubleIsBeingStaked(t *testing.T) {
 		t.Errorf("SettleGame was called %d times, want 1: the hand pays once and the start path refunds nothing it no longer owns", bank.settles)
 	}
 }
+
+// --- 評価者の指摘(反復 1)-------------------------------------------------
+
+// ⏫ ダブル stakes the second bet OUTSIDE the manager's lock (AddToEscrow is
+// disk I/O), and the sweeper does not take the per-board lock that serializes
+// presses. Before Hold, a sweep landing in that gap auto-stood a 100-chip hand
+// while 200 chips sat in escrow: the extra stake vanished with the settlement
+// and the press that staked it came back "この盤面はもう終了しています".
+//
+// The hook fires exactly in that gap, which is why this is a regression test
+// and not a hopeful race.
+func TestBlackjackDoubleIsNotSweptBetweenTheStakeAndTheHand(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a playable hand that can double", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying && g.CanDouble()
+	})
+	c, bank := newBlackjackCommandForTest(t, seed)
+	r := &fakeCasinoResponder{}
+	sessionID := startBlackjack(t, c, r, 100)
+
+	editor := newRecordingEditor()
+	swept := 0
+	bank.afterAddToEscrow = func() {
+		// Every board is now three minutes idle by the sweeper's clock.
+		before := c.sessions.Len()
+		sweepIdleBoards(editor, c.sessions, bank, time.Now().Add(casino.DefaultSessionTTL))
+		swept = before - c.sessions.Len()
+	}
+
+	resp := c.press(t, r, sessionID, blackjackActionDouble)
+
+	if swept != 0 {
+		t.Errorf("the sweeper took %d board(s) out from under a press, want 0", swept)
+	}
+	editor.idle(t)
+	if bank.settles != 1 {
+		t.Errorf("SettleGame was called %d times, want exactly 1 (the press's own settlement)", bank.settles)
+	}
+	if body := blackjackBodyOf(t, resp); strings.Contains(body, blackjackSessionOverMessage) {
+		t.Errorf("the press that staked the double was answered as a dead board: %q", body)
+	}
+
+	want := blackjackProbe(100, seed)
+	if _, err := want.Double(); err != nil {
+		t.Fatalf("probing the double: %v", err)
+	}
+	view, err := bank.ViewAccount("g1", "u1", time.Now())
+	if err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+	if view.Account.Escrow != 0 {
+		t.Errorf("escrow is %d, want 0 — the doubled stake must be settled, not stranded", view.Account.Escrow)
+	}
+	if wantChips := int64(1000) - 200 + want.Settle(); view.Account.Chips != wantChips {
+		t.Errorf("chips: got %d, want %d (1000 - ダブルで200 + 配当%d)", view.Account.Chips, wantChips, want.Settle())
+	}
+}

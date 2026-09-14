@@ -428,10 +428,17 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		return c.settle(r, i, sessionID, lock, pending)
 	}
 
-	session, ok := c.sessions.Get(sessionID)
+	// Hold, not Get: the board lock above serializes PRESSES, but the idle
+	// sweeper does not take it, and LastActionAt is only refreshed when
+	// WithSession returns. Holding the board under the manager's own lock —
+	// the lock Sweep's deadline test takes — keeps a sweep from settling a
+	// board this press is still working on (反復 1 の指摘 2).
+	session, ok := c.sessions.Hold(sessionID)
 	if !ok {
 		return respondVia(r, i.Interaction, ephemeralResponse(highLowSessionOverMessage))
 	}
+	defer c.sessions.Release(sessionID)
+
 	if msg := requireSessionOwner(i, session.UserID); msg != "" {
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
