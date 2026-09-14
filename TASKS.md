@@ -166,3 +166,11 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/casino/... -run "TestHighLow" -count=1`
 - paths: README.md, internal/casino/highlow_test.go, Docs/superpowers/specs/2026-09-14-casino-c2-design.md
 - notes: 倍率式は変えない(仕様)。README は公開物 — 過程を書かない。
+
+## C2-14: 精算失敗の契約(手動再試行)を設計書へ明記する(反復 3 の評価者指摘)
+- status: todo
+- done-when: `Docs/superpowers/specs/2026-09-14-casino-c2-design.md` §9 に「決着した盤面は `WithSession(done=true)` でセッションから外れるため掃除人は二度と見ない。精算が拒まれたときの案内は `casinoSettleFailedMessage`(手動の 🔁 再試行)で、自動の再精算は次回起動の `RefundStaleEscrows` だけ」を書く — C2-12 の done-when が求めた「次回の自動処理で精算されます」は待てば済むという嘘になるため採らない、という判断を正本に残す。案内文が `Data.Content` ごと固定されていることを `highlow_test.go` / `blackjack_test.go` の既存テストで確認し、足りなければ足す。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestHighLow|TestBlackjack|TestSweepIdleBoards" -count=1`
+- paths: Docs/superpowers/specs/2026-09-14-casino-c2-design.md, internal/commands/highlow_test.go, internal/commands/blackjack_test.go
+- notes: 評価者の 2 点目(`casinoPayoutLine` を `casino_sessions.go` へ移す)は採らない — この関数は `highlow.go` / `blackjack.go` / `casino_sessions.go` の 3 か所から呼ばれる共有ヘルパで、`casino_shared.go` が置き場として正しい。C2-12 が `paths:` の外へ 1 関数はみ出した事実は記録として残す。
