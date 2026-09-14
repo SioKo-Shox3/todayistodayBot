@@ -39,6 +39,18 @@ func (e *ErrInsufficientChips) Error() string {
 	return fmt.Sprintf("casino: insufficient chips (balance=%d)", e.Balance)
 }
 
+// ErrLotteryLimit is returned when a purchase would take the buyer past the
+// per-draw ticket cap (LotteryMaxTicketsPerDraw). It carries the headroom
+// that is actually left so the command layer can render
+// "❌ 1 回の抽選で買えるのは 10 枚までです(あと N 枚)" without a second
+// store round-trip — same shape, and same reason, as ErrInsufficientChips.
+// Remaining is never negative: a hand-edited holding above the cap reports 0.
+type ErrLotteryLimit struct{ Remaining int }
+
+func (e *ErrLotteryLimit) Error() string {
+	return fmt.Sprintf("casino: lottery ticket cap reached (remaining=%d)", e.Remaining)
+}
+
 // ErrInsufficientCoins mirrors ErrInsufficientChips for coin→chip exchange.
 type ErrInsufficientCoins struct{ Balance int64 }
 

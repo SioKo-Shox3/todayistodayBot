@@ -44,7 +44,45 @@ type GuildEconomy struct {
 	LastAnnounced     string                  `json:"last_announced"` // JST calendar date "2026-07-10"
 	Jackpot           int64                   `json:"jackpot"`        // slot jackpot pool in chips; >= JackpotSeed once seeded
 	JackpotAccum      int64                   `json:"jackpot_accum"`  // carry of the 2% accrual, in 1/100 chips; always [0, 100)
+	Lottery           Lottery                 `json:"lottery"`        // the daily 9:00 JST draw's pot (設計書 C-3a §3)
 	Users             map[string]*UserAccount `json:"users"`
+}
+
+// Lottery is one guild's daily-draw state: the pot being sold into right
+// now, plus when it was last drawn and what that draw produced.
+//
+// It is a VALUE, not a pointer: a nil *Lottery would have to be repaired at
+// every one of the read paths that touch it (every command goes through the
+// daily rollover), and a pre-C-3a data/casino.json — which has no "lottery"
+// key at all — unmarshals to exactly the right zero: DrawDate "" (never
+// drawn), no tickets, no sales, no carryover. The first rollover after the
+// upgrade therefore performs a buyer-less draw that only stamps DrawDate,
+// which is the intended behaviour, not a migration step.
+//
+// Tickets is nil until someone buys; every reader must treat a nil map as
+// "no buyers" rather than indexing a repaired copy (reading a nil map is
+// legal in Go — only assignment panics, and only BuyLotteryTickets assigns).
+type Lottery struct {
+	DrawDate  string         `json:"draw_date"` // JST date of the last draw; "" = never drawn
+	Tickets   map[string]int `json:"tickets"`   // userID -> tickets held for the NEXT draw
+	Sales     int64          `json:"sales"`     // chips taken in for the NEXT draw
+	Carryover int64          `json:"carryover"` // prize rolled forward from draws nobody entered
+	// LastDraw is the most recent draw that actually had a winner — it is
+	// omitempty and left untouched by a buyer-less draw, so /lottery status
+	// keeps showing the last real result instead of blanking out on the first
+	// quiet day.
+	LastDraw *LotteryDraw `json:"last_draw,omitempty"`
+}
+
+// LotteryDraw is one completed draw's result, kept for the 9am announcement
+// and /lottery status. Prize is what the winner was actually CREDITED, which
+// is the number both of those render.
+type LotteryDraw struct {
+	Date        string `json:"date"` // JST date the draw ran
+	WinnerID    string `json:"winner_id"`
+	Prize       int64  `json:"prize"`
+	TicketsSold int    `json:"tickets_sold"`
+	Buyers      int    `json:"buyers"`
 }
 
 // DailyRate is one JST calendar day's coin<->chip exchange rate, together

@@ -2630,3 +2630,415 @@ func TestStore_Spin_ConservesChipsAndPool(t *testing.T) {
 			gotUnits, wantUnits)
 	}
 }
+
+// --- the daily lottery (設計書 C-3a §3) -----------------------------------
+
+// seedLotteryChips gives every named user in guildID a known chip balance,
+// creating the guild and the accounts. Balances are written directly rather
+// than through the credit helpers so a test can start from any figure.
+func seedLotteryChips(t *testing.T, st *Store, guildID string, chips map[string]int64) {
+	t.Helper()
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		for userID, amount := range chips {
+			ensureAccountLocked(economy, userID).Chips = amount
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding lottery chips for %s: %v", guildID, err)
+	}
+}
+
+// totalChips sums every account's chips in one guild — the left-hand side of
+// the lottery's conservation law.
+func totalChips(economy GuildEconomy) int64 {
+	var total int64
+	for _, account := range economy.Users {
+		total += account.Chips
+	}
+	return total
+}
+
+// TestBuyLotteryTickets_RefusesBeyondThePerDrawCap pins the CUMULATIVE cap:
+// 10 tickets per buyer per draw, whatever mix of calls they arrive in. The
+// refusal must persist nothing at all — a purchase that eats chips without
+// handing out tickets is the worst failure this method can have.
+func TestBuyLotteryTickets_RefusesBeyondThePerDrawCap(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5} // no draw may happen: any Intn fails the test
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+
+	first, err := st.BuyLotteryTickets(guildID, userID, 6, fixedNow)
+	if err != nil {
+		t.Fatalf("first BuyLotteryTickets(6) returned error: %v", err)
+	}
+	if first.UserTickets != 6 || first.Cost != 300 || first.Balance != 700 {
+		t.Fatalf("first purchase = %+v, want UserTickets=6 Cost=300 Balance=700", first)
+	}
+
+	var limit *ErrLotteryLimit
+	_, err = st.BuyLotteryTickets(guildID, userID, 5, fixedNow)
+	if !errors.As(err, &limit) {
+		t.Fatalf("BuyLotteryTickets(5) on top of 6 returned %v, want *ErrLotteryLimit", err)
+	}
+	if limit.Remaining != 4 {
+		t.Fatalf("ErrLotteryLimit.Remaining = %d, want 4 (10 - 6 already held)", limit.Remaining)
+	}
+
+	refused := readGuild(t, path, guildID)
+	if refused.Lottery.Sales != 300 || refused.Lottery.Tickets[userID] != 6 || refused.Users[userID].Chips != 700 {
+		t.Fatalf("the refused purchase was persisted: Sales=%d Tickets[%s]=%d Chips=%d, want 300/6/700",
+			refused.Lottery.Sales, userID, refused.Lottery.Tickets[userID], refused.Users[userID].Chips)
+	}
+
+	// Exactly filling the cap is allowed; one more ticket is not, and the
+	// headroom reported is 0 rather than a negative number.
+	if _, err := st.BuyLotteryTickets(guildID, userID, 4, fixedNow); err != nil {
+		t.Fatalf("BuyLotteryTickets(4) filling the cap returned error: %v", err)
+	}
+	_, err = st.BuyLotteryTickets(guildID, userID, 1, fixedNow)
+	if !errors.As(err, &limit) || limit.Remaining != 0 {
+		t.Fatalf("BuyLotteryTickets(1) at the cap returned %v (Remaining=%d), want *ErrLotteryLimit with Remaining=0", err, limit.Remaining)
+	}
+
+	// A single oversized call is the same violation, reported the same way:
+	// the cap is on the HOLDING, so it needs no separate per-call check.
+	fresh, _ := newTempStore(t)
+	fresh.rng = &lotteryRand{t: t, float: 0.5}
+	seedLotteryChips(t, fresh, guildID, map[string]int64{userID: 1000})
+	_, err = fresh.BuyLotteryTickets(guildID, userID, 11, fixedNow)
+	if !errors.As(err, &limit) || limit.Remaining != LotteryMaxTicketsPerDraw {
+		t.Fatalf("BuyLotteryTickets(11) from nothing returned %v (Remaining=%d), want *ErrLotteryLimit with Remaining=%d",
+			err, limit.Remaining, LotteryMaxTicketsPerDraw)
+	}
+	if _, err := fresh.BuyLotteryTickets(guildID, userID, 0, fixedNow); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("BuyLotteryTickets(0) returned %v, want ErrInvalidAmount", err)
+	}
+}
+
+// TestBuyLotteryTickets_RefusesAndPersistsNothingWhenChipsAreShort is the
+// other refusal: the balance check must leave the pot and the balance exactly
+// where they were, so a short buyer can retry after /daily.
+func TestBuyLotteryTickets_RefusesAndPersistsNothingWhenChipsAreShort(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 49}) // one chip short of a ticket
+
+	var short *ErrInsufficientChips
+	_, err := st.BuyLotteryTickets(guildID, userID, 1, fixedNow)
+	if !errors.As(err, &short) {
+		t.Fatalf("BuyLotteryTickets with 49 chips returned %v, want *ErrInsufficientChips", err)
+	}
+	if short.Balance != 49 {
+		t.Fatalf("ErrInsufficientChips.Balance = %d, want 49", short.Balance)
+	}
+
+	after := readGuild(t, path, guildID)
+	if after.Users[userID].Chips != 49 || after.Lottery.Sales != 0 || len(after.Lottery.Tickets) != 0 {
+		t.Fatalf("the refused purchase was persisted: Chips=%d Sales=%d Tickets=%v, want 49/0/empty",
+			after.Users[userID].Chips, after.Lottery.Sales, after.Lottery.Tickets)
+	}
+}
+
+// TestLotteryDraw_PaysTheWinnerFeedsTheJackpotAndConservesChips is the
+// conservation law of 設計書 C-3a §3, checked end to end across one draw:
+// the buyers' chips fall by exactly the sales, the winner's rise by exactly
+// the prize, and the jackpot pool rises by exactly the house's cut. Nothing
+// is created and nothing is destroyed.
+func TestLotteryDraw_PaysTheWinnerFeedsTheJackpotAndConservesChips(t *testing.T) {
+	st, path := newTempStore(t)
+	// Roll 5 falls in u3's range (u1 [0,1), u2 [1,4), u3 [4,10)).
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{5}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 1000, "u2": 1000, "u3": 1000})
+
+	for userID, count := range map[string]int{"u1": 1, "u2": 3, "u3": 6} {
+		if _, err := st.BuyLotteryTickets(guildID, userID, count, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets(%s, %d): %v", userID, count, err)
+		}
+	}
+
+	sold := readGuild(t, path, guildID)
+	const wantSales = int64(500) // 10 tickets * 50 chips
+	if sold.Lottery.Sales != wantSales {
+		t.Fatalf("Sales after 10 tickets = %d, want %d", sold.Lottery.Sales, wantSales)
+	}
+	if got := totalChips(sold); got != 3000-wantSales {
+		t.Fatalf("chips after the purchases = %d, want %d (3000 - sales): the debit does not match the sales",
+			got, 3000-wantSales)
+	}
+	jackpotBefore := sold.Jackpot
+
+	// The next day's first touch rolls the draw over.
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate: %v", err)
+	}
+
+	drawn := readGuild(t, path, guildID)
+	const wantPrize, wantHouse = int64(450), int64(50)
+	if got := drawn.Users["u3"].Chips - sold.Users["u3"].Chips; got != wantPrize {
+		t.Fatalf("winner u3 gained %d chips, want %d (= floor(500*90/100) + 0 carryover)", got, wantPrize)
+	}
+	for _, loser := range []string{"u1", "u2"} {
+		if drawn.Users[loser].Chips != sold.Users[loser].Chips {
+			t.Fatalf("%s's chips moved from %d to %d — only the winner is paid",
+				loser, sold.Users[loser].Chips, drawn.Users[loser].Chips)
+		}
+	}
+	if got := drawn.Jackpot - jackpotBefore; got != wantHouse {
+		t.Fatalf("the jackpot pool gained %d, want %d (= sales - floor(sales*90/100)): the house's cut is not reaching the pool",
+			got, wantHouse)
+	}
+	if got := totalChips(drawn); got != 3000-wantSales+wantPrize {
+		t.Fatalf("chips after the draw = %d, want %d (= start - sales + prize)", got, 3000-wantSales+wantPrize)
+	}
+
+	day1 := jstDate(daysAfter(1))
+	if drawn.Lottery.DrawDate != day1 || drawn.Lottery.Sales != 0 || len(drawn.Lottery.Tickets) != 0 || drawn.Lottery.Carryover != 0 {
+		t.Fatalf("the pot was not reopened empty: %+v (want DrawDate=%s, Sales=0, no tickets, Carryover=0)", drawn.Lottery, day1)
+	}
+	want := LotteryDraw{Date: day1, WinnerID: "u3", Prize: wantPrize, TicketsSold: 10, Buyers: 3}
+	if drawn.Lottery.LastDraw == nil || *drawn.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw = %+v, want %+v", drawn.Lottery.LastDraw, want)
+	}
+}
+
+// TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult covers
+// the quiet day: no ticket was sold, so no winner is named, the pot rolls
+// forward whole, and — the part that is easy to get wrong — the previous
+// real result is NOT overwritten, so /lottery status still has something to
+// show. The carryover must then land in the next draw that does have buyers.
+func TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult(t *testing.T) {
+	st, path := newTempStore(t)
+	// One roll only: it belongs to the day-2 draw. A draw on the buyer-less
+	// day 1 would consume it and fail the test.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+
+	older := LotteryDraw{Date: "2026-07-01", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, guildID).Lottery
+		lottery.Carryover, lottery.DrawDate, lottery.LastDraw = 300, jstDate(fixedNow), &older
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the carryover: %v", err)
+	}
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate on the buyer-less day: %v", err)
+	}
+
+	quiet := readGuild(t, path, guildID)
+	if quiet.Lottery.Carryover != 300 {
+		t.Fatalf("Carryover after a buyer-less draw = %d, want 300 (the whole prize rolls forward)", quiet.Lottery.Carryover)
+	}
+	if quiet.Lottery.DrawDate != jstDate(daysAfter(1)) {
+		t.Fatalf("DrawDate = %q, want %q — an empty draw must still stamp the day, or it retries all day",
+			quiet.Lottery.DrawDate, jstDate(daysAfter(1)))
+	}
+	if quiet.Lottery.LastDraw == nil || *quiet.Lottery.LastDraw != older {
+		t.Fatalf("LastDraw = %+v, want the untouched %+v — a quiet day must not blank out the last real result",
+			quiet.Lottery.LastDraw, older)
+	}
+
+	// The carryover now rides on the next draw that does have a buyer.
+	if _, err := st.BuyLotteryTickets(guildID, userID, 1, daysAfter(1)); err != nil {
+		t.Fatalf("BuyLotteryTickets on day 1: %v", err)
+	}
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(2)); err != nil {
+		t.Fatalf("EnsureTodayRate on day 2: %v", err)
+	}
+
+	paid := readGuild(t, path, guildID)
+	const wantPrize = int64(345) // floor(50*90/100)=45, plus the 300 carried over
+	want := LotteryDraw{Date: jstDate(daysAfter(2)), WinnerID: userID, Prize: wantPrize, TicketsSold: 1, Buyers: 1}
+	if paid.Lottery.LastDraw == nil || *paid.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw = %+v, want %+v (the carryover must be part of the prize)", paid.Lottery.LastDraw, want)
+	}
+	if paid.Lottery.Carryover != 0 {
+		t.Fatalf("Carryover after a paid draw = %d, want 0 — it was handed to the winner", paid.Lottery.Carryover)
+	}
+	// 1000 - 50 spent + 345 won.
+	if got := paid.Users[userID].Chips; got != 1295 {
+		t.Fatalf("buyer's chips = %d, want 1295 (1000 - 50 + 345)", got)
+	}
+}
+
+// TestLotteryDraw_RunsAtMostOncePerDay is the double-payout regression. Every
+// command goes through the rollover, so the guard has to hold across repeated
+// touches of any kind — and across a clock that moves BACKWARDS, which is why
+// the date comparison is `<` and not `!=`.
+func TestLotteryDraw_RunsAtMostOncePerDay(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}} // exactly one draw is allowed
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+	if _, err := st.BuyLotteryTickets(guildID, userID, 2, fixedNow); err != nil {
+		t.Fatalf("BuyLotteryTickets: %v", err)
+	}
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("first EnsureTodayRate: %v", err)
+	}
+	drawn := readGuild(t, path, guildID)
+	if drawn.Lottery.LastDraw == nil {
+		t.Fatalf("no draw happened on the new day: %+v", drawn.Lottery)
+	}
+	wonChips := drawn.Users[userID].Chips
+
+	// Four more touches of the same day, through four different entry points.
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("second EnsureTodayRate: %v", err)
+	}
+	if _, err := st.LotteryStatus(guildID, userID, daysAfter(1)); err != nil {
+		t.Fatalf("LotteryStatus: %v", err)
+	}
+	if _, err := st.ViewAccount(guildID, userID, daysAfter(1)); err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+	// ...and one with the clock wound back to the day the pot was sold on.
+	if _, err := st.EnsureTodayRate(guildID, fixedNow); err != nil {
+		t.Fatalf("EnsureTodayRate with a backwards clock: %v", err)
+	}
+
+	after := readGuild(t, path, guildID)
+	if after.Users[userID].Chips != wonChips {
+		t.Fatalf("chips moved from %d to %d after re-touching the same day — the draw paid out twice",
+			wonChips, after.Users[userID].Chips)
+	}
+	if *after.Lottery.LastDraw != *drawn.Lottery.LastDraw {
+		t.Fatalf("LastDraw changed from %+v to %+v on a second touch of the same day",
+			drawn.Lottery.LastDraw, after.Lottery.LastDraw)
+	}
+}
+
+// TestEnsureTodayRate_StartupFallbackDrawsTheMissedLottery is the
+// 取りこぼし防止 of 設計書 C-3a §3: the bot was down at 09:00 — for two whole
+// days here — and the draw still happens, at the first touch after it comes
+// back, without any announcement channel being configured.
+func TestEnsureTodayRate_StartupFallbackDrawsTheMissedLottery(t *testing.T) {
+	st, path := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+	if _, err := st.BuyLotteryTickets(guildID, userID, 4, fixedNow); err != nil {
+		t.Fatalf("BuyLotteryTickets: %v", err)
+	}
+	if configured := readGuild(t, path, guildID); configured.AnnounceChannelID != "" {
+		t.Fatalf("this test must run with no announcement channel, got %q", configured.AnnounceChannelID)
+	}
+
+	// Two days later the process starts again and ensures the rate.
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(2)); err != nil {
+		t.Fatalf("EnsureTodayRate: %v", err)
+	}
+
+	after := readGuild(t, path, guildID)
+	const wantPrize = int64(180) // floor(200*90/100)
+	want := LotteryDraw{Date: jstDate(daysAfter(2)), WinnerID: userID, Prize: wantPrize, TicketsSold: 4, Buyers: 1}
+	if after.Lottery.LastDraw == nil || *after.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw = %+v, want %+v — a draw missed while the bot was down must happen at the next touch",
+			after.Lottery.LastDraw, want)
+	}
+	if got := after.Users[userID].Chips; got != 1000-200+wantPrize {
+		t.Fatalf("buyer's chips = %d, want %d (1000 - 200 + %d)", got, 1000-200+wantPrize, wantPrize)
+	}
+}
+
+// TestBuyLotteryTickets_ConcurrentPurchasesConserveTicketsAndSales is the
+// lost-update regression for the pot: 50 single-ticket purchases arrive on 50
+// goroutines (discordgo runs every interaction in its own), and the ticket
+// map, the sales figure and every balance must agree afterwards. A
+// read-modify-write outside Store.Update's mutex loses tickets here.
+func TestBuyLotteryTickets_ConcurrentPurchasesConserveTicketsAndSales(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID = "guild1"
+	users := []string{"u1", "u2", "u3", "u4", "u5"}
+	const perUser = 10 // exactly the per-draw cap, so every call must succeed
+
+	var wg sync.WaitGroup
+	for _, userID := range users {
+		for i := 0; i < perUser; i++ {
+			wg.Add(1)
+			go func(userID string) {
+				defer wg.Done()
+				if _, err := st.BuyLotteryTickets(guildID, userID, 1, fixedNow); err != nil {
+					t.Errorf("BuyLotteryTickets(%s): %v", userID, err)
+				}
+			}(userID)
+		}
+	}
+	wg.Wait()
+
+	after := readGuild(t, path, guildID)
+	wantSold := len(users) * perUser
+	sold := 0
+	for _, n := range after.Lottery.Tickets {
+		sold += n
+	}
+	if sold != wantSold {
+		t.Fatalf("lost update detected: %d tickets persisted, want %d — Store.Update is not serializing concurrent purchases",
+			sold, wantSold)
+	}
+	wantSales := LotteryTicketPrice * int64(wantSold)
+	if after.Lottery.Sales != wantSales {
+		t.Fatalf("Sales = %d, want %d (= %d tickets * %d chips)", after.Lottery.Sales, wantSales, wantSold, LotteryTicketPrice)
+	}
+	for _, userID := range users {
+		if got := after.Lottery.Tickets[userID]; got != perUser {
+			t.Fatalf("%s holds %d tickets, want %d", userID, got, perUser)
+		}
+		// Every account opened on the welcome bonus and spent 10*50 of it.
+		wantChips := int64(welcomeBonusChips) - LotteryTicketPrice*perUser
+		if got := after.Users[userID].Chips; got != wantChips {
+			t.Fatalf("%s's chips = %d, want %d (welcome bonus - %d tickets)", userID, got, wantChips, perUser)
+		}
+	}
+}
+
+// TestLotteryStatus_ReportsThePotTheHoldingAndTheNextDraw covers what
+// /lottery status renders: the prize as it stands, the pot's size, the
+// asking user's own holding, the next 09:00 JST, and the previous result
+// (nil until there has been one).
+func TestLotteryStatus_ReportsThePotTheHoldingAndTheNextDraw(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{5}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 1000, "u2": 1000, "u3": 1000})
+	for userID, count := range map[string]int{"u1": 1, "u2": 3, "u3": 6} {
+		if _, err := st.BuyLotteryTickets(guildID, userID, count, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets(%s): %v", userID, err)
+		}
+	}
+
+	view, err := st.LotteryStatus(guildID, "u2", fixedNow)
+	if err != nil {
+		t.Fatalf("LotteryStatus returned error: %v", err)
+	}
+	wantNext := time.Date(2026, 7, 11, 9, 0, 0, 0, jst) // fixedNow is 12:00 JST on the 10th
+	if view.Prize != 450 || view.TicketsSold != 10 || view.Buyers != 3 || view.UserTickets != 3 {
+		t.Fatalf("view = %+v, want Prize=450 TicketsSold=10 Buyers=3 UserTickets=3", view)
+	}
+	if !view.NextDrawAt.Equal(wantNext) {
+		t.Fatalf("NextDrawAt = %s, want %s (the next 09:00 JST)", view.NextDrawAt, wantNext)
+	}
+	if view.LastDraw != nil {
+		t.Fatalf("LastDraw = %+v, want nil before the first draw", view.LastDraw)
+	}
+
+	// Asking after the rollover both performs the draw and reports it.
+	drawn, err := st.LotteryStatus(guildID, "u1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("LotteryStatus after the rollover returned error: %v", err)
+	}
+	if drawn.LastDraw == nil || drawn.LastDraw.WinnerID != "u3" || drawn.LastDraw.Prize != 450 {
+		t.Fatalf("LastDraw = %+v, want u3 with a prize of 450", drawn.LastDraw)
+	}
+	if drawn.Prize != 0 || drawn.TicketsSold != 0 || drawn.UserTickets != 0 {
+		t.Fatalf("the reopened pot = %+v, want an empty one (Prize/TicketsSold/UserTickets all 0)", drawn)
+	}
+}

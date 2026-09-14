@@ -360,6 +360,14 @@ func ensureTodayRateIndexLocked(economy *GuildEconomy, today string, rng randSou
 	// announcement), so a guild whose members have not spun since the upgrade
 	// would otherwise be shown a pool of 0 chips that is really 1,000.
 	seedJackpotLocked(economy)
+	// Roll the daily lottery over at the very same point, for the very same
+	// reason the rate is generated here (設計書 C-3a §3 の取りこぼし防止): this
+	// is the ONE place every command and the announcement sweep pass through,
+	// so a draw hooked here happens whether or not the bot was alive at 09:00
+	// JST and whether or not the guild has an announcement channel configured.
+	// Hanging it off the scheduler instead would silently skip the draw for a
+	// guild that never set a channel, and lose a day entirely after a restart.
+	drawLotteryLocked(economy, today, rng)
 	// Drop unusable today records rather than appending after them, so the
 	// history never ends up holding two entries for the same date, and so the
 	// regeneration below starts from the last VALID day instead of from a
@@ -999,4 +1007,216 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 		return 0, err
 	}
 	return refunded, nil
+}
+
+// --- the daily lottery (設計書 C-3a §3) -----------------------------------
+//
+// The pot is PLAYERS' money in transit, unlike the jackpot pool: chips leave
+// the buyers' balances at purchase and come back to exactly one of them at
+// the next 09:00 JST rollover, minus the house's 10% — which does not vanish
+// either, it is handed to the jackpot pool. The conservation law
+// store_test.go pins down is therefore, across one draw:
+//
+//	sum(Chips lost by buyers) == Sales
+//	winner's Chips gained     == prize   (== floor(Sales*90/100) + carryover)
+//	economy.Jackpot gained    == house   (== Sales - floor(Sales*90/100))
+//
+// creditChipsCappedLocked credits `amount` chips as far as MaxChips allows
+// and reports what it actually moved. It exists for the one credit in this
+// package that has no error to return: the draw runs inside
+// ensureTodayRateIndexLocked, a rollover that every read path depends on and
+// that cannot fail. Refusing the payout outright (creditChipsLocked's
+// behaviour) would either destroy the prize or stall the rollover forever on
+// a winner sitting at the cap; crediting what fits and leaving the rest as
+// Carryover keeps every chip and lets the next draw pay it out. Caller must
+// already hold the Store's lock.
+func creditChipsCappedLocked(account *UserAccount, amount int64) int64 {
+	if amount <= 0 || account.Chips < 0 || account.Escrow < 0 {
+		return 0
+	}
+	headroom := MaxChips - account.Escrow - account.Chips
+	if headroom <= 0 {
+		return 0 // already at or over the cap (hand-edited file)
+	}
+	if amount > headroom {
+		amount = headroom
+	}
+	account.Chips += amount
+	return amount
+}
+
+// lotterySummaryLocked totals the pot currently being sold into: tickets
+// sold, distinct buyers, and what the next draw would pay. Caller must
+// already hold the Store's lock.
+func lotterySummaryLocked(lottery *Lottery) (sold, buyers int, prize int64) {
+	for _, n := range lottery.Tickets {
+		if n <= 0 {
+			continue // hand-edited junk: it bought nothing, so it counts as nothing
+		}
+		sold += n
+		buyers++
+	}
+	prize, _ = LotteryPrize(lottery.Sales, lottery.Carryover)
+	return sold, buyers, prize
+}
+
+// drawLotteryLocked runs the 09:00 JST draw if `today` is a day the lottery
+// has not been drawn on yet, then opens an empty pot for the next one. It is
+// called from ensureTodayRateIndexLocked, i.e. from inside every caller's own
+// Update — the draw and the day's rate are committed by the same write, so a
+// crash cannot leave a guild with a new rate and yesterday's pot.
+//
+// Nobody entered (no tickets, or a randSource too broken to name a winner):
+// the whole prize — which is just the carryover, since no sales happened —
+// rolls forward untouched and LastDraw is deliberately NOT overwritten, so
+// /lottery status keeps showing the last real result through a quiet spell.
+// The date is still stamped, so the empty draw is not retried all day.
+//
+// The comparison is `DrawDate < today` rather than `!=`: a clock that moves
+// backwards (an NTP correction, a hand-set host clock) must not be able to
+// re-draw a day that has already paid out — the same rule
+// ensureTodayRateIndexLocked applies to the rate history. Caller must already
+// hold the Store's lock, which is also what makes reading rng safe.
+func drawLotteryLocked(economy *GuildEconomy, today string, rng randSource) {
+	lottery := &economy.Lottery
+	if today == "" || lottery.DrawDate >= today {
+		return
+	}
+	prize, house := LotteryPrize(lottery.Sales, lottery.Carryover)
+	sold, buyers, _ := lotterySummaryLocked(lottery)
+	winner := PickLotteryWinner(lottery.Tickets, rng)
+	if winner == "" {
+		lottery.Carryover = prize
+		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, today
+		return
+	}
+	paid := creditChipsCappedLocked(ensureAccountLocked(economy, winner), prize)
+	// The house's cut feeds the slot jackpot pool (設計書 C-3a §3). Seed
+	// first: adding to a pool still sitting at a pre-C-3a 0 and only then
+	// raising it to the seed would swallow the cut.
+	seedJackpotLocked(economy)
+	economy.Jackpot += house
+	lottery.LastDraw = &LotteryDraw{
+		Date: today, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
+	}
+	// prize-paid is 0 on every normal draw; it is non-zero only when the
+	// winner was at MaxChips, and then the remainder funds the next draw
+	// rather than being destroyed.
+	lottery.Carryover = prize - paid
+	lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, today
+}
+
+// LotteryPurchase is what a successful /lottery buy left behind: the buyer's
+// own numbers plus the state of the pot they just joined, so the command
+// layer can render the confirmation without a second store round-trip.
+type LotteryPurchase struct {
+	Count       int       // tickets bought by THIS call
+	Cost        int64     // chips debited by this call
+	Balance     int64     // the buyer's chips after the purchase
+	UserTickets int       // the buyer's whole holding for the next draw
+	TicketsSold int       // every buyer's tickets for the next draw
+	Buyers      int       // distinct buyers in the next draw
+	Prize       int64     // what the next draw pays as of this purchase
+	NextDrawAt  time.Time // the next 09:00 JST
+}
+
+// BuyLotteryTickets buys `count` tickets for guildID/userID at
+// LotteryTicketPrice chips each, in one Update. Returns *ErrLotteryLimit
+// when the purchase would take the buyer past LotteryMaxTicketsPerDraw for
+// this draw (the cap is CUMULATIVE, so it also covers a single oversized
+// call), *ErrInsufficientChips when the balance will not cover the cost, and
+// ErrInvalidAmount below 1 — defense in depth, exactly as Spin treats its
+// bet bounds: the command layer's option range is a UX nicety, not a
+// guarantee. Nothing at all is persisted on any error, so a refused purchase
+// cannot eat chips.
+//
+// The daily rollover runs FIRST, inside the same transaction: a purchase
+// made after 09:00 JST on a day nothing else has touched the guild must join
+// the NEW draw, not be swept into yesterday's pot by the rollover that a
+// later command would trigger.
+func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Time) (LotteryPurchase, error) {
+	if count < 1 {
+		return LotteryPurchase{}, ErrInvalidAmount
+	}
+	today := jstDate(now)
+	var result LotteryPurchase
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		ensureTodayRateLocked(economy, today, s.rng) // rolls the draw over
+		account := ensureAccountLocked(economy, userID)
+		lottery := &economy.Lottery
+		owned := lottery.Tickets[userID] // reading a nil map is legal and yields 0
+		remaining := LotteryMaxTicketsPerDraw - owned
+		if remaining < 0 {
+			remaining = 0 // hand-edited holding already past the cap
+		}
+		if count > remaining {
+			return &ErrLotteryLimit{Remaining: remaining}
+		}
+		cost := LotteryTicketPrice * int64(count) // count <= 10, so no overflow
+		if account.Chips < cost {
+			return &ErrInsufficientChips{Balance: account.Chips}
+		}
+		account.Chips -= cost
+		if lottery.Tickets == nil {
+			lottery.Tickets = make(map[string]int, 1)
+		}
+		lottery.Tickets[userID] = owned + count
+		lottery.Sales += cost
+		sold, buyers, prize := lotterySummaryLocked(lottery)
+		result = LotteryPurchase{
+			Count: count, Cost: cost, Balance: account.Chips,
+			UserTickets: lottery.Tickets[userID],
+			TicketsSold: sold, Buyers: buyers, Prize: prize,
+			NextDrawAt: nextRunAt(now),
+		}
+		return nil
+	})
+	if err != nil {
+		return LotteryPurchase{}, err
+	}
+	return result, nil
+}
+
+// LotteryView is what /lottery status shows: the pot being sold into now and
+// the last draw that produced a winner (nil until one has).
+type LotteryView struct {
+	Prize       int64     // what the next draw pays if nobody else buys
+	TicketsSold int       // tickets in the next draw
+	Buyers      int       // distinct buyers in the next draw
+	UserTickets int       // the asking user's own tickets
+	NextDrawAt  time.Time // the next 09:00 JST
+	LastDraw    *LotteryDraw
+}
+
+// LotteryStatus reports guildID's lottery for userID, running the daily
+// rollover in the same transaction — so merely LOOKING at the status after
+// 09:00 JST performs the draw that the bot may have been down for, and the
+// user sees the result rather than a stale pot.
+func (s *Store) LotteryStatus(guildID, userID string, now time.Time) (LotteryView, error) {
+	today := jstDate(now)
+	var result LotteryView
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		ensureTodayRateLocked(economy, today, s.rng) // rolls the draw over
+		lottery := &economy.Lottery
+		sold, buyers, prize := lotterySummaryLocked(lottery)
+		result = LotteryView{
+			Prize: prize, TicketsSold: sold, Buyers: buyers,
+			UserTickets: lottery.Tickets[userID],
+			NextDrawAt:  nextRunAt(now),
+		}
+		if lottery.LastDraw != nil {
+			// Hand back a COPY: the pointer belongs to the Data this Update
+			// is about to write out and drop, and the caller reads the view
+			// long after the lock is gone.
+			draw := *lottery.LastDraw
+			result.LastDraw = &draw
+		}
+		return nil
+	})
+	if err != nil {
+		return LotteryView{}, err
+	}
+	return result, nil
 }

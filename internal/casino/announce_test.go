@@ -750,3 +750,80 @@ func TestCollectDailyAnnouncements_CarriesGrownJackpotPool(t *testing.T) {
 		t.Fatalf("job.JackpotPool = %d, want 45678 (the pool must not be reseeded or reset)", jobs[0].JackpotPool)
 	}
 }
+
+// TestCollectDailyAnnouncements_CarriesTheMorningLotteryDraw pins the 9am
+// embed's lottery half (設計書 C-3a §3): the sweep itself performs the draw
+// — the rollover is inside the same ensureTodayRateLocked it already calls —
+// and the job carries that result plus the freshly reopened pot, not the one
+// that was just settled.
+func TestCollectDailyAnnouncements_CarriesTheMorningLotteryDraw(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	yesterday := announceAt1000.AddDate(0, 0, -1)
+	if _, err := st.BuyLotteryTickets("guild1", "u1", 2, yesterday); err != nil {
+		t.Fatalf("BuyLotteryTickets: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(announceAt1000)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+
+	job := jobs[0]
+	want := LotteryDraw{Date: announceDay, WinnerID: "u1", Prize: 90, TicketsSold: 2, Buyers: 1}
+	if job.LotteryDraw == nil || *job.LotteryDraw != want {
+		t.Fatalf("job.LotteryDraw = %+v, want %+v — the sweep must settle and report the morning's draw", job.LotteryDraw, want)
+	}
+	if job.LotteryPrize != 0 || job.LotteryTickets != 0 {
+		t.Fatalf("job.LotteryPrize/LotteryTickets = %d/%d, want 0/0 — these describe the pot that is now OPEN, which the draw just emptied",
+			job.LotteryPrize, job.LotteryTickets)
+	}
+	// The house's 10% reached the jackpot pool the same morning.
+	if want := JackpotSeed + 10; job.JackpotPool != want {
+		t.Fatalf("job.JackpotPool = %d, want %d (seed + the lottery's house cut)", job.JackpotPool, want)
+	}
+}
+
+// TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot is the
+// other half: the embed says 「昨日の当選」, so a LastDraw left over from a
+// quiet spell must NOT be repeated under that wording every morning — while
+// the open pot (carryover included) is still reported, because that is what
+// readers can buy into today.
+func TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, and today's draw already ran"}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	stale := LotteryDraw{Date: "2026-07-01", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, "guild1").Lottery
+		lottery.DrawDate = announceDay // today's draw has already happened
+		lottery.LastDraw = &stale
+		lottery.Carryover = 500
+		lottery.Sales = 100
+		lottery.Tickets = map[string]int{"u1": 2}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the lottery state: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(announceAt1000)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+
+	job := jobs[0]
+	if job.LotteryDraw != nil {
+		t.Fatalf("job.LotteryDraw = %+v, want nil — a draw from %s is not 昨日の当選", job.LotteryDraw, stale.Date)
+	}
+	if job.LotteryPrize != 590 || job.LotteryTickets != 2 {
+		t.Fatalf("job.LotteryPrize/LotteryTickets = %d/%d, want 590/2 (floor(100*90/100) + 500 carried over, 2 tickets)",
+			job.LotteryPrize, job.LotteryTickets)
+	}
+}

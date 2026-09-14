@@ -20,6 +20,18 @@ type AnnouncementJob struct {
 	// seedJackpotLocked), so a guild that has never spun is shown the real
 	// JackpotSeed rather than a pool of 0.
 	JackpotPool int64
+	// LotteryDraw is the draw THIS morning's rollover just settled, or nil
+	// when nobody had entered it. It is filtered to Today's date rather than
+	// simply being economy.Lottery.LastDraw: the announcement says 「昨日の
+	// 当選」, and a LastDraw from a quiet spell three days ago would put a
+	// stale winner under that wording every morning until someone buys again.
+	LotteryDraw *LotteryDraw
+	// LotteryPrize / LotteryTickets describe the draw that is now OPEN (the
+	// one the readers can still buy into), read after the rollover cleared
+	// the settled pot — so they are today's fresh numbers, which for a guild
+	// with no carryover are 0.
+	LotteryPrize   int64
+	LotteryTickets int
 }
 
 // collectDailyAnnouncements ensures every known guild's rate exists for
@@ -46,12 +58,23 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			if len(recent) > 7 {
 				recent = recent[len(recent)-7:]
 			}
-			jobs = append(jobs, AnnouncementJob{
+			// Every lottery field is read after ensureTodayRateLocked, which
+			// is what performed this morning's draw — so the job carries the
+			// settled result and the freshly opened pot, not yesterday's.
+			sold, _, prize := lotterySummaryLocked(&economy.Lottery)
+			job := AnnouncementJob{
 				GuildID: guildID, ChannelID: economy.AnnounceChannelID,
 				Today: rate, RecentRates: recent,
-				TopAssets:   topAssetsLocked(economy, rate.Rate, 3),
-				JackpotPool: economy.Jackpot, // read after ensureTodayRateLocked seeded it
-			})
+				TopAssets:      topAssetsLocked(economy, rate.Rate, 3),
+				JackpotPool:    economy.Jackpot, // read after ensureTodayRateLocked seeded it
+				LotteryPrize:   prize,
+				LotteryTickets: sold,
+			}
+			if last := economy.Lottery.LastDraw; last != nil && last.Date == today {
+				draw := *last // copy: the Data behind the pointer is dropped with this Update
+				job.LotteryDraw = &draw
+			}
+			jobs = append(jobs, job)
 		}
 		return nil
 	})

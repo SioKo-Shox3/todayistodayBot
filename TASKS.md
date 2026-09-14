@@ -199,7 +199,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 精算 → 表示の順序は変えない(表示は `SpinResult` の値を写すだけ)。
 
 ## C3-03: 宝くじの永続化・購入・抽選(§3)
-- status: todo
+- status: done
 - done-when: `types.go` に `Lottery` / `LotteryDraw`(§3 の形。`GuildEconomy.Lottery` は値型で `json:"lottery"`)。`internal/casino/lottery.go`(純粋): `LotteryPrize(sales, carryover) (prize, house int64)`(`prize = floor(sales*90/100) + carryover`、`house = sales − floor(sales*90/100)`)、`PickLotteryWinner(tickets map[string]int, rng) string`(枚数で重み付け。決定的な順序 = userID 昇順で累積)。`store.go`: `BuyLotteryTickets(guild, user string, count int, now) (LotteryPurchase, error)`(1〜10、1 人 1 抽選 10 枚まで → `ErrLotteryLimit`、残高不足 → `ErrInsufficientChips`。`Update` 1 回)、`LotteryStatus(guild, user, now) (LotteryView, error)`(次回賞金・枚数・購入者数・自分の枚数・次の 9:00 JST・前回の結果)、日次ロールオーバー(`ensureTodayRateLocked` と同じ `Update` の内側)に `drawLotteryLocked(economy, today, rng)`: `DrawDate < today` のとき、購入者がいれば当選者に `prize` を加算・ハウス分を `Jackpot` へ・`LastDraw` 更新、いなければ `Carryover = prize`。抽選後は `Tickets`/`Sales` を空に、`DrawDate = today`。`AnnouncementJob` に `LotteryDraw`(前回結果)と次回の賞金・枚数を足す。`store_test.go` / `lottery_test.go`: 上限・残高不足・賞金とハウス分の計算・重み付き抽選が決定的・購入者 0 の繰り越し・同じ日に二度抽選しない・`EnsureTodayRate` の起動時フォールバックで抽選される・並行購入 50 本で枚数と売上が合う・保存則(`Chips` の減少 = 売上、当選者の増加 = 賞金、`Jackpot` の増加 = ハウス分)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestLottery|TestStore|TestEnsureTodayRate|TestCollect" -count=1`
