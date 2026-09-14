@@ -304,9 +304,14 @@ func TestLotteryAnnounceCelebration_OnlyForAnActualWinner(t *testing.T) {
 	}{
 		{"nobody entered", nil, ""},
 		{"no winner named", &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "", Prize: 900}, ""},
-		// The winner was already at MaxChips, so creditChipsCappedLocked paid
-		// 0 and the pot rolled forward: there is nothing to celebrate.
-		{"winner credited nothing", &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 0}, ""},
+		// A winner already at MaxChips is credited nothing by
+		// creditChipsCappedLocked and the pot rolls forward, but the draw
+		// still named them: the ping is owed either way.
+		{
+			"winner credited nothing",
+			&casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 0},
+			"🎉🎉🎉 <@u1> が 🎟️ 宝くじに当選!! 0 チップ 獲得!! 🎉🎉🎉",
+		},
 		{
 			"real winner",
 			&casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3},
@@ -446,5 +451,42 @@ func TestStartAnnounceScheduler_CelebrationFailureStillMarksTheDayAnnounced(t *t
 	startAnnounceScheduler(ctx2, store, send, sendText, now, sleep)()
 	if embeds != 1 {
 		t.Fatalf("the failed celebration re-opened the day: %d embeds posted in total, want 1", embeds)
+	}
+}
+
+func TestStartAnnounceScheduler_CelebratesAWinnerWhoWasCreditedNothing(t *testing.T) {
+	// The draw pays through creditChipsCappedLocked, so a winner sitting at
+	// MaxChips is recorded with Prize 0 and the pot rolls forward. The draw
+	// still named them, so the @mentioning message is still posted — the
+	// amount it prints is the 0 that was actually credited.
+	store := newTestCasinoStore(t)
+	if err := store.SetAnnounceChannel("g1", "c1"); err != nil {
+		t.Fatalf("SetAnnounceChannel: %v", err)
+	}
+	at := announceAt10()
+	// A single buyer wins whatever the rng rolls, so this does not depend on
+	// the store's rng (see the sibling test).
+	if _, err := store.BuyLotteryTickets("g1", "u1", 2, at.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("BuyLotteryTickets: %v", err)
+	}
+	// Fill the account to the cap AFTER buying: the purchase itself has to
+	// be affordable, and only the credit at draw time must hit the ceiling.
+	if err := store.Update(func(d *casino.Data) error {
+		(*d)["g1"].Users["u1"].Chips = casino.MaxChips
+		return nil
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	_, texts, channels := runOneAnnouncePass(t, store, at)
+
+	if len(texts) != 1 {
+		t.Fatalf("got %d celebration messages, want exactly 1: %q", len(texts), texts)
+	}
+	if want := "🎉🎉🎉 <@u1> が 🎟️ 宝くじに当選!! 0 チップ 獲得!! 🎉🎉🎉"; texts[0] != want {
+		t.Fatalf("unexpected celebration:\n got: %q\nwant: %q", texts[0], want)
+	}
+	if channels[0] != "c1" {
+		t.Fatalf("the celebration went to %q, want the announce channel", channels[0])
 	}
 }

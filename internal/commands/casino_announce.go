@@ -101,14 +101,15 @@ func lotteryAnnounceLines(job casino.AnnouncementJob) string {
 // (slotCelebrationMessage): an embed field is easy to scroll past, and the
 // whole point of the mention is that the winner gets pinged.
 //
-// "" means「何も投稿しない」: no draw, no winner named, or a prize of 0. The
-// last case is not hypothetical — drawLotteryLocked pays through
-// creditChipsCappedLocked, so a winner already at MaxChips is recorded with
-// Prize 0 and the whole pot rolls forward instead. 「0 チップ 獲得!!」 would
-// be a celebration of nothing; the embed field still reports that draw
-// exactly as it was recorded.
+// "" means「何も投稿しない」, and the ONLY reasons are structural: there was
+// no draw, or the draw named nobody. A named winner is always celebrated,
+// including one recorded with Prize 0 — drawLotteryLocked pays through
+// creditChipsCappedLocked, so a winner already at MaxChips keeps the win but
+// receives nothing and the pot rolls forward. Suppressing that message would
+// drop the ping for a real winner; the amount is printed as recorded, so the
+// message stays honest about what actually landed in the account.
 func lotteryAnnounceCelebration(draw *casino.LotteryDraw) string {
-	if draw == nil || draw.WinnerID == "" || draw.Prize <= 0 {
+	if draw == nil || draw.WinnerID == "" {
 		return ""
 	}
 	return fmt.Sprintf("🎉🎉🎉 <@%s> が 🎟️ 宝くじに当選!! %d チップ 獲得!! 🎉🎉🎉", draw.WinnerID, draw.Prize)
