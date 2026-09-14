@@ -19,17 +19,25 @@
 
 - C2-02(`casino.Store` の預かり 4 メソッド)= 3331a8d。`UserAccount` に `Escrow` / `EscrowGame` / `EscrowOpenedAt`(`omitempty`)、`OpenGame` / `AddToEscrow` / `SettleGame` / `RefundStaleEscrows` をそれぞれ `Update` 1 回で。総資産は `totalAssetsLocked` に寄せ、`TopAssets` と `ViewAccount` の両方が `Escrow` を含める。検証出力: `.harness/runs/20260914-121315/verify-C2-02-{1,2,3,4}.txt`(build+vet clean / 対象テスト 73 PASS・FAIL 0 / casino ok / `go test ./...` 8 パッケージ ok)。
 
+- C2-02 の評価者指摘(返金でチップが消失する)= 28ff79a。`creditChipsLocked` の上限判定に `Escrow` を含めた — 預かり中は Chips が空いて見えるので、日次受取や両替が Chips を `MaxChips` まで埋め、続く返金に置き場が無くなっていた。返金は `moveFromEscrowLocked`(`moveToEscrowLocked` の逆)にして切り捨てを廃止した(預かりは元から本人の金なので、返すのは通貨の生成ではない)。回帰は `store_test.go` の 3 件(預かり中の `/daily`・`/exchange` は `ErrChipCapExceeded`、手編集で上限超過の口座も全額返金)。修正前は 3 件とも落ちることを確認した: `.harness/runs/20260914-121315/verify-C2-02fix-0-baseline.txt`。検証出力: 同 `verify-C2-02fix-{1,2,3}.txt`(build+vet clean / 対象テスト 80 PASS・FAIL 0 / `go test ./...` 8 パッケージ ok)。
+
+- C2-03(カードの山とハイ&ローの純粋ロジック)= 8c81337。`cards.go`(`Card`/`Suit`/`Deck`、`NewDeck(n, rng)` は Fisher-Yates、`Draw`/`Remaining`(コピー)/`Len`)と `highlow.go`(`HighLowGame` は全フィールド非公開+アクセサ、`Odds`/`Multiplier`/`Guess`/`CashOut`/`AutoResolve`)。検証出力: `.harness/runs/20260914-121315/verify-C2-03-{1,2,3,4}.txt`(build+vet clean / `TestDeck|TestHighLow` ok・exit=0 / `go test ./...` 8 パッケージ ok / gofmt 差分なし)。統計テストの実測は 1 手あたり RTP 0.9479(100 万手・0.7 秒)。
+
 ## In progress
 - (なし)
 
 ## Next
-- **次は C2-03**(`internal/casino/cards.go` + `highlow.go` の純粋ロジック)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-06)。C2-05 の `SessionManager` はまだ無い。
+- **次は C2-04**(ブラックジャックの純粋ロジック)。`cards.go` の `Deck`/`Card` はそのまま使える(`Draw` は末尾から引く。テストの `deckOf` が引く順で並べ替える)。`internal/commands` 側の配線は C2-06 以降。
+- (済)~~次は C2-03~~(`internal/casino/cards.go` + `highlow.go` の純粋ロジック)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-06)。C2-05 の `SessionManager` はまだ無い。
 - **C-2 開始(2026-09-14)**: 仕様 `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`、タスク C2-01〜C2-08(`TASKS.md`)。ブランチ `feat/casino-c2`。順に消化する。
 - **C-1 は完了**(2026-09-14: R-001〜R-004 着地、Astra 2 周目 PASS、`main` へ ff マージ)。次は稼働(トークンと実行場所はユーザー判断)か C-2(ボタン基盤+ハイ&ロー+ブラックジャック、未設計 → M1 から)。
 - `TASKS.md` の未完は無し(R-001〜R-004 すべて done)。次は R-003 修正差分の評価者 2 周目(前回指摘への対応差分だけを見る)。
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **ハイ&ローの数式(C2-03 で確定)**: 倍率は x100 整数の `Multiplier(winning, remaining) = 95*remaining/winning` 一式で、切り捨ては最後に 1 回だけ(常にハウス有利)。ポットは `floor(pot*m/100)`。**同ランクは分母にだけ入る**(高い/低いのどちらの分子にも数えない)ので、ハウス取り分は 5 % + 同ランク分。上限 100 倍は**上限で**支払う(設計書 §6「超えたら上限で自動キャッシュアウト」)— `growPot` が clamp し、オーバーフロー時も cap を返すので clamp は全域。1 手あたり RTP の実測は 0.9479(95 %±1 % に収まる)。
+- **`errDeckExhausted` は到達不能**(C2-03): `Odds` が数える山と `Guess` が引く山は同じなので、当たり枚数 > 0 なら必ずカードが残る。将来この結合が壊れたときに大声で落ちるための防御で、非公開・テスト無し。
+- **預かりと上限の関係(C2-02 の指摘で確定)**: チップ上限 `MaxChips` は **Chips + Escrow** に掛かる。付与(`creditChipsLocked`)は預かりを数え、口座内の移動(`moveToEscrowLocked` / `moveFromEscrowLocked`)は数えない。返金は「返せない」があってはならない — 切り捨てもエラーもチップの消失か永久ロックになる。
 - **預かりの規律(C2-02 で決めた)**: 保存則は `Chips + Escrow`。預け入れ(`OpenGame` / `AddToEscrow`)は同一口座の 2 フィールド間の移動なので合計を動かさず、合計が動くのは `SettleGame` に渡した `payout` のときだけ。だから預け入れは `creditChipsLocked` を通さない(通貨を作らないので上限判定の対象外)。`payout` は**預かりの返還を含む総額** — 呼び出し側でベットを足さない。二重決着は二重に守る: セッションを map から消す(C2-05)+ `SettleGame` の `ErrNoGameInProgress`。`AddToEscrow` も `Escrow == 0` を拒む(仕様は残高不足しか書いていないが、進行中でないゲームへの追加は返す先が無い)。
 - **総資産に預かりを含める(C2-02)**: `totalAssetsLocked(account, rate)` 1 箇所に寄せた。`TopAssets` と `ViewAccount` の両方がこれを使う — 含めないとゲーム中だけランキングと `/balance` から掛け金が消えて、決着で復活する。
 - **`RefundStaleEscrows` は年齢を見ない**: 盤面はメモリなので、起動時に残っている預かりは定義上「二度と決着しない盤面」。`now` 引数は `OpenGame` との対称性のために取るだけで判定には使わない。手編集で `Chips + Escrow > MaxChips` になっているファイルは `MaxChips` まで返して預かりを消す(中断すると全ギルドの口座が永久に「進行中」で固まる方が悪い)。
