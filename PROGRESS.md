@@ -4,6 +4,15 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-01(duel の純粋ロジックと 1 トランザクションのゼロサム精算)= コミット `e6a6f8f`。C-3b の最初の 1 件。
+  **`duel.go`(純粋)**: `GameDuel`(`GameKind`)・`DuelStage`(`DuelPending` / `DuelSettled`)・`DuelState{ChallengerID, OpponentID, Bet, Stage}`・`FlipDuel(rng) bool`(`rng.Intn(2) == 0`)・`DuelPayout(bet, challengerWins) (challenger, opponent int64)`(勝者 `2*bet`・敗者 0)。`DuelState` に `OpponentID` を持たせたのは**所有者検査が他の全ゲームと逆向き**だから — `Session.UserID` は挑戦者なのに、ボタンを押してよいのは受け手だけ(§4.5)。盤面にこのフィールドが無いと C3B-04 は誰も弾けない。`DuelPayout` は `bet` が `[1, MaxChips]` の外なら **(0, 0)** を返す(`AcceptDuel` が先に弾くので観測不能。`2*bet` が wrap して**負の配当**になるのを構造的に断つだけの防御)。
+  **`AcceptDuel(guild, challenger, opponent, bet, challengerWins) (DuelSettlement, error)` は 1 回の `Update`**。2 回に割ると、受け手を預かってから精算するまでの間に**その預かりを解放できる盤面が存在しない**窓ができる(落ちれば起動時返金まで塩漬け、並行受諾ならその窓に滑り込んで壺を二度払う)。`challengerWins` は呼び出し側が `FlipDuel` で引いて渡す(注入。store は日次レート以外の乱数を持たない)。
+  **拒否は 6 種で、どれも何も永続化しない**: `ErrDuelSelf`(両席が同一ユーザー = `ensureAccountLocked` が**同じポインタ**を返し、1 口預かって 2 口払う = `2*bet` の発行)/ `ErrInvalidAmount`(`bet` が範囲外)/ `ErrNoGameInProgress`(挑戦者が duel の預かりを持っていない = **二重精算のガード**。受諾が最初にその預かりを 0 にするのはこのため)/ `ErrDuelStakeMismatch`(預かりが `bet` と違う = 払う壺 `2*bet` と預かり総額がずれ、**ゼロサムが崩れる**)/ `ErrGameInProgress`・`*ErrInsufficientChips`(受け手側)。**受け手の失敗で挑戦者へ返金しない**のは §4.5 の明示 — 盤面は生きたままで、受け手は入金してやり直すか断るか失効を待つ。
+  **`EscrowGame` を額と一緒に見る**のが今回効いた点。duel は**他人の操作(受諾・掃除人)で決着する最初のゲーム**なので、「挑戦が閉じたあとに挑戦者が始めたブラックジャックの預かり」と区別が要る。`Escrow > 0` だけだと、古い duel ボタンがその BJ の掛け金を精算・返金してしまう(mutation `M2` で `DeclineDuel` 側と 2 件同時に落ちる)。
+  **`DeclineDuel` は `moveFromEscrowLocked`**。§4.5 の文言は `SettleGame(payout = bet)` 相当だが、credit は `MaxChips` で切り詰めるので**手編集で上限超の挑戦者が自分の掛け金を取り戻すだけでチップを失う**し、拒否(`ErrChipCapExceeded`)なら預かりが永久に残って全ゲームから締め出される。逆向きの move なら `Chips + Escrow` が出発点にぴったり戻る(`RefundStaleEscrows` と同じ論法)。
+  **`UserAccount.SeasonNet`(§3)を足した**(`json:"season_net,omitempty"` — 既存 JSON はキーが無いので 0 で読める)。受け取ったのは**実際に口座へ入った額**で数える(§2): 上限に座った勝者は入る分しか入らないので、払うべき額で数えると**残高が裏付けない順位**が出る。読み取り点の正規化は C3B-02 の担当なので、ここでは書き込み側だけを閉じた — `addSeasonNetLocked` が**加算前に現在値を ±MaxChips へ寄せてから**足す(ファイル由来の `season_net` は無界なので、結果だけ丸めても加算自体が wrap する)。
+  **効き目の確認**(`mutation-C3B-01.txt`、6 本。いずれも狙ったテストだけが落ちる): M1 預かり額の一致検査を外す → 受諾が通ってしまう / M2 `EscrowGame` 検査を外す → 他ゲームの掛け金を触る 2 件 / M3 `SeasonNet` を払うべき額で数える → 上限のケースが `200, want 100` / M4 自分自身のガードを外す → `ErrGameInProgress` が返り発行を止められない / M5 コインを `Intn(2) == 1` へ倒す → 決定性 / M6 敗者に掛け金を残す → 配当表とゼロサムとストアの合計。
+  検証出力: `.harness/runs/20260915-033205/verify-C3B-01-{1,2,3}.txt`(build+vet exit=0 / casino ok exit=0 / `go test ./...` 8 パッケージ ok exit=0)、`verify-C3B-01-4-duel-subtests.txt`(新規 10 テスト・サブテスト 19 件すべて PASS)。既存テストの期待値は 1 つも変えていない。
 - C3-19(移行の掲示チャンネル条件を外し、掲示済み境界を後退させない = 3 周目レビューの blocking 2 件)= コミット `ccf1aa6`。
   **(1) [P1] チャンネル未設定のギルドで旧当選が消える**: C3-18 で置いた `AnnounceChannelID == ""` の除外を**外した**(下の C3-18 の項の「宛先が無いギルドは移行しない」は**この項で覆っている** — 当時の判断が見落としていたのは、待つ間に窓が閉じることだった)。「後からチャンネルを設定すればそのとき移行される」は成り立たない — 移行の窓は**次の抽選まで**で、`drawLotteryLocked` が `LastDraw` を上書きした瞬間に旧当選は**どこにも残らない**。移行の条件は「保存する価値があるか」だけで、「今日どこかへ送れるか」は `collectDailyAnnouncements` 側の別の問いとして残る(`drawLotteryLocked` がチャンネルを見ないのと同じ理由)。
   **(2) [P2] 時計の巻き戻りで掲示済みの当選が復活する**: `MarkAnnounced` の `LastAnnounced` を**単調非減少**にした(`date > LastAnnounced` のときだけ書く)。読み手が 2 つともこれを上限線として使っている — `collectDailyAnnouncements` の「今日はもう掲示した」判定と、移行の「`LastDraw.Date > LastAnnounced` なら未掲示」。後退させると両方の判定が済んだ日に対して開き直り、9/14 が二度掲示され当選者が二度祝われる。**待ち行列の刈り取りは同じ扱いにしない** — 刈るのは「今出ていったメッセージに載っていた回」で、これは今日の日付が何であれ事実。
@@ -136,7 +145,10 @@
 - (なし)
 
 ## Next
-- **C-3b 開始(2026-09-15)**: 仕様 `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`、タスク C3B-01〜C3B-07。ブランチ `feat/casino-c3b`。`--evaluate every` で回す(最後のタスクも評価させる)。これでフェーズ C が閉じる。
+- **次は C3B-02(`SeasonNet` を全ゲームの決着に配線する)**。`UserAccount.SeasonNet` と `addSeasonNetLocked` は C3B-01 で**既に置いてある** — C3B-02 が足すのは (a) スロット / H&L・BJ の `SettleGame` / 宝くじの各決着からの呼び出しと、(b) **読み取り点(`ensureAccountLocked` → `normalizeAccountLocked`)での `[-MaxChips, MaxChips]` 正規化**。(b) はまだ無い(C3B-01 は書き込み側だけを閉じた)。`SettleGame` は「賭けた額」を知らないので、`clearEscrowLocked` の**前に** `account.Escrow` を読んで使う(ダブル込みの総額)。
+- **C-3b の残り**: C3B-02〜C3B-07。仕様 `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`、ブランチ `feat/casino-c3b`。`--evaluate every` で回す(最後のタスクも評価させる)。これでフェーズ C が閉じる。
+- **C3B-01 は危険地帯(資金の保存則)なので、段階が探索期でも評価者(Astra, `codex exec -m gpt-6-astra -s read-only`)を通す**。C3B-02 / C3B-03 も同じ危険地帯(C3B-03 は全口座を触る)なので、**3 件まとめて 1 つの差分として**回すのが 1 差分 2 周の枠を無駄にしない。
+- **`AcceptDuel` が増やした公開センチネルは 2 つ** — `ErrDuelSelf` と `ErrDuelStakeMismatch`。C3B-04 のコマンド層は前者に「❌ 自分自身とは対戦できません」を当て、後者は盤面とファイルの不一致なので汎用の失敗文言でよい(ユーザー操作では到達しない)。
 - **C-3a は完了**(2026-09-15: C3-01〜C3-19 着地。Astra 1 周目 blocking 3 → 対応 → 2 周目 blocking 2(修正が持ち込んだ新規)→ 対応 → 未評価だった移行コミットの単発レビュー blocking 2 → 対応 → 収集側の比較を親が直して締め)。`main` へ ff 済み。次は C-3b(/duel + 月次シーズン制)の M1 設計。
 - **`TASKS.md` に未完のタスクは無い**(38 件すべて done。C3-19 が最後の 1 件)。`NEXT_FINDINGS.md` も見出しだけ。先へ進むには M1 へ戻って項目を足す。
 - **この差分のレビューは 2 周で打ち切り済み**(1 差分 2 周まで)。C3-19 は 2 周目レビュー(`.harness/reviews/2026-09-15-astra-c3-18.md`)の blocking 2 件を落としたもの。**次に評価者へ回すなら、それは新しい差分として**回す。
