@@ -4,6 +4,18 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-04(`/duel` コマンドと受諾・辞退ボタン)= コミット `95cc63c`。証拠 `.harness/runs/20260915-033205/verify-C3B-04-{1,2,3}.txt`(3 本とも exit=0)。
+  **所有者検査がこのゲームだけ逆向き**。`Session.UserID` は挑戦者で、ボタンを押してよいのは**受け手**(§4.5)。共有の `requireSessionOwner` は使えない(文言も §6 で別)ので `requireDuelOpponent(i, board.OpponentID)` を別に置いた。受け手 ID は盤面(`casino.DuelState.OpponentID`)が持つ — マネージャは知らない。挑戦者自身の押下も**他人と同じく弾く**(テスト `TestDuelOnlyTheReceiverCanPress` が挑戦者と無関係の 2 人で見ている)。
+  **失効は「決着」ではなく「取り下げ」なので、掃除人の既定経路に乗せられない**。C-2 の掃除人は `AutoResolve() int64` → `SettleGame(guild, session.UserID, payout)` 一本で、duel をそこに通すと (a) 返金が `creditChipsLocked` の上限に当たって**掛け金の一部が消える**(`DeclineDuel` が `moveFromEscrowLocked` を選んだのと同じ理由)、(b) タイトルが「⌛ 時間切れ — 自動決着」になる。そこで `casino_sessions.go` に**3 つ目の任意インターフェース** `timedOutBoardSettler{ SettleTimedOutBoard(*casino.Session) (SettleResult, error) }` を足し、`sweepIdleBoards` の精算部分を `settleSweptBoard` へ切り出した。実装しないゲームは従来どおり `AutoResolve` → `SettleGame`(既存テストは 1 件も変えていない)。**`DuelState` は `casino.AutoResolver` を実装しない** — 「この盤面が 1 人の player に何を負っているか」という 1 つの数に、2 人分の帰結は入らない。
+  **効き目の確認**: `settleSweptBoard` のインターフェース分岐を無効化する変異で `TestDuelTimedOutChallengeIsWithdrawnAndRefunded` が 3 行(返金されない / Stage が pending のまま / 編集が出ない)落ち、ログに `a swept board cannot resolve itself game=duel` が出ることを確認した。テストは `bank.settles != 0` も見ている — 返金が `SettleGame` を通っていないことの証拠。
+  **受諾の失敗は 2 種類に割れる**。受け手のチップ不足・受け手が別ゲーム中は「まだ答えていない」だけなので ephemeral で断って**盤面を残す**(他の誰かが受けることはできない。§4.5)。それ以外(`ErrNoGameInProgress` / `ErrDuelStakeMismatch`)は**挑戦の裏にある預かりが既に無い**ので盤面ごと閉じる — 押しても必ず失敗するボタンを残さない。この分岐は `duelAcceptKeepsTheChallenge` 1 か所。
+  **`AcceptDuel` が成功したら編集より先に `Close`**。失効と受諾が競うと掃除人が「取り下げ」で上書きしうるが、押下は `Hold` を握っているので `Sweep` はこの盤面を返さない(C2-08 の busy 判定)。`Close` はその `Hold` の中で呼ぶ。
+  **`UserValue` / `IntValue` を使わない**。どちらも値の形が想定外だと panic し、discordgo はハンドラ goroutine に recover を張らない(= bot ごと落ちる)。`duelTarget` / `duelBet` はカンマ ok で読む。Bot 判定は option の値ではなく `data.Resolved.Users[id].Bot` から取り、`Resolved` が無ければ **false**(欠けたフィールドで実在の相手を断るより、Bot への挑戦を 3 分で返金する方が安い)。
+  **`casinoBank` に `AcceptDuel` / `DeclineDuel` を足した**。`flakyBank` は `*casino.Store` を埋め込んでいるのでテスト側の変更は不要。
+- NEXT_FINDINGS(反復 3 の Astra 判定 NEEDS_WORK: 月またぎの精算が前月へ混入する)= コミット `6304801`。証拠 `.harness/runs/20260915-033205/recheck-C3B-03-4-{1,2,3}.txt`(3 本とも exit=0)。
+  **月次ロールオーバーは読み取り経路の住人だったが、精算は読み取りではない**。`SettleGame` / `Spin` / `AcceptDuel` は呼び出し側から `now` を受け取らず、`ensureTodayRateIndexLocked` を**一度も通らずに** `addSeasonNetLocked` に到達する。7/31 に配られて 8/01 00:01 に払われた手は 7 月の純利に足され、次の表示がその 7 月を**8 月の結果込みで**締めて 8 月を 0 から開く(= 誤った月に計上され、正しい月からは消える)。
+  **直し方は `ensureSeasonMonthLocked(economy)` を 3 つのクロージャの先頭へ**。`rolloverSeasonLocked(economy, jstMonth(s.nowLocked()))` だけを呼ぶ(レート履歴と抽選は表示側の仕事で、呼び出し側の `now` を要る)。冪等かつ**前進のみ**なので、月の変わらない日は何もしない。**credit の前**に呼ぶこと — 切り替えは全口座の `SeasonNet` を 0 にするので、逆順は計上しようとしている結果そのものを消す。
+  **効き目の確認**: 3 つの呼び出しを外した木で新規 3 テスト(`SettleGame` / `Spin` / `AcceptDuel` の月またぎ)が `LastSeason = nil` で落ちる。`BuyLotteryTickets` は先頭で `ensureTodayRateLocked` を呼ぶので元から通っており、`drawLotteryLocked` はロールオーバーの**後ろ**にある(順序の理由は `ensureTodayRateIndexLocked` のコメント)。
 - C3B-02(`SeasonNet` を全ゲームの決着へ配線)= コミット `0a775b6` + `292b86a`。証拠 `.harness/runs/20260915-033205/verify-C3B-02-{4,5,6}.txt`(3 本とも exit=0)。
   **計上点は 5 つ**: `Spin`(`result.Payout - bet`)・`SettleGame`(`payout - staked`)・`BuyLotteryTickets`(`-cost`)・`drawLotteryLocked`(`+paid`)・`AcceptDuel`(C3B-01 で既出)。どれも**入金が成功したあと**に呼ぶ。`Spin` と `SettleGame` は `creditChipsLocked` が全か無かなので「入った額」と「払うはずの額」が一致するが、宝くじと duel は `creditChipsCappedLocked` なので一致しない — 上限に座った当選者は入る分しか取れず、**計上するのは `paid` であって `prize` ではない**(§2)。ここを `prize` にする変異はテストが落とす。
   **`SettleGame` が「賭けた額」を知る唯一の手段は `Escrow`**。`clearEscrowLocked` の**前**に `staked := account.Escrow` を読む。この値は bet + ダブルの総額なので、ダブルした手は `bet` ではなく総額が引かれる — 200 賭けて 400 戻る行(`+200`)が、bet だけを引く実装で落ちる行。
@@ -152,7 +164,10 @@
 - (なし)
 
 ## Next
-- **次は C3B-03**(`TASKS.md` の未完の先頭)。C3B-02 までで `SeasonNet` は**書き込み側も読み取り点も閉じた** — 残るのはシーズンの境界(月替わりで全口座の `SeasonNet` を 0 に戻し、賞与を配る)と、それを見せるコマンド層。C3B-03 は全口座を触るので C3B-02 と同じ危険地帯。
+- **次は C3B-05**(`TASKS.md` の未完の先頭)。C3B-04 で C-3b のゲーム側は閉じた — 残るのは見せる側(`/season`、`/balance` の今月の純利行、9 時掲示のシーズン欄、`/help` と README の一覧)。
+- **`/help` と `README.md` に `/duel` を足すのはまだ**(§5 は `/season` と同じタスクで足すと書いている)。C3B-04 では触っていない。
+- **掃除人の任意インターフェースは 3 つになった**(`casino_sessions.go`): `timedOutBoardRenderer`(ボタン)・`timedOutBoardResultRenderer`(本文)・`timedOutBoardSettler`(精算そのもの)。新しいゲームを足すときは、既定(`AutoResolve` → `SettleGame`)で足りるかを最初に決める。
+- **旧: 次は C3B-03**(`TASKS.md` の未完の先頭)。C3B-02 までで `SeasonNet` は**書き込み側も読み取り点も閉じた** — 残るのはシーズンの境界(月替わりで全口座の `SeasonNet` を 0 に戻し、賞与を配る)と、それを見せるコマンド層。C3B-03 は全口座を触るので C3B-02 と同じ危険地帯。
 - **`SeasonNet` を新しい経路から動かすときの規律**(C3B-03 以降がここを踏む): (a) 計上は**入金が成功したあと**、(b) 入金が `creditChipsCappedLocked` 経由なら**戻り値**を計上する(`prize`/`payout` ではない)、(c) 掛け金を持つゲームは `Escrow` を消す**前**に読む、(d) チップを配るだけ・両替するだけの経路は触らない。`store.go` の `addSeasonNetLocked` の直前コメントが (b) の理由を持っている。
 - **次は C3B-02(`SeasonNet` を全ゲームの決着に配線する)**。`UserAccount.SeasonNet` と `addSeasonNetLocked` は C3B-01 で**既に置いてある** — C3B-02 が足すのは (a) スロット / H&L・BJ の `SettleGame` / 宝くじの各決着からの呼び出しと、(b) **読み取り点(`ensureAccountLocked` → `normalizeAccountLocked`)での `[-MaxChips, MaxChips]` 正規化**。(b) はまだ無い(C3B-01 は書き込み側だけを閉じた)。`SettleGame` は「賭けた額」を知らないので、`clearEscrowLocked` の**前に** `account.Escrow` を読んで使う(ダブル込みの総額)。
 - **C-3b の残り**: C3B-02〜C3B-07。仕様 `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`、ブランチ `feat/casino-c3b`。`--evaluate every` で回す(最後のタスクも評価させる)。これでフェーズ C が閉じる。
