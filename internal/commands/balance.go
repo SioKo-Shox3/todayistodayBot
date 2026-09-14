@@ -30,13 +30,18 @@ func (c *BalanceCommand) Definition() *discordgo.ApplicationCommand {
 // The escrow line appears only while a game is in flight (設計書 §3): those
 // chips left Chips but are still the player's, and total assets count them,
 // so without the line a mid-game /balance looks like chips went missing.
+//
+// 今月の純利 (設計書 C-3b §5) carries its sign and is NOT part of the totals
+// below it: it counts wins and losses only — no daily bonus, no exchange, no
+// season prize (§3) — so it deliberately does not reconcile with the balance
+// above it. It points at /season rather than repeating the ranking here.
 func formatBalanceMessage(view casino.AccountView) string {
 	escrow := ""
 	if view.Account.Escrow > 0 {
 		escrow = fmt.Sprintf("\nゲーム中の預かり: %d枚（%s）", view.Account.Escrow, view.Account.EscrowGame)
 	}
-	return fmt.Sprintf("💰 **残高**\nチップ: %d枚%s\nコイン: %d枚\nストリーク: %d日\n総資産: %d相当(本日レート %d)",
-		view.Account.Chips, escrow, view.Account.Coins, view.Account.StreakDays, view.TotalAssets, view.RateUsed)
+	return fmt.Sprintf("💰 **残高**\nチップ: %d枚%s\nコイン: %d枚\nストリーク: %d日\n今月の純利: %+d(/season で順位)\n総資産: %d相当(本日レート %d)",
+		view.Account.Chips, escrow, view.Account.Coins, view.Account.StreakDays, view.Account.SeasonNet, view.TotalAssets, view.RateUsed)
 }
 
 func (c *BalanceCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreate) error {

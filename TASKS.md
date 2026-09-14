@@ -405,7 +405,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: C-2 のセッション基盤をそのまま使う(`AutoResolve` の duel 版は「挑戦の取り下げ」)。通信エラーのログは `redactInteractionError` を通す。
 
 ## C3B-05: `/season` コマンドと `/balance` の純利表示(§5)
-- status: todo
+- status: done
 - done-when: `internal/commands/season.go`: `/season`(今月の上位 10 名・自分の順位と純利・残り日数(月末まで)・前シーズンの結果)。`store.go` に `SeasonStatus(guild, user string, now time.Time) (SeasonView, error)`(ロールオーバーを通す)。`/balance` に「今月の純利」を 1 行足す。`/help` の一覧に `/duel` と `/season` を足す。`season_test.go` / `balance_test.go`: 表示の純粋関数(順位表・自分が圏外のとき・誰も遊んでいないとき・前シーズンなし)、残り日数の計算(月末・月初)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`

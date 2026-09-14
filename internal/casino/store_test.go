@@ -5264,3 +5264,168 @@ func TestStore_SeasonRollover_AcceptDuelAcrossTheBoundaryBooksIntoTheNewMonth(t 
 		"rival":  1_000 - 200 + 5_000,
 	})
 }
+
+// --- /season の読み取り (設計書 C-3b §5) -----------------------------------
+
+// The table is truncated to SeasonTopLimit but the CALLER's place is not:
+// somebody in 12th must be told "12位", not quietly dropped off the board
+// they are trying to climb. Players counts everyone with a result, table or
+// no table.
+func TestStore_SeasonStatus_TruncatesTheTableButNotTheCallersPlace(t *testing.T) {
+	st, _ := newTempStore(t)
+	users := map[string]UserAccount{}
+	// 12 players, each 100 chips of 純利 apart: p01 leads, p12 is last.
+	for place := 1; place <= 12; place++ {
+		users[fmt.Sprintf("p%02d", place)] = UserAccount{Chips: 1_000, SeasonNet: int64(1_300 - 100*place)}
+	}
+	users["idle"] = UserAccount{Chips: 1_000, SeasonNet: 0}
+	seedAccounts(t, st, seasonGuild, users)
+
+	view, err := st.SeasonStatus(seasonGuild, "p12", seasonJuly)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+
+	if view.Month != "2026-07" {
+		t.Errorf("Month = %q, want %q — the read must open the season", view.Month, "2026-07")
+	}
+	if len(view.Ranks) != SeasonTopLimit {
+		t.Fatalf("len(Ranks) = %d, want %d", len(view.Ranks), SeasonTopLimit)
+	}
+	if view.Ranks[0].UserID != "p01" || view.Ranks[0].Net != 1_200 {
+		t.Errorf("Ranks[0] = %+v, want p01 on +1200", view.Ranks[0])
+	}
+	if view.Ranks[SeasonTopLimit-1].UserID != "p10" {
+		t.Errorf("Ranks[9] = %+v, want p10 — the table ends at the 10th place", view.Ranks[SeasonTopLimit-1])
+	}
+	if view.SelfRank != 12 {
+		t.Errorf("SelfRank = %d, want 12 — the caller's place is their place in the WHOLE ranking", view.SelfRank)
+	}
+	if view.Self.Net != 100 {
+		t.Errorf("Self.Net = %d, want 100", view.Self.Net)
+	}
+	if view.Players != 12 {
+		t.Errorf("Players = %d, want 12 — the idle account has no result to count", view.Players)
+	}
+	if view.DaysLeft != 1 {
+		t.Errorf("DaysLeft = %d, want 1 — 7月31日 is the last day of the season", view.DaysLeft)
+	}
+}
+
+// 純利 exactly 0 is unranked, not last: SelfRank 0 is what /season renders as
+// 圏外. Reading the season must not invent a place for someone who has not
+// played, and must not open a season it then reports as somebody's.
+func TestStore_SeasonStatus_UnplayedCallerIsUnranked(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"player": {Chips: 1_000, SeasonNet: 500},
+	})
+
+	view, err := st.SeasonStatus(seasonGuild, "newcomer", seasonJuly)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+
+	if view.SelfRank != 0 {
+		t.Errorf("SelfRank = %d, want 0 (圏外) for an account with no result", view.SelfRank)
+	}
+	if view.Self.Net != 0 {
+		t.Errorf("Self.Net = %d, want 0", view.Self.Net)
+	}
+	if view.Players != 1 {
+		t.Errorf("Players = %d, want 1 — only the one account with a result counts", view.Players)
+	}
+	if view.Last != nil {
+		t.Errorf("Last = %+v, want nil — no season has closed yet", view.Last)
+	}
+}
+
+// The read goes through the daily rollover, so /season on the 1st shows the
+// NEW month and reports the old one as 前シーズン — rather than presenting
+// July's table as if it were still being played for, until some other
+// command happens to close it.
+func TestStore_SeasonStatus_ClosesAnElapsedSeasonBeforeReporting(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"winner": {Chips: 1_000, SeasonNet: 1_000},
+		"loser":  {Chips: 1_000, SeasonNet: -300},
+	})
+	openSeason(t, st, path)
+
+	view, err := st.SeasonStatus(seasonGuild, "winner", seasonAugust)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+
+	if view.Month != "2026-08" {
+		t.Errorf("Month = %q, want %q", view.Month, "2026-08")
+	}
+	if len(view.Ranks) != 0 || view.Players != 0 || view.SelfRank != 0 {
+		t.Errorf("the new season is not empty: %+v", view)
+	}
+	if view.Last == nil {
+		t.Fatal("Last = nil, want July's closed season")
+	}
+	if view.Last.Month != "2026-07" || view.Last.Players != 2 {
+		t.Errorf("Last = %+v, want 2026-07 with 2 players", view.Last)
+	}
+	want := []SeasonRank{{UserID: "winner", Net: 1_000, Bonus: 10_000}, {UserID: "loser", Net: -300, Bonus: 5_000}}
+	if len(view.Last.Ranks) != len(want) {
+		t.Fatalf("Last.Ranks = %+v, want %+v", view.Last.Ranks, want)
+	}
+	for i := range want {
+		if view.Last.Ranks[i] != want[i] {
+			t.Errorf("Last.Ranks[%d] = %+v, want %+v", i, view.Last.Ranks[i], want[i])
+		}
+	}
+	// The prize actually landed: the view is a report of a committed switch,
+	// not a preview of one.
+	assertChips(t, path, map[string]int64{"winner": 11_000, "loser": 6_000})
+}
+
+// The view is handed to a display, and a display must not be able to edit the
+// economy. Last is a copy down to its slice — sharing the stored pointer
+// would let a caller's slice write reach the next Update's snapshot.
+func TestStore_SeasonStatus_LastSeasonIsACopy(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{"winner": {Chips: 1_000, SeasonNet: 1_000}})
+	openSeason(t, st, path)
+
+	view, err := st.SeasonStatus(seasonGuild, "winner", seasonAugust)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+	if view.Last == nil || len(view.Last.Ranks) != 1 {
+		t.Fatalf("Last = %+v, want July with one row", view.Last)
+	}
+	view.Last.Month = "hacked"
+	view.Last.Ranks[0] = SeasonRank{UserID: "thief", Net: 99, Bonus: 99}
+
+	stored := readGuild(t, path, seasonGuild).LastSeason
+	if stored.Month != "2026-07" {
+		t.Errorf("stored Month = %q after the caller edited its copy, want 2026-07", stored.Month)
+	}
+	if stored.Ranks[0].UserID != "winner" {
+		t.Errorf("stored podium = %+v after the caller edited its copy, want winner's row", stored.Ranks[0])
+	}
+}
+
+// A hand-edited 純利 outside the cap must not be able to take first place:
+// the read normalises every account it ranks, the same discipline
+// topAssetsLocked applies to balances.
+func TestStore_SeasonStatus_NormalisesHandEditedNets(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"edited": {Chips: 1_000, SeasonNet: math.MaxInt64},
+		"honest": {Chips: 1_000, SeasonNet: 500},
+	})
+
+	view, err := st.SeasonStatus(seasonGuild, "honest", seasonJuly)
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+
+	if view.Ranks[0].UserID != "edited" || view.Ranks[0].Net != MaxChips {
+		t.Errorf("Ranks[0] = %+v, want the edited account clamped to %d", view.Ranks[0], MaxChips)
+	}
+}

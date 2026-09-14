@@ -51,7 +51,7 @@ func TestFormatHelpText_ListsTheCasinoGames(t *testing.T) {
 	// The registry is the only list there is (絶対規則 2: commands self-register),
 	// so /help drops a game the moment its init() stops running — nothing else
 	// would notice.
-	for _, name := range []string{"highlow", "blackjack", "lottery"} {
+	for _, name := range []string{"highlow", "blackjack", "lottery", "duel", "season"} {
 		if !strings.Contains(got, "`/"+name+"` - ") {
 			t.Errorf("/help does not list /%s:\n%s", name, got)
 		}

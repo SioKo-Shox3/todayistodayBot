@@ -50,7 +50,7 @@ func TestFormatBalanceMessage_RendersAllFields(t *testing.T) {
 		RateUsed:    100,
 		TotalAssets: 3500,
 	}
-	want := "💰 **残高**\nチップ: 1500枚\nコイン: 20枚\nストリーク: 3日\n総資産: 3500相当(本日レート 100)"
+	want := "💰 **残高**\nチップ: 1500枚\nコイン: 20枚\nストリーク: 3日\n今月の純利: +0(/season で順位)\n総資産: 3500相当(本日レート 100)"
 	if got := formatBalanceMessage(view); got != want {
 		t.Fatalf("unexpected message:\n got: %q\nwant: %q", got, want)
 	}
@@ -65,7 +65,7 @@ func TestFormatBalanceMessage_ShowsTheStakeOfAGameInFlight(t *testing.T) {
 		RateUsed:    100,
 		TotalAssets: 3500,
 	}
-	want := "💰 **残高**\nチップ: 1400枚\nゲーム中の預かり: 100枚（highlow）\nコイン: 20枚\nストリーク: 3日\n総資産: 3500相当(本日レート 100)"
+	want := "💰 **残高**\nチップ: 1400枚\nゲーム中の預かり: 100枚（highlow）\nコイン: 20枚\nストリーク: 3日\n今月の純利: +0(/season で順位)\n総資産: 3500相当(本日レート 100)"
 	if got := formatBalanceMessage(view); got != want {
 		t.Fatalf("unexpected message:\n got: %q\nwant: %q", got, want)
 	}
@@ -87,5 +87,58 @@ func TestBalanceCommand_FirstAccess_OpensAccountWithWelcomeBonus(t *testing.T) {
 	}
 	if !strings.Contains(formatBalanceMessage(view), "チップ: 1000枚") {
 		t.Fatalf("the rendered balance must show the welcome bonus: %q", formatBalanceMessage(view))
+	}
+}
+
+// 設計書 C-3b §5「/balance に『今月の純利』を 1 行足す」。The sign is the
+// point: a losing month must read as a loss, and the zero of a player who has
+// not bet must not be mistaken for a player who broke even after a hundred
+// hands — which is why the line points at /season for the ranking.
+func TestFormatBalanceMessage_ShowsThisMonthsNetWithItsSign(t *testing.T) {
+	tests := []struct {
+		name string
+		net  int64
+		want string
+	}{
+		{"勝ち越し", 1_200, "今月の純利: +1200(/season で順位)"},
+		{"負け越し", -350, "今月の純利: -350(/season で順位)"},
+		{"まだ勝敗なし", 0, "今月の純利: +0(/season で順位)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			view := casino.AccountView{
+				Account:     casino.UserAccount{Coins: 20, Chips: 1500, StreakDays: 3, SeasonNet: tc.net},
+				RateUsed:    100,
+				TotalAssets: 3500,
+			}
+			if got := formatBalanceMessage(view); !strings.Contains(got, tc.want+"\n") {
+				t.Fatalf("the 純利 line is missing or wrong:\n got: %q\nwant it to contain: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The number comes off the account the store keeps, so a result booked by a
+// game shows up in /balance without /balance knowing how the game settled.
+func TestBalanceCommand_ShowsTheNetTheEconomyRecorded(t *testing.T) {
+	store := newTestCasinoStore(t)
+	now := testNow()
+	if err := store.EnsureCasinoAccess("g1", "u1", now); err != nil {
+		t.Fatalf("EnsureCasinoAccess: %v", err)
+	}
+	if err := store.OpenGame("g1", "u1", string(casino.GameHighLow), 200, now); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	if _, err := store.SettleGame("g1", "u1", 0); err != nil {
+		t.Fatalf("SettleGame: %v", err)
+	}
+
+	view, err := store.ViewAccount("g1", "u1", now)
+	if err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+
+	if got := formatBalanceMessage(view); !strings.Contains(got, "今月の純利: -200(/season で順位)\n") {
+		t.Fatalf("the lost stake is not reflected in 今月の純利:\n%s", got)
 	}
 }

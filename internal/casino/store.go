@@ -623,6 +623,103 @@ func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 	return entries
 }
 
+// SeasonTopLimit is how many rows /season's table shows (設計書 C-3b §5).
+// It is unrelated to seasonRankLimit, which is how many places are PAID:
+// the table is a display, the podium is money.
+const SeasonTopLimit = 10
+
+// SeasonView is one guild's running season as /season shows it: the table,
+// the caller's own place in it, how long is left, and the season that
+// closed before it.
+//
+// SelfRank is the caller's 1-based place in the FULL ranking, not in the
+// truncated table, so an 11th-placed player is told "11位" rather than
+// silently dropped. 0 means unranked — a 純利 of exactly 0, which
+// SeasonRanks excludes on purpose (a guild is full of accounts that exist
+// only because someone ran /balance).
+type SeasonView struct {
+	Month    string
+	Ranks    []SeasonRank
+	Self     SeasonRank
+	SelfRank int
+	Players  int
+	DaysLeft int
+	Last     *SeasonResult
+}
+
+// SeasonDaysLeft reports how many JST calendar days the season running at
+// `now` still has, COUNTING TODAY: 1 on the last day of the month, 31 on the
+// 1st of a 31-day month. Counting today is what makes "残り1日" mean 「今日で
+// 終わり」 rather than 「もう終わっている」 — the season closes at the next
+// midnight boundary (設計書 C-3b §4), so today is still playable.
+//
+// The month length is taken from the day before the 1st of the NEXT month
+// rather than from a table, so February and leap years need no special case;
+// time.Date normalises month 13 into January of the following year.
+func SeasonDaysLeft(now time.Time) int {
+	t := now.In(jst)
+	lastOfMonth := time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, jst).AddDate(0, 0, -1)
+	return lastOfMonth.Day() - t.Day() + 1
+}
+
+// SeasonStatus returns guildID's season as userID sees it, opening the
+// account (welcome bonus) and running the daily rollover first — the same
+// entry every other read path uses. Going through the rollover is what stops
+// /season on the 1st of a month from showing last month's table: the switch
+// (rolloverSeasonLocked) is hooked into ensureTodayRateLocked, so reading
+// without it would report a season that has already been paid out and
+// zeroed by the next command to arrive.
+//
+// Every account is normalised on the way past, for topAssetsLocked's reason:
+// SeasonRanks compares stored values, and a hand-edited 純利 outside
+// [-MaxChips, MaxChips] would otherwise sit at the top of the table.
+//
+// The previous season is returned as a COPY, slice included: the value
+// behind economy.LastSeason stays in the store's data, and handing a caller
+// a pointer into it would let a display mutate the file's contents.
+func (s *Store) SeasonStatus(guildID, userID string, now time.Time) (SeasonView, error) {
+	var view SeasonView
+	err := s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		ensureTodayRateLocked(economy, now, s.rng)
+		account := ensureAccountLocked(economy, userID)
+		for _, other := range economy.Users {
+			if other == nil {
+				continue // hand-edited {"users":{"someone":null}}; see topAssetsLocked
+			}
+			normalizeAccountLocked(other)
+		}
+
+		ranked := SeasonRanks(economy.Users, len(economy.Users))
+		view = SeasonView{
+			Month:    economy.SeasonMonth,
+			Ranks:    ranked,
+			Self:     SeasonRank{UserID: userID, Net: account.SeasonNet},
+			Players:  len(ranked),
+			DaysLeft: SeasonDaysLeft(now),
+		}
+		for i, rank := range ranked {
+			if rank.UserID == userID {
+				view.SelfRank = i + 1
+				break
+			}
+		}
+		if len(view.Ranks) > SeasonTopLimit {
+			view.Ranks = view.Ranks[:SeasonTopLimit]
+		}
+		if economy.LastSeason != nil {
+			last := *economy.LastSeason
+			last.Ranks = append([]SeasonRank(nil), economy.LastSeason.Ranks...)
+			view.Last = &last
+		}
+		return nil
+	})
+	if err != nil {
+		return SeasonView{}, err
+	}
+	return view, nil
+}
+
 // TopAssets returns guildID's top `limit` accounts by total assets, using
 // today's rate (generated first if missing, same transaction).
 func (s *Store) TopAssets(guildID string, now time.Time, limit int) ([]RankEntry, error) {
