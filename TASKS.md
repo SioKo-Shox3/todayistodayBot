@@ -103,7 +103,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 文言は §9。ボタンのラベルに確率と倍率を出す(例 `⬆️ ハイ 61% ×1.55`)。
 
 ## C2-07: `/blackjack` コマンド・ボタン・表示(§7・§8・§9)
-- status: todo
+- status: done
 - done-when: `internal/commands/blackjack.go`: `/blackjack <bet>`(C2-06 と同じガード) → `OpenGame` → `NewBlackjack`。ナチュラルで即決着なら精算して結果を出す。それ以外は embed(プレイヤーの手と値、ディーラーの表 1 枚 + 🂠)と 3 ボタン `🃏 ヒット` / `✋ スタンド` / `⏫ ダブル`(ダブルは最初の判断だけ有効・残高不足なら disabled)。`ComponentHandler`(prefix `blackjack`): 所有者検査 → ダブルは `AddToEscrow` を先に永続化 → 盤面適用 → 決着なら `SettleGame` → 編集(ディーラーの伏せ札を公開)。ナチュラルは公開の祝い。`blackjack_test.go`: 表示の純粋関数、ダブルの disabled 条件、精算が編集より先、二重押し(決着後)の応答。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestBlackjack" -count=1`
