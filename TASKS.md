@@ -387,7 +387,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。`SeasonNet` は順位のための集計値で通貨ではない(§2)— 保存則のテストに混ぜない。
 
 ## C3B-03: 月次シーズンの切り替えと賞与(§4)
-- status: todo
+- status: done
 - done-when: `internal/casino/season.go`: `SeasonRanks(users map[string]*UserAccount, limit int) []SeasonRank`(純利の降順、同点は UserID 昇順、純利 0 は除く)、`SeasonBonus(rank int) int64`(1 位 10,000 / 2 位 5,000 / 3 位 2,500 / それ以外 0)。`types.go` に `SeasonMonth` / `LastSeason` / `SeasonResult` / `SeasonRank`(§4 の形)。`store.go` の日次ロールオーバー(`ensureTodayRateIndexLocked`)に `rolloverSeasonLocked(economy, month string)`: JST の月が `SeasonMonth` と違えば閉じる — 上位 3 名へ賞与を入れ(`creditChipsCappedLocked`。入り切らない分は捨てる。`SeasonRank.Bonus` は**実際に入った額**)、`LastSeason` を書き、全口座の `SeasonNet` を 0 にし、`SeasonMonth` を今月にする。未開始(`""`)なら賞与を配らず今月を開始するだけ。**月の比較は `SeasonMonth < month` の前進のみ**(時計の巻き戻しで二度閉じない。C3-19 と同じ規律)。`season_test.go` / `store_test.go`: 順位と同点の解決、賞与の額、純利 0 を数えない、月またぎで 1 回だけ閉じる、巻き戻りで閉じない、未開始ギルドは賞与なし、切り替え後に全員の `SeasonNet` が 0、賞与が上限で入り切らないときの `Bonus` の値、既存 JSON(フィールド無し)の互換。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

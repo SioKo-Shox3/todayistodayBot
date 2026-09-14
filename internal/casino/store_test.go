@@ -5172,3 +5172,95 @@ func TestStore_SeasonRollover_RunsBeforeTheLotteryDraw(t *testing.T) {
 	assertSeasonNet(t, path, seasonGuild, "buyer", prize)
 	assertChips(t, path, map[string]int64{"buyer": 1_000 + 10_000 + prize})
 }
+
+// seasonJulyLate is the last minute of July JST — the instant a game is
+// STARTED at in the boundary regressions below, so that only the settlement
+// falls in August.
+var seasonJulyLate = time.Date(2026, 7, 31, 23, 59, 0, 0, jst)
+
+// A settlement that lands on the far side of a month boundary belongs to the
+// month it landed in, not to the one that has just ended.
+//
+// The daily rollover is a READ path: SettleGame takes no instant from the
+// caller and never reaches it. Without the switch inside the settlement's own
+// transaction, a hand that was dealt on 31 July and paid at 00:01 on 1 August
+// is added to July's 純利 — and the very next display then closes July with
+// August's result on the podium and opens August at zero, i.e. the result is
+// counted for the wrong month AND lost from the right one.
+func TestStore_SeasonRollover_SettleGameAcrossTheBoundaryBooksIntoTheNewMonth(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"player": {Chips: 1_000, SeasonNet: 500},
+	})
+	openSeason(t, st, path)
+
+	// Dealt in July...
+	if err := st.OpenGame(seasonGuild, "player", string(GameHighLow), 100, seasonJulyLate); err != nil {
+		t.Fatalf("OpenGame returned error: %v", err)
+	}
+	// ...paid in August, with no display in between.
+	if _, err := st.at(seasonAugust).SettleGame(seasonGuild, "player", 200); err != nil {
+		t.Fatalf("SettleGame returned error: %v", err)
+	}
+
+	// July closed on the 純利 it had BEFORE the hand was paid.
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "player", Net: 500, Bonus: 10_000}})
+	// ...and the hand's +100 opens August rather than vanishing with the zeroing.
+	assertSeasonNet(t, path, seasonGuild, "player", 100)
+	assertChips(t, path, map[string]int64{"player": 1_000 - 100 + 200 + 10_000})
+	if month := readGuild(t, path, seasonGuild).SeasonMonth; month != "2026-08" {
+		t.Fatalf("SeasonMonth = %q after the settlement, want %q", month, "2026-08")
+	}
+}
+
+// The slot books its 純利 in the same transaction as the spin and, like
+// SettleGame, never passes the display's rollover.
+func TestStore_SeasonRollover_SpinAcrossTheBoundaryBooksIntoTheNewMonth(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"player": {Chips: 1_000, SeasonNet: 500},
+	})
+	openSeason(t, st, path)
+
+	result, err := st.at(seasonAugust).Spin(seasonGuild, "player", 100)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 1, []SeasonRank{{UserID: "player", Net: 500, Bonus: 10_000}})
+	// The expectation comes from the spin's own report, not from a copy of
+	// the paytable: what is under test is WHICH MONTH the net lands in.
+	assertSeasonNet(t, path, seasonGuild, "player", result.Payout-100)
+	if month := readGuild(t, path, seasonGuild).SeasonMonth; month != "2026-08" {
+		t.Fatalf("SeasonMonth = %q after the spin, want %q", month, "2026-08")
+	}
+}
+
+// The duel settles BOTH sides in one transaction, so a boundary crossed
+// there would misfile two players' results at once.
+func TestStore_SeasonRollover_AcceptDuelAcrossTheBoundaryBooksIntoTheNewMonth(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"player": {Chips: 1_000, SeasonNet: 500},
+		"rival":  {Chips: 1_000, SeasonNet: 300},
+	})
+	openSeason(t, st, path)
+
+	if err := st.OpenGame(seasonGuild, "player", string(GameDuel), 200, seasonJulyLate); err != nil {
+		t.Fatalf("OpenGame(duel) returned error: %v", err)
+	}
+	if _, err := st.at(seasonAugust).AcceptDuel(seasonGuild, "player", "rival", 200, true); err != nil {
+		t.Fatalf("AcceptDuel returned error: %v", err)
+	}
+
+	assertSeason(t, path, "2026-07", 2, []SeasonRank{
+		{UserID: "player", Net: 500, Bonus: 10_000},
+		{UserID: "rival", Net: 300, Bonus: 5_000},
+	})
+	assertSeasonNet(t, path, seasonGuild, "player", 200)
+	assertSeasonNet(t, path, seasonGuild, "rival", -200)
+	assertChips(t, path, map[string]int64{
+		"player": 1_000 - 200 + 400 + 10_000,
+		"rival":  1_000 - 200 + 5_000,
+	})
+}

@@ -915,6 +915,7 @@ func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 	var result SpinResult
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
+		s.ensureSeasonMonthLocked(economy)
 		account := ensureAccountLocked(economy, userID)
 		if account.Chips < bet {
 			return &ErrInsufficientChips{Balance: account.Chips}
@@ -1108,6 +1109,7 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 			return ErrInvalidAmount
 		}
 		economy := ensureGuildLocked(d, guildID)
+		s.ensureSeasonMonthLocked(economy)
 		account := ensureAccountLocked(economy, userID)
 		if account.Escrow == 0 {
 			return ErrNoGameInProgress
@@ -1160,6 +1162,32 @@ func addSeasonNetLocked(account *UserAccount, delta int64) {
 		net = -MaxChips
 	}
 	account.SeasonNet = net
+}
+
+// ensureSeasonMonthLocked closes an elapsed season before the caller books a
+// game's 純利. The rollover's home is ensureTodayRateIndexLocked, the read
+// path every DISPLAY passes through — but a settlement is not a read:
+// SettleGame, Spin and AcceptDuel take no `now` from the caller and reach
+// addSeasonNetLocked without ever touching that path. A game whose result
+// lands in the first minutes of a new month would otherwise be added to the
+// month that has already ended, and the next display would then close that
+// month WITH the foreign result on the podium and open the new one at zero.
+//
+// It calls rolloverSeasonLocked alone rather than the whole daily rollover:
+// the rate history and the lottery draw are the display's business and want
+// the caller's instant, while the month a result is booked into is decided
+// by the clock at the moment the chips move — s.nowLocked(), read under the
+// lock like s.rng. Being idempotent and forward-only (see below), running it
+// here as well as on the read path costs nothing on the days it has nothing
+// to do.
+//
+// Call it BEFORE the credit, never after: the switch zeroes every account's
+// SeasonNet, so the other order erases the very result being booked.
+//
+// Caller must already hold the Store's lock (call only from inside an
+// Update closure).
+func (s *Store) ensureSeasonMonthLocked(economy *GuildEconomy) {
+	rolloverSeasonLocked(economy, jstMonth(s.nowLocked()))
 }
 
 // rolloverSeasonLocked closes the running season when the JST month has
@@ -1321,6 +1349,7 @@ func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, 
 			return ErrInvalidAmount
 		}
 		economy := ensureGuildLocked(d, guildID)
+		s.ensureSeasonMonthLocked(economy)
 		challenger := ensureAccountLocked(economy, challengerID)
 		opponent := ensureAccountLocked(economy, opponentID)
 
