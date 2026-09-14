@@ -437,3 +437,42 @@
 - **設計書の「duel はゼロサム」は `paths:` の外**: `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md:22` は
   設計の契約として無条件のゼロサムを書いている(§2 の実測段落は上限の話と整合)。今回は触っていない。
   次に設計書を開くときに、上限の例外を 1 行足すか判断する。
+
+## 反復 2(C3B-13) — 2026-09-15
+
+- **Done**: C3B-13。`UserAccount` に `EscrowSession`(`json:"escrow_session,omitempty"`)を足し、
+  預かりに「どの盤面のものか」の印を持たせた。`SettleGame` / `AddToEscrow` / `AcceptDuel` /
+  `DeclineDuel` は渡されたセッション ID と印が一致するときだけ動き、不一致は新しいセンチネル
+  `ErrEscrowMismatch` で拒む(`escrowOwnedByLocked`)。ゲート 3 本とも exit=0・全 8 パッケージ ok
+  (`.harness/runs/20260915-080323/verify-C3B-13-1..3.txt`)。
+- **Next**: C3B-14(未送達時の後始末を盤面ロックの内側で行う。blocking 1、P1)。未完は C3B-14〜17 の 4 件。
+- **印は盤面が生まれる前から必要だった(二段階の開始)**: 賭けは盤面より先に動く(C2-06 の完了条件 —
+  「一人一ゲーム」の**永続する側**が二度目の賭けを断る側でなければならない)ので、`OpenGame` の
+  時点ではまだセッション ID が無い。印を空のままにするとその隙だけ「誰の預かりでもない」= 誰でも
+  精算できる状態が残るので、`OpenGame` は `casino.EscrowOpening`(定数 `"opening"`)を書き、盤面が
+  できてから `BindEscrowSession` が盤面 ID へ差し替える。セッション ID は 32 桁の hex なので
+  `"opening"` と衝突しない = 開始途中の預かりを精算できるのは、その定数を明示して渡す開始側の
+  返金だけ。順序を逆(盤面 → 賭け)にする案は採らなかった:
+  `TestHighLowStakesBeforeTheBoardAndRefundsWhenTheBoardCannotOpen` と blackjack の同名テストが
+  C2-06 の契約としてこの順序を押さえており、`session.go` の `Open` の説明もそれ前提で書かれている。
+- **`paths:` の外に 3 ファイル触った(不可避)**: `internal/commands/casino_shared.go` は `casinoBank`
+  インターフェースの住所で、`SettleGame` などの引数が増えれば**必ず**直さないとコンパイルが通らない
+  (タスクの `paths:` がこの 1 ファイルを落としている)。`internal/commands/balance_test.go` と
+  `season_test.go` も同じ理由(`OpenGame` の呼び出しが 1 行ずつ)。どれも引数の追加だけで、判断は
+  入っていない。
+- **後方互換は「印が空なら通す」= 前向きにだけ効く**: 配備前に開かれた預かりは `escrow_session` を
+  持たないので、どの盤面からでも精算できる(`escrowOwnedByLocked`)。ここを厳格にすると、更新を
+  またいだ進行中のゲームのチップが全部宙に浮く。印が守るのは C3B-13 以降に開かれた盤面だけ。
+- **効き目の確認(mutation)**: `escrowOwnedByLocked` を `return true` に差し替えると、今回足した
+  5 件(duel の受諾・取り下げ、H&L/BJ の精算、ダブルの追加、`BindEscrowSession`)がすべて落ちる
+  (`verify-C3B-13-mutation.txt`)。緑なだけでは印が効いている証拠にならない。
+- **掃除人の扱い**: `sweepIdleBoards` は `ErrEscrowMismatch` を `ErrNoGameInProgress` と同じ
+  「この盤面にはもう払うものが無い」として盤面を落とす。再試行を続けても、口座にある預かりは
+  別の盤面のものなので永久に払えない。
+- **テスト側の下準備も本番と同じ順序にした**: `sweepFixture` は `EscrowOpening` で開いてから
+  `BindEscrowSession` で盤面へ渡す。盤面を差し替えていた 2 つのテストは、差し替えをやめて
+  `sweepFixtureFor(t, casino.GameBlackjack, ...)` で最初から blackjack の盤面を開く
+  (`dropFixtureBoard` は残っているが呼ぶ人がいなくなった — 次に触るときに消すか判断する)。
+- **評価者未実施**: 危険地帯の変更なので、区切りのレビューでは `AcceptDuel` / `SettleGame` の
+  再入(`Update` のクロージャ内から公開メソッドを呼んでいないこと)と、`EscrowOpening` の隙間に
+  誰も入れないことを重点に見てほしい。
