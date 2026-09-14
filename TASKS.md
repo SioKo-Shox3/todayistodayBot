@@ -226,7 +226,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 祝いは掲示チャンネルへ。掲示チャンネル未設定なら祝いも送らない(結果は `/lottery status` で見える)。
 
 ## C3-06: README・設計書の実測・architecture の追記案(§4・§7)
-- status: todo
+- status: done
 - done-when: `README.md` のコマンド一覧に `/lottery buy` / `/lottery status` と、`/slot` のジャックポットの説明を足す(公開物 — 過程を書かない)。設計書 §2・§3 の「実測」として、積立の端数の例と賞金の計算例を 1 段落ずつ書く。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3-06.md` に正本へ写す追記(レイヤー表の「宝くじ」、日次ロールオーバーで動くもの = レート生成・ジャックポットの種・宝くじの抽選、危険地帯 6 点目 = プールと賞金の保存則)を書く。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./... -count=1`
