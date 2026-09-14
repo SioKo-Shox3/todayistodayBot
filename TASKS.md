@@ -94,7 +94,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: discordgo 非依存。放置の自動決着のゲーム側処理(`AutoResolve` → 精算 → 編集)は C2-08 の Sweep goroutine が呼ぶ。
 
 ## C2-06: `/highlow` コマンド・ボタン・表示(§6・§8・§9)
-- status: todo
+- status: done
 - done-when: `internal/commands/highlow.go`: `/highlow <bet>`(ギルド専用宣言 + 実行時ガード、ベット幅 10〜1,000、`EnsureCasinoAccess` → `Store.OpenGame` → `DefaultSessions().Open` → 公開メッセージに embed(現在のカード・ポット・連勝・各選択肢の確率と倍率)と 3 ボタン `⬆️ ハイ` / `⬇️ ロー` / `💰 キャッシュアウト`(選択不可の側は disabled)。`ComponentHandler`(prefix `highlow`): 所有者検査 → `WithSession` で `Guess`/`CashOut` を適用 → 決着なら `SettleGame` を先に永続化 → メッセージ編集(結果・配当・残高、ボタン無効化)。7 連勝以上のキャッシュアウトは公開の祝いメッセージ(`slot.go` の流儀)。通信エラーのログは `redactInteractionError` を通す。`/balance` に預かり額を 1 行足す。`highlow_test.go`: 表示の純粋関数(embed 本文・ボタンの disabled)、custom_id の往復、所有者不一致、決着後のボタンは「終了しています」、精算が編集より先(fake responder で順序を記録)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestHighLow|TestBalance" -count=1`

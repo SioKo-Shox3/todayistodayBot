@@ -26,9 +26,17 @@ func (c *BalanceCommand) Definition() *discordgo.ApplicationCommand {
 // formatBalanceMessage renders /balance's response. Wording is this plan's
 // own judgment (設計書 doesn't pin exact copy for /balance) — consistent
 // with the rest of the bot's tone.
+//
+// The escrow line appears only while a game is in flight (設計書 §3): those
+// chips left Chips but are still the player's, and total assets count them,
+// so without the line a mid-game /balance looks like chips went missing.
 func formatBalanceMessage(view casino.AccountView) string {
-	return fmt.Sprintf("💰 **残高**\nチップ: %d枚\nコイン: %d枚\nストリーク: %d日\n総資産: %d相当(本日レート %d)",
-		view.Account.Chips, view.Account.Coins, view.Account.StreakDays, view.TotalAssets, view.RateUsed)
+	escrow := ""
+	if view.Account.Escrow > 0 {
+		escrow = fmt.Sprintf("\nゲーム中の預かり: %d枚（%s）", view.Account.Escrow, view.Account.EscrowGame)
+	}
+	return fmt.Sprintf("💰 **残高**\nチップ: %d枚%s\nコイン: %d枚\nストリーク: %d日\n総資産: %d相当(本日レート %d)",
+		view.Account.Chips, escrow, view.Account.Coins, view.Account.StreakDays, view.TotalAssets, view.RateUsed)
 }
 
 func (c *BalanceCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCreate) error {

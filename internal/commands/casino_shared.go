@@ -191,8 +191,35 @@ func redactInteractionError(err error) string {
 // s.InteractionRespond; the returned error is a plain message (nothing
 // unwraps it) that has already been through redactInteractionError.
 func respond(s *discordgo.Session, i *discordgo.Interaction, resp *discordgo.InteractionResponse) error {
-	if err := s.InteractionRespond(i, resp); err != nil {
+	return respondVia(s, i, resp)
+}
+
+// interactionResponder is the *discordgo.Session surface the button games
+// need. Taking it as an interface is what lets a test observe the ORDER of
+// a settlement and the message edit that follows it without a Discord
+// connection — the same seam as slot.go's slotResponder, widened because a
+// board also has to look its own message up (to remember the message ID for
+// the idle sweeper) and post a public celebration.
+type interactionResponder interface {
+	InteractionRespond(i *discordgo.Interaction, resp *discordgo.InteractionResponse, options ...discordgo.RequestOption) error
+	InteractionResponse(i *discordgo.Interaction, options ...discordgo.RequestOption) (*discordgo.Message, error)
+	ChannelMessageSend(channelID, content string, options ...discordgo.RequestOption) (*discordgo.Message, error)
+}
+
+// respondVia is respond() for a handler that holds the interface rather than
+// the concrete session. It is the single place the games' replies leave the
+// package, so the redaction rule holds for them too.
+func respondVia(r interactionResponder, i *discordgo.Interaction, resp *discordgo.InteractionResponse) error {
+	if err := r.InteractionRespond(i, resp); err != nil {
 		return errors.New(redactInteractionError(err))
 	}
 	return nil
+}
+
+// messageResponse wraps content as a plain, publicly visible reply.
+func messageResponse(content string) *discordgo.InteractionResponse {
+	return &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Content: content},
+	}
 }

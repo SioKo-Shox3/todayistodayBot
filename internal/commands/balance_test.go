@@ -56,6 +56,21 @@ func TestFormatBalanceMessage_RendersAllFields(t *testing.T) {
 	}
 }
 
+// While a board is in flight the stake is out of Chips but still counted in
+// TotalAssets, so /balance has to name it — otherwise a mid-game balance
+// looks like chips went missing.
+func TestFormatBalanceMessage_ShowsTheStakeOfAGameInFlight(t *testing.T) {
+	view := casino.AccountView{
+		Account:     casino.UserAccount{Coins: 20, Chips: 1400, Escrow: 100, EscrowGame: "highlow", StreakDays: 3},
+		RateUsed:    100,
+		TotalAssets: 3500,
+	}
+	want := "💰 **残高**\nチップ: 1400枚\nゲーム中の預かり: 100枚（highlow）\nコイン: 20枚\nストリーク: 3日\n総資産: 3500相当(本日レート 100)"
+	if got := formatBalanceMessage(view); got != want {
+		t.Fatalf("unexpected message:\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestBalanceCommand_FirstAccess_OpensAccountWithWelcomeBonus(t *testing.T) {
 	store := newTestCasinoStore(t)
 	now := testNow()
