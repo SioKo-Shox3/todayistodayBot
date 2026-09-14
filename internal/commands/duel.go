@@ -331,7 +331,9 @@ func (c *DuelCommand) SettleTimedOutBoard(session *casino.Session) (casino.Settl
 		return casino.SettleResult{}, err
 	}
 	board.Stage = casino.DuelSettled
-	return casino.SettleResult{Payout: board.Bet}, nil
+	// Owed equals Payout because DeclineDuel returns the stake whole: the
+	// withdrawal never goes near the chip cap, so there is nothing to drop.
+	return casino.SettleResult{Payout: board.Bet, Owed: board.Bet}, nil
 }
 
 // --- error wording ---------------------------------------------------------

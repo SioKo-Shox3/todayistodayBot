@@ -2133,20 +2133,86 @@ func TestSettleGame_NegativePayoutIsRefusedAndKeepsTheEscrow(t *testing.T) {
 	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, "highlow")
 }
 
-func TestSettleGame_PayoutOverTheChipCapPersistsNothing(t *testing.T) {
+// A payout with nowhere to go is CAPPED, not refused (設計書 C-3b §2): the
+// game closes, what fits lands and the rest is dropped. Refusing was the
+// pre-C3B-12 behaviour — see TestSettleGame_AtTheCapAfterTheMonthlyBonus...
+// below for what it cost.
+func TestSettleGame_PayoutOverTheChipCapKeepsOnlyWhatFits(t *testing.T) {
 	st, path := newTempStore(t)
-	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips})
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips - 500})
 	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
-	// Free chips are MaxChips-1000; a payout of 2000 would land at
-	// MaxChips+1000.
-	_, err := st.SettleGame(escrowGuild, escrowUser, 2000)
-	if !errors.Is(err, ErrChipCapExceeded) {
-		t.Fatalf("SettleGame error = %v, want ErrChipCapExceeded", err)
+	// Free chips are MaxChips-1500, so of a 2000 payout only 1500 fits.
+	result, err := st.SettleGame(escrowGuild, escrowUser, 2000)
+	if err != nil {
+		t.Fatalf("SettleGame returned error: %v", err)
 	}
-	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips-1000, 1000, "highlow")
+	if result.Payout != 1500 || result.Owed != 2000 || result.Chips != MaxChips {
+		t.Fatalf("SettleResult = %+v, want Payout 1500 / Owed 2000 / Chips %d", result, MaxChips)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips, 0, "")
+	// 純利 counts what LANDED: 1500 credited against a 1000 stake is +500, not
+	// the +1000 the owed figure would book (§2's last bullet).
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 500)
+}
+
+// The whole point of C3B-12: the monthly bonus is itself what fills the
+// account, so a refusal here rolls back the season switch that caused it and
+// the next attempt rebuilds the same state — the hand could never be settled.
+//
+// July's leader carries a 100-chip hand into August with 300 chips of room.
+// The rollover pays the 1位 bonus first, capped at those 300, leaving 100 of
+// room for a 200-chip payout.
+func TestSettleGame_AtTheCapAfterTheMonthlyBonusStillClosesTheGame(t *testing.T) {
+	st, path := newTempStore(t)
+	err := st.Update(func(d *Data) error {
+		(*d)[seasonGuild] = &GuildEconomy{
+			SeasonMonth: "2026-07",
+			Users: map[string]*UserAccount{
+				"leader": {
+					Chips:          MaxChips - 300,
+					Escrow:         100,
+					EscrowGame:     string(GameHighLow),
+					EscrowOpenedAt: "2026-07-31T23:55:00+09:00",
+					SeasonNet:      500,
+				},
+			},
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding the season returned error: %v", err)
+	}
+
+	result, err := st.at(seasonAugust).SettleGame(seasonGuild, "leader", 200)
+	if err != nil {
+		t.Fatalf("SettleGame returned error: %v — the cap must not refuse a settlement", err)
+	}
+	if result.Payout != 100 || result.Owed != 200 || result.Chips != MaxChips {
+		t.Fatalf("SettleResult = %+v, want Payout 100 / Owed 200 / Chips %d", result, MaxChips)
+	}
+	assertHoldings(t, path, seasonGuild, "leader", MaxChips, 0, "")
+
+	// The season switch COMMITTED. This is the assertion that fails on a
+	// refusal: a rolled-back transaction leaves the guild in July with the
+	// hand still in escrow, and every retry repeats it.
+	economy := readGuild(t, path, seasonGuild)
+	if economy.SeasonMonth != "2026-08" {
+		t.Fatalf("SeasonMonth = %q, want 2026-08 — the rollover rolled back with the settlement", economy.SeasonMonth)
+	}
+	if len(economy.UnannouncedSeasons) != 1 || economy.UnannouncedSeasons[0].Month != "2026-07" {
+		t.Fatalf("UnannouncedSeasons = %+v, want July's closed result", economy.UnannouncedSeasons)
+	}
+	// 純利: the rollover zeroed it, then the settlement booked 100 landed
+	// against the 100 staked. The bonus itself stays out of 純利 (§3).
+	assertSeasonNet(t, path, seasonGuild, "leader", 0)
+
+	// The game is CLOSED, not waiting for a retry that can never succeed.
+	if _, err := st.SettleGame(seasonGuild, "leader", 200); !errors.Is(err, ErrNoGameInProgress) {
+		t.Fatalf("second SettleGame returned %v, want ErrNoGameInProgress", err)
+	}
 }
 
 func TestRefundStaleEscrows_ReturnsEveryStakeInEveryGuild(t *testing.T) {
@@ -4566,12 +4632,15 @@ func TestSettleGame_RefusalsLeaveSeasonNetUntouched(t *testing.T) {
 	}
 	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
 
-	// A payout that breaks the cap aborts the whole transaction.
+	// A negative payout aborts the whole transaction. (The chip cap is NOT on
+	// this list since C3B-12: it caps the credit instead of refusing it, so
+	// the 純利 it books is the landed amount rather than nothing — that is
+	// TestSettleGame_PayoutOverTheChipCapKeepsOnlyWhatFits.)
 	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), 100, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
-	if _, err := st.SettleGame(escrowGuild, escrowUser, MaxChips); !errors.Is(err, ErrChipCapExceeded) {
-		t.Fatalf("SettleGame over the cap returned %v, want ErrChipCapExceeded", err)
+	if _, err := st.SettleGame(escrowGuild, escrowUser, -1); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("SettleGame with a negative payout returned %v, want ErrInvalidAmount", err)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, string(GameHighLow))
 	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)

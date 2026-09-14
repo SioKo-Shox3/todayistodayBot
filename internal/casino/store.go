@@ -1219,7 +1219,8 @@ func (s *Store) AddToEscrow(guildID, userID string, amount int64) error {
 // SettleResult is what a settlement left behind.
 type SettleResult struct {
 	Chips  int64 // the account's chip balance after the payout landed
-	Payout int64 // what was paid, stake included (0 on a loss)
+	Payout int64 // what ACTUALLY landed, stake included (0 on a loss)
+	Owed   int64 // what the settlement owed; above Payout only when MaxChips kept the rest out
 }
 
 // SettleGame closes the in-flight game for guildID/userID: the escrow is
@@ -1232,9 +1233,21 @@ type SettleResult struct {
 // dropping a settled session is the other half): a button pressed twice in
 // the same instant resolves the same board on two goroutines, and without
 // this check the second one would pay the whole payout again out of nothing.
-// ErrInvalidAmount rejects a negative payout and ErrChipCapExceeded a payout
-// that would break MaxChips — on any error nothing at all is persisted, so
-// the escrow survives for a retry rather than vanishing.
+// ErrInvalidAmount rejects a negative payout — on any error nothing at all is
+// persisted, so the escrow survives for a retry rather than vanishing.
+//
+// A payout that does not fit under MaxChips is NOT an error. The credit goes
+// through creditChipsCappedLocked: the account takes what fits and the rest is
+// dropped (設計書 C-3b §2, the same rule as the season bonus and the duel pot).
+// Refusing would abort a transaction that has already closed an elapsed season
+// above — and the monthly bonus paid by that very rollover is what fills the
+// account to the cap, so the retry rebuilds the state that refused it and the
+// game can never be settled again, escrow and all. A cap is a property of
+// where the chips are going, not a reason to leave a game open.
+//
+// SettleResult.Owed keeps the owed figure so a caller can tell the two apart;
+// Payout is what the player really received, which is what the boards print
+// and what 純利 is booked from (§2: 「実際に口座へ入った額」).
 func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, error) {
 	var result SettleResult
 	err := s.Update(func(d *Data) error {
@@ -1254,11 +1267,13 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 		// exactly 設計書 C-3b §3's 「賭けた額」 for a hand that doubled.
 		staked := account.Escrow
 		clearEscrowLocked(account)
-		if err := creditChipsLocked(account, payout); err != nil {
-			return err // aborts: the escrow release above is discarded with the transaction
-		}
-		addSeasonNetLocked(account, payout-staked)
-		result = SettleResult{Chips: account.Chips, Payout: payout}
+		// The escrow is released FIRST so the cap is measured against the
+		// headroom the stake leaves behind: a push (payout == staked) always
+		// fits, and a player at the cap gets their own chips back rather than
+		// having them counted twice.
+		credited := creditChipsCappedLocked(account, payout)
+		addSeasonNetLocked(account, credited-staked)
+		result = SettleResult{Chips: account.Chips, Payout: credited, Owed: payout}
 		return nil
 	})
 	if err != nil {

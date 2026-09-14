@@ -475,7 +475,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 設計判断は親が決めた(各 notes)。仕様 § は `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`。
 
 ## C3B-12: 精算の入金を他の経路と同じ「上限で切り詰める」形に揃える(blocking 3、P1)
-- status: todo
+- status: done
 - done-when: 月次賞与が口座の空きを埋めた直後の `SettleGame` が `creditChipsLocked`(厳格版)で `ErrChipCapExceeded` を返し、**トランザクション全体(月次切り替えを含む)が巻き戻って何度やっても失敗する**(再現: 7 月首位を `Chips=MaxChips-300`・`Escrow=100`・`SeasonNet=500` にして 8 月の時計で `SettleGame(..., 200)`)。§2 の契約は「配当が口座の上限で入り切らない分は**捨てる**」なので、`SettleGame` の入金を `creditChipsCappedLocked` に変え、`SeasonNet` は**実際に入った額**で数える(§2 の既存規則)。`SettleResult` に実際に入った額が分かる情報を残す(表示が「配当 N」と嘘をつかないこと)。同じ理由で上限に当たりうる他の精算経路(`AcceptDuel` の勝者への入金など)も同じ扱いか確認し、違えば揃える。併せて設計書 §2 冒頭の「合計は不変」「消えない」という無条件の書き方に**上限の例外**を足す(non-blocking 1。実測段落・README・`blocked/C3B-07.md` とは既に整合しているので冒頭だけ)。回帰テスト: 上の再現手順で精算が成功し、入った分だけ増え、`SeasonNet` も入った額で動く / 通常範囲の既存の期待値が 1 つも変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
@@ -518,3 +518,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
 - notes: **嘘を書かない** — 「必ず一度だけ」とは書かず、再送されうる条件をそのまま書く(C-3a の「精算失敗は手動再試行だけが出口」と同じ扱い)。
+
+## C3B-17: スロットの配当も上限で切り詰める(C3B-12 で見つけた最後の不揃い、P2)
+- status: todo
+- done-when: C3B-12 で他の精算経路を確認した結果、`Store.Spin`(`store.go` の `creditChipsLocked(account, result.Payout)`)だけが**上限で拒否する**形のまま残っている。設計書 §2 は「上限で入り切らない分は捨てる(**スロット等の配当と同じ**)」と書いており、スロットこそがその例として名指しされているのに実装が唯一の例外になっている。`SettleGame` と同じく `creditChipsCappedLocked` に変え、`SeasonNet` は入った額で数え、`SpinResult` に入った額と払うはずだった額の両方を残す。**ジャックポットは別の判断が要る** — 当たりで `economy.Jackpot = JackpotSeed` と一緒にリセットされるので、上限で入り切らない分をそのまま捨てるとプールの分まで消える。宝くじ(`drawLotteryLocked`)は溢れた分をプールへ戻しており、こちらも同じ形にできるか実装者が決めて理由を進捗に書く。回帰テスト: `MaxChips` 近くの口座がスロットを回すと拒否ではなく入る分だけ入る / `SeasonNet` が入った額で動く / 通常範囲の既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/commands/slot.go, internal/commands/slot_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
+- notes: `SettleGame` と違い**行き詰まりはしない**(取引ごと巻き戻るので賭け金は戻り、預かりも残らない)ので P1 ではない。`slot.go` の `ErrChipCapExceeded` の分岐は変更後に到達不能になるので一緒に消す。`ClaimDaily` と両替は精算ではない(進行中のものが無く、拒否しても利用者は元手を保ったまま)ので厳格なままでよい — 揃えない。
