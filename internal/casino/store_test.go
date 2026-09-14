@@ -1558,6 +1558,42 @@ func TestStore_TopAssets_MaxBalances_DoesNotOverflow(t *testing.T) {
 	}
 }
 
+// TestTopAssets_HandEditedMaxInt64IsNormalisedNotWrapped is the same guard
+// one step further out. The test above proves the arithmetic is safe for
+// balances AT the caps; this one proves the caps actually hold for the
+// values that reach this loop. topAssetsLocked reads economy.Users
+// directly, so a hand-edited math.MaxInt64 account never met a credit path
+// and never met ensureAccountLocked either — Chips + Escrow + Coins*rate
+// then wraps NEGATIVE and the wrapped account sorts last instead of first,
+// silently, with no error or panic. Normalising each entry first is what
+// keeps the bound the comment claims a real one.
+func TestTopAssets_HandEditedMaxInt64IsNormalisedNotWrapped(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, "guild1", map[string]UserAccount{
+		"user-a": {Chips: math.MaxInt64, Escrow: math.MaxInt64, Coins: math.MaxInt64},
+		"user-b": {Chips: 100},
+	})
+	seedRate(t, st, "guild1", fixedNow, maxRate)
+
+	entries, err := st.TopAssets("guild1", fixedNow, 10)
+	if err != nil {
+		t.Fatalf("TopAssets returned error: %v", err)
+	}
+
+	want := []RankEntry{
+		{UserID: "user-a", TotalAssets: MaxChips + MaxChips + MaxCoins*maxRate}, // every field at its cap
+		{UserID: "user-b", TotalAssets: 100},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d entries, want %d: %+v", len(entries), len(want), entries)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Fatalf("entry %d = %+v, want %+v — a wrapped total sorts the hand-edited account last", i, entries[i], want[i])
+		}
+	}
+}
+
 // TestTopAssets_NilAccountDoesNotPanic covers the §3.3 nil-pointer path the
 // existing nil-guild regression does NOT reach. ensureGuildLocked repairs the
 // guild and its Users map, and ensureAccountLocked repairs only the ONE user a
@@ -2379,6 +2415,59 @@ func TestRefundStaleEscrows_HandEditedOverTheCapKeepsEveryChip(t *testing.T) {
 		t.Fatalf("refunded %d accounts, want 1", count)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips+500, 0, "")
+}
+
+// TestRefundStaleEscrows_HandEditedMaxInt64DoesNotWrapTheRefund is the
+// counterpart of the credit-path regression above, for the one path that
+// moves chips without crediting them. moveFromEscrowLocked does
+// `account.Chips += account.Escrow`; on a hand-edited
+// Chips = Escrow = math.MaxInt64 file that sum WRAPS, and the refund
+// PERSISTS Chips = -2 — a negative balance the next read normalises to
+// zero, i.e. every chip on the account destroyed by the one operation whose
+// whole contract is that it destroys none. Taking the refunded account
+// through ensureAccountLocked first is what keeps the addends inside the
+// caps, so the sum stays a sum.
+func TestRefundStaleEscrows_HandEditedMaxInt64DoesNotWrapTheRefund(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID, userID = "guild1", "u1"
+	seedAccount(t, st, guildID, userID, UserAccount{
+		Chips: math.MaxInt64, Escrow: math.MaxInt64,
+		EscrowGame: "blackjack", EscrowOpenedAt: "2026-09-14T12:00:00+09:00",
+	})
+
+	count, err := st.RefundStaleEscrows(fixedNow)
+	if err != nil {
+		t.Fatalf("RefundStaleEscrows returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refunded %d accounts, want 1", count)
+	}
+
+	// What reached the FILE is the assertion that matters: a negative Chips
+	// there is chips the next read silently clamps away.
+	persisted := readAccount(t, path, guildID, userID)
+	if persisted.Chips < 0 || persisted.Escrow < 0 {
+		t.Fatalf("the refund wrapped: persisted Chips %d / Escrow %d", persisted.Chips, persisted.Escrow)
+	}
+	if persisted.Escrow != 0 || persisted.EscrowGame != "" || persisted.EscrowOpenedAt != "" {
+		t.Fatalf("escrow not cleared: Escrow %d / Game %q / OpenedAt %q",
+			persisted.Escrow, persisted.EscrowGame, persisted.EscrowOpenedAt)
+	}
+	// Both fields came back to MaxChips before the move, and the move
+	// preserves their sum — the refund itself still truncates nothing.
+	if persisted.Chips != 2*MaxChips {
+		t.Fatalf("persisted Chips = %d, want %d (both caps, moved into one field)", persisted.Chips, 2*MaxChips)
+	}
+
+	// And the next read tops the balance out at the cap instead of finding
+	// it at zero.
+	view, err := st.ViewAccount(guildID, userID, fixedNow)
+	if err != nil {
+		t.Fatalf("ViewAccount: %v", err)
+	}
+	if view.Account.Chips != MaxChips {
+		t.Fatalf("ViewAccount Chips = %d, want %d (the cap)", view.Account.Chips, MaxChips)
+	}
 }
 
 // --- the jackpot pool (設計書 C-3a §2) ------------------------------------
@@ -3808,6 +3897,40 @@ func TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn(t *testing.T) {
 					view.UserTickets)
 			}
 		})
+	}
+}
+
+// TestLotteryStatus_NeverDrawnGuildNamesThisMorningsDraw isolates the "" branch
+// of nextLotteryDrawAt from any purchase. The table case above reaches that
+// branch too, but only through BuyLotteryTickets — and the purchase's own
+// rollover has already STAMPED DrawDate by the time the status call reads it,
+// so the case that passes through it never asks a genuinely never-drawn guild
+// anything. Here nothing has been bought: DrawDate is still "", and 08:59:59
+// is the instant where the draw day (yesterday's, via the Hour() < 9
+// correction) and the calendar day disagree by nine hours. The answer must be
+// this morning's 09:00, not tomorrow's.
+func TestLotteryStatus_NeverDrawnGuildNamesThisMorningsDraw(t *testing.T) {
+	st, _ := newTempStore(t)
+	// The pot is empty, so the rollover this call performs picks no winner and
+	// never reads the rng — an empty script fails loudly if it ever does.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	const guildID, userID = "guild1", "u1"
+	now := time.Date(2026, 9, 14, 8, 59, 59, 0, jst)
+	want := time.Date(2026, 9, 14, 9, 0, 0, 0, jst)
+
+	view, err := st.LotteryStatus(guildID, userID, now)
+	if err != nil {
+		t.Fatalf("LotteryStatus returned error: %v", err)
+	}
+	if !view.NextDrawAt.Equal(want) {
+		t.Fatalf("NextDrawAt = %s, want %s — a guild that has never drawn was pushed past this morning's draw",
+			view.NextDrawAt, want)
+	}
+	if view.LastDraw != nil {
+		t.Fatalf("LastDraw = %+v, want nil: an empty pot rolls over without a draw to report", view.LastDraw)
+	}
+	if view.TicketsSold != 0 || view.UserTickets != 0 || view.Prize != 0 {
+		t.Fatalf("view = %+v, want an empty pot (TicketsSold/UserTickets/Prize all 0)", view)
 	}
 }
 

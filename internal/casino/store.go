@@ -552,7 +552,14 @@ func totalAssetsLocked(account *UserAccount, rate int) int64 {
 // Chips <= MaxChips (1e12), Coins <= MaxCoins (1e12) and rate <= maxRate
 // (140, the clamp ceiling), so the sum is bounded by
 // 1e12 + 1e12*140 = 1.41e14, about 65,413x below math.MaxInt64
-// (9.223e18). Every credit path enforces those caps.
+// (9.223e18). Every credit path enforces those caps — but only for accounts
+// a credit has touched, and this loop reads the map directly, so the bound
+// holds on a hand-edited file only because each account goes through the
+// normalisation point first. normalizeAccountLocked rather than
+// ensureAccountLocked: clamping an entry that is already there is not the
+// same as CREATING one, and creating one here would mint the 1,000-chip
+// welcome bonus for someone who never played merely because a third party
+// read the ranking (the same reason the nil case below is skipped).
 func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 	entries := make([]RankEntry, 0, len(economy.Users))
 	for userID, account := range economy.Users {
@@ -574,6 +581,7 @@ func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 			// the entry the moment that user actually plays.
 			continue
 		}
+		normalizeAccountLocked(account)
 		entries = append(entries, RankEntry{UserID: userID, TotalAssets: totalAssetsLocked(account, rate)})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -1084,6 +1092,15 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 // alternatives are worse — capping would destroy the difference, and
 // aborting would leave every account in every guild staked forever, unable
 // to open another game.
+//
+// Preserving the sum is exactly why each refunded account goes through
+// ensureAccountLocked first. The move is `Chips += Escrow`, which on a
+// hand-edited Chips = Escrow = math.MaxInt64 file WRAPS to -2 and persists
+// it; the next read normalises that to zero, so the one operation forbidden
+// to destroy chips destroys all of them. Normalising the addends first is
+// the same fix, at the same point, that the headroom subtractions get —
+// which is what makes "every path that touches an account goes through
+// ensureAccountLocked" true of the write paths without exception.
 func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 	refunded := 0
 	err := s.Update(func(d *Data) error {
@@ -1092,10 +1109,15 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 			if economy == nil {
 				continue // hand-edited {"g": null}; see ensureGuildLocked
 			}
-			for _, account := range economy.Users {
+			for userID, account := range economy.Users {
 				if account == nil || account.Escrow <= 0 {
 					continue // hand-edited {"users":{"someone":null}}; see topAssetsLocked
 				}
+				// Through the normalisation point before the addition, even
+				// though the account is already non-nil: this is a write path
+				// that adds Escrow into Chips, and only ensureAccountLocked
+				// makes those two addends small enough to sum.
+				account = ensureAccountLocked(economy, userID)
 				moveFromEscrowLocked(account)
 				refunded++
 			}
