@@ -472,7 +472,7 @@
 - **テスト側の下準備も本番と同じ順序にした**: `sweepFixture` は `EscrowOpening` で開いてから
   `BindEscrowSession` で盤面へ渡す。盤面を差し替えていた 2 つのテストは、差し替えをやめて
   `sweepFixtureFor(t, casino.GameBlackjack, ...)` で最初から blackjack の盤面を開く
-  (`dropFixtureBoard` は残っているが呼ぶ人がいなくなった — 次に触るときに消すか判断する)。
+  (呼ぶ人がいなくなった `dropFixtureBoard` は削除した)。
 - **評価者未実施**: 危険地帯の変更なので、区切りのレビューでは `AcceptDuel` / `SettleGame` の
   再入(`Update` のクロージャ内から公開メソッドを呼んでいないこと)と、`EscrowOpening` の隙間に
   誰も入れないことを重点に見てほしい。

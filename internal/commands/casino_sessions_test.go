@@ -483,22 +483,6 @@ func TestSweepIdleBoardsClearsTheButtonsOfAGameThatCannotRedrawThem(t *testing.T
 	}
 }
 
-// dropFixtureBoard throws away the single board sweepFixture opened, so the
-// test can open its own in its place. It goes through Sweep + Remove because
-// that is the only way to name a board the manager did not hand back — and
-// Close would refuse the expired board anyway, since an expired board belongs
-// to the sweeper.
-func dropFixtureBoard(t *testing.T, mgr *casino.SessionManager) {
-	t.Helper()
-	expired := mgr.Sweep(time.Now().Add(100 * 365 * 24 * time.Hour))
-	if len(expired) != 1 {
-		t.Fatalf("the fixture holds %d boards, want exactly 1", len(expired))
-	}
-	if !mgr.Remove(expired[0].ID) {
-		t.Fatal("Remove did not take the fixture board")
-	}
-}
-
 // --- C2-12: 時間切れの決着は結果を見せる ------------------------------------
 
 // The sweeper's edit REPLACES the board, so the money line alone erased the
