@@ -316,7 +316,9 @@ func (s *Store) EnsureTodayRate(guildID string, now time.Time) (DailyRate, error
 
 // ensureTodayRateLocked returns economy's DailyRate for `today`, appending
 // a freshly-generated one (via nextRate) if missing or unusable, and trimming
-// history to the most recent 30 entries (設計書). Caller must already hold the
+// history to the most recent 30 entries (設計書). A `today` the history has
+// already reached is answered from the history instead (settledRateLocked):
+// the history only ever moves forward. Caller must already hold the
 // Store's lock, which is also what makes reading s.rng here safe — *rand.Rand
 // is not safe for concurrent use.
 //
@@ -347,6 +349,16 @@ func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) 
 		}
 		economy.Rates = economy.Rates[:last]
 	}
+	// A date the history has already reached must never be drawn a second
+	// time. The tail check above only asks "is the LAST entry today?", so a
+	// clock that moves backwards between two calls (an NTP correction, a hand
+	// -set system time, a host whose zone data is fixed at boot) turns
+	// D→D+1→D into an append: the history becomes D,D+1,D,D+1 and day D gets
+	// a fresh, different rate after /exchange has already paid out at the old
+	// one. Dates are "2006-01-02", so string order is calendar order.
+	if len(economy.Rates) > 0 && today <= economy.Rates[len(economy.Rates)-1].Date {
+		return settledRateLocked(economy, today)
+	}
 	var prevRate int
 	var prevTrend TrendState
 	hasPrev := len(economy.Rates) > 0
@@ -361,6 +373,37 @@ func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) 
 		economy.Rates = economy.Rates[len(economy.Rates)-30:]
 	}
 	return result
+}
+
+// settledRateLocked answers "what rate does `date` report?" for a date the
+// history has already passed, WITHOUT touching the history: the entry stored
+// for `date` itself when there is one, otherwise the newest stored entry —
+// the rate the guild has actually settled on. Caller must already hold the
+// Store's lock.
+//
+// Only in-clamp entries qualify, for the crash-loop reason spelled out on
+// ensureTodayRateLocked: a hand-edited record must never be handed back as a
+// divisor. A history in which no entry at all is usable falls back to the
+// 基準100 starting point rather than to a zero.
+func settledRateLocked(economy *GuildEconomy, date string) DailyRate {
+	var newest DailyRate
+	found := false
+	for i := len(economy.Rates) - 1; i >= 0; i-- {
+		entry := economy.Rates[i]
+		if !validRate(entry.Rate) {
+			continue
+		}
+		if entry.Date == date {
+			return entry
+		}
+		if !found {
+			newest, found = entry, true
+		}
+	}
+	if found {
+		return newest
+	}
+	return DailyRate{Date: date, Rate: baseRate, Trend: TrendFlat, Event: EventNone}
 }
 
 // EnsureCasinoAccess commits, as its OWN transaction, the two invariants
@@ -632,8 +675,15 @@ func (s *Store) RecentRates(guildID string, now time.Time, limit int) ([]DailyRa
 	var result []DailyRate
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		ensureTodayRateLocked(economy, today, s.rng)
+		rate := ensureTodayRateLocked(economy, today, s.rng)
 		recent := economy.Rates
+		// Entries dated after the day `rate` came from exist only when the
+		// clock went backwards (see ensureTodayRateLocked). /rate reads the
+		// last element as "today's rate", so leaving them in would headline a
+		// different number from the one /exchange charges on the same day.
+		for len(recent) > 0 && recent[len(recent)-1].Date > rate.Date {
+			recent = recent[:len(recent)-1]
+		}
 		if len(recent) > limit {
 			recent = recent[len(recent)-limit:]
 		}

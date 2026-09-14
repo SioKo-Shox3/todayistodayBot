@@ -17,7 +17,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 資金の保存則に関わる(危険地帯)。拒否の文言は既存の「本日は受給済み」系に揃える。
 
 ## R-002: 確定済みの日次レートを再抽選しない(`EnsureTodayRate` の順序逆転)
-- status: todo
+- status: done
 - done-when: 所見 2(P1)。`internal/casino/store.go` の `EnsureTodayRate` が履歴末尾との一致しか見ず、`D→D+1→D→D+1` で履歴が `D,D+1,D,D+1` になり同じ日を再抽選する。渡された日付が履歴に**既にある**ならその日のレートを返して追加しない、履歴末尾より**前**の日付は追加しない(末尾のレートを返すか、専用エラー。設計書に従う — 無ければ「履歴にある日はその値、無い過去日は末尾の値」)。回帰テスト: 注入乱数 `Float64()=0.9` で上のシーケンスを回し、履歴が `D,D+1` の 2 件のままでレートが変わらない。両替・スパークライン(`/rate`)が同じ日に同じ値を返すことも 1 件で確かめる。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestEnsureTodayRate|TestNextRate|TestStore" -count=1`

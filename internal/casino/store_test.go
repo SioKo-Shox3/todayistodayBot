@@ -773,6 +773,120 @@ func TestStore_EnsureTodayRate_OutOfRangePersistedEntry_Regenerates(t *testing.T
 	}
 }
 
+// TestStore_EnsureTodayRate_ClockGoingBackwards_KeepsSettledRates pins that
+// the rate history only ever moves FORWARD. The "is the last entry today?"
+// check alone reads a clock that has gone backwards (an NTP correction, a
+// hand-set system time, a host whose zone data is repaired at boot) as "no
+// rate for that day yet", so D→D+1→D→D+1 appended D,D+1,D,D+1: day D got a
+// second, different rate after /exchange had already paid out at the first.
+func TestStore_EnsureTodayRate_ClockGoingBackwards_KeepsSettledRates(t *testing.T) {
+	st, path := newTempStore(t)
+	// 0.9: no trend flip (>= 0.15), no event (>= 0.05), noise -3+0.9*6 = +2.4%.
+	st.rng = fixedRand{float: 0.9}
+
+	day1, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("EnsureTodayRate for day 1 returned error: %v", err)
+	}
+	day2, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate for day 2 returned error: %v", err)
+	}
+
+	back, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("EnsureTodayRate after the clock went back returned error: %v", err)
+	}
+	if back != day1 {
+		t.Fatalf("day 1 re-read as %+v, want the rate it already settled on %+v", back, day1)
+	}
+	forward, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate after the clock caught up returned error: %v", err)
+	}
+	if forward != day2 {
+		t.Fatalf("day 2 re-read as %+v, want the rate it already settled on %+v", forward, day2)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	want := []DailyRate{day1, day2}
+	if len(economy.Rates) != len(want) {
+		t.Fatalf("persisted rates = %+v, want exactly %+v — a settled day must never be appended twice", economy.Rates, want)
+	}
+	for i := range want {
+		if economy.Rates[i] != want[i] {
+			t.Fatalf("persisted rate %d = %+v, want %+v", i, economy.Rates[i], want[i])
+		}
+	}
+}
+
+// TestStore_EnsureTodayRate_DateOlderThanHistory_ReturnsNewest covers the
+// other half of "the history only moves forward": a date the history skipped
+// over entirely (no entry of its own) must report the newest settled rate
+// instead of being spliced in behind it.
+func TestStore_EnsureTodayRate_DateOlderThanHistory_ReturnsNewest(t *testing.T) {
+	st, path := newTempStore(t)
+	seedRate(t, st, "guild1", daysAfter(3), 120)
+	st.rng = forbiddenRand{t: t, reason: "a date the history has already passed is answered from the history, never drawn"}
+
+	got, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+	want := DailyRate{Date: jstDate(daysAfter(3)), Rate: 120, Trend: TrendFlat, Event: EventNone}
+	if got != want {
+		t.Fatalf("EnsureTodayRate for a skipped-over day = %+v, want the newest settled %+v", got, want)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if len(economy.Rates) != 1 || economy.Rates[0] != want {
+		t.Fatalf("persisted rates = %+v, want the untouched %+v", economy.Rates, want)
+	}
+}
+
+// TestStore_ExchangeAndRecentRates_AgreeAfterClockGoesBackwards is the
+// user-visible half of the rule: /exchange charges the rate
+// ensureTodayRateLocked returns, while /rate headlines the LAST element of
+// RecentRates. On a day the history has already passed, those two must still
+// be the same number — otherwise the bot quotes one rate and bills another.
+func TestStore_ExchangeAndRecentRates_AgreeAfterClockGoesBackwards(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = fixedRand{float: 0.9}
+
+	day1, err := st.EnsureTodayRate("guild1", fixedNow)
+	if err != nil {
+		t.Fatalf("EnsureTodayRate for day 1 returned error: %v", err)
+	}
+	day2, err := st.EnsureTodayRate("guild1", daysAfter(1))
+	if err != nil {
+		t.Fatalf("EnsureTodayRate for day 2 returned error: %v", err)
+	}
+	if day2.Rate == day1.Rate {
+		t.Fatalf("day 2 drew the same rate %d as day 1 — the test cannot tell the two days apart", day2.Rate)
+	}
+	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Coins: 100}})
+
+	// The clock goes back to day 1, which the history has already passed.
+	exchange, err := st.ExchangeCoinToChip("guild1", "user-1", 10, fixedNow)
+	if err != nil {
+		t.Fatalf("ExchangeCoinToChip returned error: %v", err)
+	}
+	history, err := st.RecentRates("guild1", fixedNow, 7)
+	if err != nil {
+		t.Fatalf("RecentRates returned error: %v", err)
+	}
+	if len(history) == 0 {
+		t.Fatal("RecentRates returned an empty history")
+	}
+	headline := history[len(history)-1]
+	if exchange.RateUsed != headline.Rate {
+		t.Fatalf("/exchange charged %d while /rate headlines %d (history %+v) — both read the same day", exchange.RateUsed, headline.Rate, history)
+	}
+	if exchange.RateUsed != day1.Rate {
+		t.Fatalf("/exchange charged %d on day 1, want the rate day 1 settled on %d", exchange.RateUsed, day1.Rate)
+	}
+}
+
 func TestStore_EnsureCasinoAccess_FirstAccessGrantsWelcomeBonus(t *testing.T) {
 	st, path := newTempStore(t)
 	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
