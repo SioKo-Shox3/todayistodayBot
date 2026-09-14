@@ -27,11 +27,16 @@
 
 - C2-04(ブラックジャックの純粋ロジック)= 375c178。`blackjack.go`: `BlackjackGame`(全フィールド非公開+アクセサ)、`NewBlackjack(bet, rng)` は 6 デッキのシューから表順(プレイヤー→ディーラー→プレイヤー→ディーラー)に 4 枚配り、ナチュラル 3 分岐を配布時に決着。`Hit` / `Stand` / `Double`(`CanDouble` = 生きている・2 枚・未ダブル)、`playDealer` は `HandValue < 17` の間だけ引く、`Settle`、`AutoResolve`(= スタンド)、`HandValue`(A は 11、入らなければ 1 枚ずつ 1 に落とす)。検証出力: `.harness/runs/20260914-121315/verify-C2-04-{1,2,4}.txt`(build+vet exit=0 / 対象テスト 42 PASS・FAIL 0・exit=0 / `go test ./...` 8 パッケージ ok)。
 
+- C2-05(セッション管理)= 未コミット→本反復。`session.go`: `Session{ID, GuildID, UserID, Game, State any, LastActionAt, Ref MessageRef}` と `SessionManager`(id→session と guild+user→id の 2 マップを 1 つの `sync.Mutex` で守る)。`Open` / `Get`(コピーを返す) / `WithSession`(ロック内で盤面に適用、`done` で両マップから削除) / `Sweep(now)`(期限切れを外して返す) / `Touch` / `Close` / `Len`、シングルトン `DefaultSessions()`(TTL 3 分・`time.Now`)。セッション ID は `crypto/rand` 16 バイトの hex(32 文字)。検証出力: `.harness/runs/20260914-121315/verify-C2-05-{1,2,4}.txt`(build+vet exit=0 / `TestSession` 10 件 PASS・exit=0 / `go test ./...` 8 パッケージ ok・gofmt 差分なし)と `verify-C2-05-3-mutation.txt`(`WithSession` からロックを外すと並行テストが 5/5 で落ちる = 更新の取りこぼしを実際に検出する)。
+
+- 反復 4 の評価者指摘(C2-04)はコード変更なしで解消。機能条件への違反は「見つかりませんでした」で、残る 1 件は**評価依頼の比較基点**の問題(`8408e2f..HEAD` を渡したため C2-03 修正コミット `8446bbc` と進捗文書が混ざった)。正しい基点は `375c178^..375c178`。以後、評価依頼は**そのタスクのコミット 1 つの差分**を基点にし、`PROGRESS.md` / `TASKS.md` / `.harness/` は範囲検査の例外として渡す。
+
 ## In progress
 - (なし)
 
 ## Next
-- **次は C2-05**(セッション管理と放置の自動決着)。`internal/casino` の純粋ロジック 2 つ(`HighLowGame` / `BlackjackGame`)は揃った — どちらも `AutoResolve() int64` を持つので、セッション管理はこの 1 メソッドだけを知っていればよい。`internal/commands` 側の配線は C2-06 以降。
+- **次は C2-06**(`/highlow` コマンド・ボタン・表示)。材料は揃った: `HighLowGame`(C2-03)・`BuildCustomID`/`RegisterComponent`/`requireSessionOwner`(C2-01)・`OpenGame`/`SettleGame`(C2-02)・`SessionManager`(C2-05、`RegisterComponent` はまだ登録者ゼロ)。順序の規律は Notes の「預け入れと Open の順序」を守る。
+- (済)~~次は C2-05~~(セッション管理と放置の自動決着)。`internal/casino` の純粋ロジック 2 つ(`HighLowGame` / `BlackjackGame`)は揃った — どちらも `AutoResolve() int64` を持つので、セッション管理はこの 1 メソッドだけを知っていればよい。`internal/commands` 側の配線は C2-06 以降。
 - (済)~~次は C2-04~~(ブラックジャックの純粋ロジック)。`cards.go` の `Deck`/`Card` はそのまま使える(`Draw` は末尾から引く。テストの `deckOf` が引く順で並べ替える)。`internal/commands` 側の配線は C2-06 以降。
 - (済)~~次は C2-03~~(`internal/casino/cards.go` + `highlow.go` の純粋ロジック)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-06)。C2-05 の `SessionManager` はまだ無い。
 - **C-2 開始(2026-09-14)**: 仕様 `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`、タスク C2-01〜C2-08(`TASKS.md`)。ブランチ `feat/casino-c2`。順に消化する。
@@ -40,6 +45,13 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **セッションの二重決着を止める 3 枚(C2-05)**: (1) `WithSession` が `done` を返した瞬間に両マップから消す、(2) `Sweep` が削除と期限判定を同じクリティカルセクションでやるので同じ盤面は 1 度しか返らない、(3) それでも漏れたら `SettleGame` の `ErrNoGameInProgress`。`Close` が bool を返すのも同じ理由 — 「自分が閉じた」と「既に誰かが閉じていた」を呼び出し側が区別できないと二重に払う。
+- **`WithSession` の再入禁止(危険地帯)**: `SessionManager.mu` は非再入で、`fn` の実行中ずっと握られる。`fn` からマネージャのメソッドを呼ばない・Discord も disk I/O も sleep もしない(プロセス内の全ボタン押下が待つ)。永続化(`Store.SettleGame`)は `WithSession` を**抜けてから**。`Store.Update` の同名契約と 2 つのロックが入れ子になるので、順序は常に「セッション → 抜ける → ストア」。
+- **`Get` はコピーを返す(C2-05)**: 所有者検査が `GuildID`/`UserID` を読むためだけにマネージャのロックを取らずに済ませるため。ただしコピーの `State` は**共有の盤面を指す**ので、盤面の読み書きは `WithSession` の中だけ。
+- **`fn` のエラーは盤面を消さない(C2-05)**: 却下された手(例: `ErrDoubleUnavailable`)で盤面が消えると、預かりが残ったまま操作先が消える。消えるのは `done == true` のときだけ。
+- **`Open` は預け入れより先(C2-05)**: 「1人1ゲーム」はセッション側(`ErrGameInProgress`)と口座側(`Store.OpenGame` の `ErrGameInProgress`)の二重で守る。コマンド層は**セッションを開いてからチップを預ける**。逆順にすると、2 つ目のゲームを断るときに預けたチップを戻す経路が要る。
+- **TTL 判定は境界を含む(C2-05)**: `now.Sub(LastActionAt) >= ttl` で外す。30 秒周期の Sweep goroutine(C2-08)なので、ちょうど 3 分の盤面を次の周回まで生かす理由が無い。
+- **並行テストの効き目を確かめた(C2-05)**: この PC は cgo 無しで `-race` が使えないため、`WithSession` からロックを外した木で並行テストを走らせ 5/5 で落ちる(96〜98 件しか適用されない)ことを確認した(`verify-C2-05-3-mutation.txt`)。ロック付きのテストが緑なだけでは「ロックが効いている」証拠にならない。
 - **ブラックジャックの設計(C2-04 で決めた)**: 状態は「進行中 / 終了」の 2 値で、勝敗は `BlackjackResult`(未決・プレイヤー勝ち・ディーラー勝ち・プッシュ・ナチュラル)に分けた。バーストは独立の結果にしない — 相手の勝ちであり、バーストした合計は手札に残るので表示側が読める。`Settle` は状態遷移ではない純粋な読み取り(`CashOut` と違い 2 回呼んでも同じ数を返す)で、二重決済を止めるのはセッション削除と `SettleGame` の `ErrNoGameInProgress`。
 - **ディーラーの 17 はソフト判定を持たない(C2-04)**: `HandValue(dealer) < 17` の間だけ引く。A+6 は `HandValue` が 17 を返すので止まる — 「この 17 はソフトか」という分岐を書かないことがソフト 17 スタンドの実装そのもの。テストは結果で見分ける(誤ってヒットすると A+6+4 = 21 でプッシュになる山を渡す)。
 - **ダブルの順序の危険(C2-04)**: `Double` は `CanDouble` が偽なら `ErrDoubleUnavailable` を返すが、コマンド層は**先に `CanDouble` を見てから `AddToEscrow`** を呼ぶこと。逆順にすると古いメッセージの ⏫ で追加ベットだけ預かられ、手札が数えない預かりが残る(C2-06 以降の配線で守る)。

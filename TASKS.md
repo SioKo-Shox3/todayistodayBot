@@ -86,7 +86,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: `cards.go` は C2-03 のものを使う(足りない API は足してよいが C2-03 のテストを壊さない)。
 
 ## C2-05: セッション管理と放置の自動決着(§5)
-- status: todo
+- status: done
 - done-when: `internal/casino/session.go`: `Session{ID, GuildID, UserID, Game, State any, LastActionAt, MessageRef{ChannelID, MessageID}}`、`SessionManager`(`NewSessionManager(now func() time.Time, ttl time.Duration)`、`Open(guild, user, game, state, ref) (*Session, error)`(同一 guild+user に進行中があれば `ErrGameInProgress`)、`Get(id)`、`WithSession(id, fn func(*Session) (done bool, err error)) error`(ロック内で盤面に適用し、`done` なら map から消す)、`Sweep(now) []*Session`(TTL 超過を map から外して返す)、`Touch(id, now)`)、プロセス内シングルトン `DefaultSessions()`(`sync.Once`、TTL 3 分、時計は `time.Now`)。セッション ID は `crypto/rand` 16 バイトの hex。`session_test.go`: 二重開始の拒否、`WithSession` の done で消える、`Sweep` が期限切れだけを返し二度と返さない、`Touch` で延命、並行 `WithSession` 100 本で盤面の適用回数が 100。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestSession" -count=1`
