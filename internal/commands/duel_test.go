@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -716,5 +717,124 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 		if !component.(discordgo.Button).Disabled {
 			t.Errorf("button %d is still live on an expired challenge", idx)
 		}
+	}
+}
+
+// --- refusals that must not cost the challenger their stake -----------------
+
+// duelFailingBank makes ONE AcceptDuel fail the way a disk error inside
+// Store.Update does: nothing is written, so the challenger's stake is still
+// sitting in escrow when the command sees the error.
+type duelFailingBank struct {
+	*flakyBank
+	acceptErr error
+}
+
+func (b *duelFailingBank) AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (casino.DuelSettlement, error) {
+	if err := b.acceptErr; err != nil {
+		b.acceptErr = nil // once — the retry must reach the real store
+		return casino.DuelSettlement{}, err
+	}
+	return b.flakyBank.AcceptDuel(guildID, challengerID, opponentID, bet, challengerWins)
+}
+
+// 反復 4 の指摘 1: 保存前に失敗した受諾は、預かりを口座に残したまま返ってくる。
+// ここでセッションを閉じると預かりを解く経路が両方(🚫 と掃除人)消えるので、
+// 挑戦者は再起動まで「進行中のゲーム」で固まる。挑戦は立ったままでなければならない。
+func TestDuelAcceptFailingWithoutWritingKeepsTheChallengeRefundable(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	c.store = &duelFailingBank{flakyBank: bank, acceptErr: errors.New("casino: write casino.json: disk full")}
+	r := &fakeCasinoResponder{}
+	sessionID := startDuel(t, c, r, 100)
+
+	resp := duelPress(t, c, r, sessionID, duelActionAccept, duelOpponent)
+
+	if resp.Data.Content != duelActionFailedMessage {
+		t.Errorf("reply = %q, want %q", resp.Data.Content, duelActionFailedMessage)
+	}
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Errorf("challenger: %d chips / %d escrow, want 900 / 100 — a failed save moves nothing", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d challenges are live, want 1 — a stake still in escrow needs a board that can release it", c.sessions.Len())
+	}
+
+	// The whole point of keeping the board: 🚫 still works afterwards.
+	duelPress(t, c, r, sessionID, duelActionDecline, duelOpponent)
+
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("after 🚫: %d chips / %d escrow, want 1000 / 0", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges are live after the decline, want 0", c.sessions.Len())
+	}
+}
+
+// The other side of the same test: ErrNoGameInProgress is the one refusal
+// that says there is no stake left to release — that board must go, or it
+// keeps a button that can only ever fail.
+func TestDuelAcceptWithoutAStakeDropsTheChallenge(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	c.store = &duelFailingBank{flakyBank: bank, acceptErr: casino.ErrNoGameInProgress}
+	r := &fakeCasinoResponder{}
+	sessionID := startDuel(t, c, r, 100)
+
+	resp := duelPress(t, c, r, sessionID, duelActionAccept, duelOpponent)
+
+	if resp.Data.Content != duelChallengeOverMessage {
+		t.Errorf("reply = %q, want %q", resp.Data.Content, duelChallengeOverMessage)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges are live, want 0 — nothing is staked behind this board", c.sessions.Len())
+	}
+}
+
+// 反復 4 の指摘 2: 受け手以外の押下で失効期限が延びてはならない。延びると、
+// 拒否され続ける第三者がボタンを叩くだけで挑戦者への返金を無期限に止められる。
+func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
+	for _, action := range []string{duelActionAccept, duelActionDecline} {
+		t.Run(action, func(t *testing.T) {
+			resetComponentsForTest()
+			t.Cleanup(resetComponentsForTest)
+
+			c, bank := newDuelCommandForTest(t, true)
+			RegisterComponent(c)
+
+			opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+			now := opened
+			mgr := casino.NewSessionManager(func() time.Time { return now }, casino.DefaultSessionTTL)
+			c.sessions = mgr
+
+			if err := bank.EnsureCasinoAccess("g1", duelChallenger, opened); err != nil {
+				t.Fatalf("EnsureCasinoAccess: %v", err)
+			}
+			if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), 100, opened); err != nil {
+				t.Fatalf("OpenGame: %v", err)
+			}
+			board := &casino.DuelState{ChallengerID: duelChallenger, OpponentID: duelOpponent, Bet: 100, Stage: casino.DuelPending}
+			session, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+			if err != nil {
+				t.Fatalf("opening the challenge: %v", err)
+			}
+
+			// One second before the deadline, a bystander presses.
+			r := &fakeCasinoResponder{}
+			now = opened.Add(casino.DefaultSessionTTL - time.Second)
+			resp := duelPress(t, c, r, session.ID, action, "u9")
+			if resp.Data.Content != duelNotYoursMessage {
+				t.Fatalf("reply = %q, want %q", resp.Data.Content, duelNotYoursMessage)
+			}
+
+			// The deadline is still measured from the challenge itself.
+			now = opened.Add(casino.DefaultSessionTTL)
+			sweepIdleBoards(newRecordingEditor(), mgr, bank, now)
+
+			if mgr.Len() != 0 {
+				t.Errorf("%d challenges survived the sweep, want 0 — a refused press must not extend the deadline", mgr.Len())
+			}
+			if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+				t.Errorf("challenger: %d chips / %d escrow, want 1000 / 0 — the expired challenge must refund", chips, escrow)
+			}
+		})
 	}
 }

@@ -66,6 +66,12 @@ const (
 // rather than leaving an unanswerable challenge holding an escrow.
 var errDuelBadState = errors.New("commands: session state is not a duel board")
 
+// errDuelNotOpponent carries "somebody else pressed this" out of WithSession.
+// It is an error rather than a flag because only an error return keeps the
+// manager from refreshing the challenge's deadline; the wording the presser
+// sees is requireDuelOpponent's, not this value's.
+var errDuelNotOpponent = errors.New("commands: this duel challenge is addressed to somebody else")
+
 // DuelCommand implements /duel and the two buttons its challenge carries.
 // One value serves as both Command and ComponentHandler, like the other two
 // button games.
@@ -365,7 +371,7 @@ func translateDuelPressError(err error) string {
 }
 
 // translateDuelAcceptError renders the refusals of ⚔️. The first two leave
-// the challenge standing (see duelAcceptKeepsTheChallenge) and are answered
+// the challenge standing (see duelAcceptDropsTheChallenge) and are answered
 // privately, so the board in the channel is untouched.
 func translateDuelAcceptError(err error) string {
 	var insufficientChips *casino.ErrInsufficientChips
@@ -379,14 +385,20 @@ func translateDuelAcceptError(err error) string {
 	}
 }
 
-// duelAcceptKeepsTheChallenge reports whether a refused acceptance leaves the
-// challenge standing. An opponent who cannot cover the bet — or who is in a
-// game of their own — has simply not answered yet, and 設計書 §4.5 keeps the
-// board alive for them (nobody else can take it anyway). Every other refusal
-// means the stake behind the challenge is gone, so the board goes with it.
-func duelAcceptKeepsTheChallenge(err error) bool {
-	var insufficientChips *casino.ErrInsufficientChips
-	return errors.As(err, &insufficientChips) || errors.Is(err, casino.ErrGameInProgress)
+// duelAcceptDropsTheChallenge reports whether a refused acceptance leaves no
+// stake for this challenge to release. Only ErrNoGameInProgress says that:
+// the challenger's escrow is empty, or it now belongs to another game, and
+// either way this board can neither settle nor refund anything.
+//
+// Every other refusal keeps the challenge standing, and the default side of
+// the test is the important one. An I/O failure inside Store.Update writes
+// nothing, so the stake is still in escrow; closing the session on it would
+// take away the 🚫 button AND hide the board from the sweeper, stranding the
+// chips until the next restart. An opponent who cannot cover the bet — or who
+// is in a game of their own — has simply not answered yet, and 設計書 §4.5
+// keeps the board alive for them (nobody else can take it anyway).
+func duelAcceptDropsTheChallenge(err error) bool {
+	return errors.Is(err, casino.ErrNoGameInProgress)
 }
 
 // --- /duel -----------------------------------------------------------------
@@ -511,6 +523,7 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 	defer c.sessions.Release(sessionID)
 
 	var board casino.DuelState
+	var refusal string
 	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
 		state, isDuel := live.State.(*casino.DuelState)
 		if !isDuel {
@@ -519,15 +532,23 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 		if state.Stage != casino.DuelPending {
 			return false, casino.ErrNoGameInProgress
 		}
+		// The owner of a challenge is the RECEIVER, not Session.UserID. The
+		// test runs INSIDE the closure, and a refusal leaves through the
+		// error return, because WithSession refreshes LastActionAt on every
+		// call that does not fail: a bystander pressing either button would
+		// otherwise push the 3-minute deadline back indefinitely and hold off
+		// the refund the challenger is waiting for.
+		if msg := requireDuelOpponent(i, state.OpponentID); msg != "" {
+			refusal = msg
+			return false, errDuelNotOpponent
+		}
 		board = *state
 		return false, nil
 	}); err != nil {
+		if errors.Is(err, errDuelNotOpponent) {
+			return respondVia(r, i.Interaction, ephemeralResponse(refusal))
+		}
 		return respondVia(r, i.Interaction, ephemeralResponse(translateDuelPressError(err)))
-	}
-
-	// The owner of a challenge is the RECEIVER, not Session.UserID.
-	if msg := requireDuelOpponent(i, board.OpponentID); msg != "" {
-		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
 
 	switch action {
@@ -546,7 +567,7 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 func (c *DuelCommand) accept(r interactionResponder, i *discordgo.InteractionCreate, sessionID, guildID string, board casino.DuelState) error {
 	settlement, err := c.store.AcceptDuel(guildID, board.ChallengerID, board.OpponentID, board.Bet, c.flip())
 	if err != nil {
-		if !duelAcceptKeepsTheChallenge(err) {
+		if duelAcceptDropsTheChallenge(err) {
 			// The stake behind this challenge is gone, so the board can never
 			// settle: drop it rather than leave a button that only ever fails.
 			c.sessions.Close(sessionID)
