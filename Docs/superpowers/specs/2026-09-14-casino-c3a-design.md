@@ -53,6 +53,8 @@
 - 抽選(毎日 9:00 JST): 賞金 `prize = floor(Sales × 90 / 100) + Carryover`、ハウス分 `Sales − floor(Sales × 90 / 100)` は**ジャックポットのプールへ**。
   当選者は枚数で重み付けした 1 人(乱数源は注入可能。既存の `randSource`)。`Chips += prize`。購入者が 0 なら抽選せず `Carryover = prize`(= 前回の繰り越しのまま)。
   抽選後 `Tickets` / `Sales` を空にし、`DrawDate = today`、`LastDraw` を更新。
+  当選者が `MaxChips` にいて賞金を受け取り切れないときは、**受け取れなかった分もジャックポットのプールへ**送り(ハウス分と同じ経路)、`Carryover = 0` にする —
+  次の抽選へ繰り越すと、その人の賞金が別人の手に渡る。`LastDraw.Prize` は実際に払った額。
 - **取りこぼし防止**: 抽選は「今日のレートが無ければ生成する」と同じ場所(日次ロールオーバー、`ensureTodayRateLocked` と同じ `Update` の内側)で
   `DrawDate < today` のときに行う。9 時に Bot が落ちていても、起動時・初回アクセス時に抽選される。掲示チャンネル未設定なら掲示だけスキップし、
   結果は `LastDraw` に残る(`/lottery status` で見える)。

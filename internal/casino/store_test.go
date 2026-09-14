@@ -3162,16 +3162,17 @@ func TestBuyLotteryTickets_RefusedPurchaseKeepsTheSettledDraw(t *testing.T) {
 	}
 }
 
-// TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward pins what the
-// draw does when the winner has no room for the whole prize. MaxChips is a
-// hard invariant of this package — every other credit path refuses rather
+// TestLotteryDraw_WinnerAtTheChipCapSendsTheRemainderToTheJackpot pins what
+// the draw does when the winner has no room for the whole prize. MaxChips is
+// a hard invariant of this package — every other credit path refuses rather
 // than breach it — but a rollover has nobody to refuse TO: it runs inside
 // whatever command happened to touch the guild first. So the winner is paid
-// as far as the cap allows and the remainder becomes the next draw's
-// carryover, which keeps both the cap and the conservation law (the chips
-// leave no account and are not destroyed) at the cost of the winner's credit
-// falling short of the headline prize on this one boundary.
-func TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward(t *testing.T) {
+// as far as the cap allows and the remainder follows the house's cut into the
+// jackpot pool. Carrying it forward instead would move THIS winner's prize to
+// whoever wins the NEXT draw — a different player — which is what this test
+// exists to forbid; the pool is the one destination that keeps the chips in
+// play without handing them to a named person.
+func TestLotteryDraw_WinnerAtTheChipCapSendsTheRemainderToTheJackpot(t *testing.T) {
 	st, path := newTempStore(t)
 	// Two draws, each named by roll 0: day 1 goes to u1 (sorted first), day 2
 	// is u2's alone.
@@ -3184,7 +3185,8 @@ func TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward(t *testing.T) 
 		}
 	}
 	sold := readGuild(t, path, guildID)
-	jackpotBefore := sold.Jackpot
+	jackpotBefore, chipsBefore := sold.Jackpot, totalChips(sold)
+	const salesDay1 = int64(100) // 2 tickets at LotteryTicketPrice
 
 	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
 		t.Fatalf("EnsureTodayRate on day 1: %v", err)
@@ -3198,24 +3200,36 @@ func TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward(t *testing.T) 
 	if got := drawn.Users["u1"].Chips; got != MaxChips {
 		t.Fatalf("capped winner's chips = %d, want MaxChips (%d) — the cap was breached or the payout was skipped", got, MaxChips)
 	}
-	if drawn.Lottery.Carryover != 40 {
-		t.Fatalf("Carryover = %d, want 40 (90 prize - 50 paid) — the unpayable remainder was destroyed", drawn.Lottery.Carryover)
+	if drawn.Lottery.Carryover != 0 {
+		t.Fatalf("Carryover = %d, want 0 — a draw that named a winner must reopen the pot empty instead of moving the remainder to the next winner",
+			drawn.Lottery.Carryover)
 	}
-	if got := drawn.Jackpot - jackpotBefore; got != 10 {
-		t.Fatalf("the jackpot pool gained %d, want 10 (the house's cut) — the cap must not touch the house's share", got)
+	// 10 house + the 40 the winner had no room for.
+	if got := drawn.Jackpot - jackpotBefore; got != 50 {
+		t.Fatalf("the jackpot pool gained %d, want 50 (10 house + 40 unpayable remainder)", got)
+	}
+	// Conservation: what the draw handed out, in chips and in pool, is
+	// exactly what it took in — sales plus the carryover it started from (0).
+	if got := (totalChips(drawn) - chipsBefore) + (drawn.Jackpot - jackpotBefore); got != salesDay1 {
+		t.Fatalf("chips gained + pool gained = %d, want %d (sales + carryover) — the draw created or destroyed chips", got, salesDay1)
 	}
 
-	// The remainder is not lost: it funds the next draw.
+	// Day 2: u2 is the only buyer, so a carried-over remainder would land in
+	// u2's account here.
 	if _, err := st.BuyLotteryTickets(guildID, "u2", 1, daysAfter(1)); err != nil {
 		t.Fatalf("BuyLotteryTickets on day 1: %v", err)
 	}
-	u2Before := readGuild(t, path, guildID).Users["u2"].Chips
+	before := readGuild(t, path, guildID)
+	u2Before, jackpotBefore2 := before.Users["u2"].Chips, before.Jackpot
 	if _, err := st.EnsureTodayRate(guildID, daysAfter(2)); err != nil {
 		t.Fatalf("EnsureTodayRate on day 2: %v", err)
 	}
 	next := readGuild(t, path, guildID)
-	const wantNextPrize = int64(85) // floor(50*90/100) + 40 carryover
+	const wantNextPrize = int64(45) // floor(50*90/100), with nothing carried over
 	if got := next.Users["u2"].Chips - u2Before; got != wantNextPrize {
-		t.Fatalf("the next winner gained %d chips, want %d (floor(50*90/100) + 40 carried over)", got, wantNextPrize)
+		t.Fatalf("the next winner gained %d chips, want %d — u1's unpayable remainder must not reach another player", got, wantNextPrize)
+	}
+	if got := next.Jackpot - jackpotBefore2; got != 5 {
+		t.Fatalf("the pool gained %d on day 2, want 5 (the house's cut alone)", got)
 	}
 }

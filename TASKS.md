@@ -240,7 +240,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 仕様 § は `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md`。
 
 ## C3-07: 上限で受け取れなかった賞金を、次の当選者ではなくジャックポットのプールへ送る(所見 1)
-- status: todo
+- status: done
 - done-when: `drawLotteryLocked`(`internal/casino/store.go` 1090 付近)は、当選者が `MaxChips` で賞金を受け取り切れないとき残額を `lottery.Carryover` に入れており、**次回の別の当選者へその人の賞金が移る**。親の決定(2026-09-14): 受け取れなかった残額は **ジャックポットのプールへ送る**(`economy.Jackpot += prize - paid`。ハウス分と同じ経路・`seedJackpotLocked` の後)。C-1 の「丸め損は常にハウス側」と同じ扱いで、通貨は消えず、他人の手にも渡らない(プールは 7️⃣7️⃣7️⃣ で全員に戻る)。`Carryover` は**当選者がいなかった回だけ**使う(`winner == ""` の経路のまま)。当選者がいた回は `lottery.Carryover = 0`。`LastDraw.Prize` は実際に払った `paid` のまま。設計書 §3 に「上限で受け取れなかった分はプールへ」を 1 行書く。`store_test.go`: 既存の「残額が次回へ繰り越る」期待(3174 付近)を書き換え、**残高上限の u1 が当選 → 入金は入る分だけ・残額はプールに入る・`Carryover` は 0・次回 u2 だけが買っても u1 の残額は u2 へ渡らない**を固定する。保存則(チップの増加 + プールの増加 = 売上 + 前回繰り越し)も併せて検査する。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestLottery|TestStore|TestDrawLottery" -count=1`

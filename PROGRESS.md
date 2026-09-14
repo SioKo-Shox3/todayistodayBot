@@ -4,6 +4,11 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-07(上限で受け取れなかった賞金をプールへ)= 次のコミット。`drawLotteryLocked` は当選者が `MaxChips` で賞金を受け取り切れないとき残額を `lottery.Carryover` へ入れていた — これは**その人の賞金を次回の別の当選者へ渡す**経路だった。親の決定どおり `economy.Jackpot += house + (prize - paid)` に変え、当選者がいた回の `Carryover` は必ず 0 にした。`Carryover` を使うのは `winner == ""` の回だけになった(型注釈どおり)。`LastDraw.Prize` は実際に払った `paid` のまま(C3-06 で祝いが `Prize == 0` でも出るようにしてあるので、上限に張り付いた当選者も名前は出る)。`seedJackpotLocked` の後で足す順序は据え置き(C3-01 の落とし穴)。
+  **`prize - paid` が負にならないことが前提** — `creditChipsCappedLocked` は `headroom` が `amount` より小さいときだけ切り詰め、`amount` を超えて払う経路が無いので `paid <= prize`。ここが崩れるとプールが減る。
+  テストは `TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward` を `..._SendsTheRemainderToTheJackpot` に書き換えた。固定したのは 4 点 — 入金は入る分だけ(`u1` は `MaxChips` のまま・`LastDraw.Prize` は 50)、プールは 50 増える(ハウス 10 + 残額 40)、`Carryover` は 0、翌日 `u2` だけが 1 枚買った回の当選金は 45(= `floor(50×0.9)`。繰り越しが生きていれば 85 になる)。保存則(チップの増加 + プールの増加 == 売上 + 前回繰り越し)も同じテストで検査する。既存の `totalChips` ヘルパ(`store_test.go` 2655)を使う — **同名のヘルパを書き足すと `redeclared` でコンパイルが落ちる**。
+  検証出力: `.harness/runs/20260914-222248/verify-C3-07-{1,2,3}.txt`(build+vet exit=0 / casino の絞り込み ok exit=0 / `go test ./...` 8 パッケージ ok exit=0)、`verify-C3-07-4.txt`(新テスト単体 `-v` で PASS)、`mutation-C3-07.txt`(`Carryover = prize - paid` に戻すと `Carryover = 40, want 0` で落ちる)。
+  `blocked/C3-06.md` の保存則 6(b) の記述も新しい挙動へ書き直した(**正本へ写すのはユーザー**。C2-08.md・C3-06.md と同じ扱い)。設計書 §3 に 1 行追記。
 - C3-06(README・設計書の実測・architecture の追記案)= 7cba582。README は公開物なので `/slot` の 3 行(積立 2 %・7️⃣7️⃣7️⃣ でプール全額と種 1,000 へのリセット・表示場所)と `/lottery buy|status` の各 3 行を**規則だけ**書いた(過程・判断の経緯は書かない)。`/help` はレジストリから自動生成なので変更不要(C3-04 で確認済み)。設計書 §2・§3 の「実測」は**通っているテストの値だけ**から書いた — 積立は 10 チップ×5 スピンで 1,001・端数 0(`TestStore_Spin_AccruesTheSmallestBetWithoutLosingTheRemainder`)、発火はプール 37,500 + 自分の積立 2 = 37,502(`TestStore_Spin_TripleSevenPaysTheWholePoolAndResetsToTheSeed`)、賞金は 500→450/50・1,234→1,110/124(`TestLotteryPrize_SplitsSalesAndAddsTheCarryover`)。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3-06.md` に正本へ写す 3 節(レイヤー表の「宝くじ」行、日次ロールオーバーの 3 つ = レート生成・種・抽選、危険地帯 6 点目 = プールと賞金の保存則)を書いた。**これはユーザー(人)が MyWorkflow の正本へ写して再展開する作業**(C2-08.md と同じ)。`cmd/bot/main.go` は §7 どおり変更していない。検証出力: `.harness/runs/20260914-204154/verify-C3-06-{1,2,3}.txt`(build+vet exit=0 / `go test ./...` 8 パッケージ ok exit=0 / `go build -o bin/todayistodaybot ./cmd/bot` exit=0)。
   **README は行末が混在している**(231 行中 217 行が CRLF、残り 14 行が LF)。テキストモードで読み書きすると全行 CRLF に揃ってしまい `git diff --numstat` が 226/217 の全面書き換えになる — バイナリで読み、挿入行に `
 ` を付けて書き戻した(`--numstat` と `--ignore-cr-at-eol --numstat` が 9/0 で一致)。
@@ -66,6 +71,9 @@
 - (なし)
 
 ## Next
+- **`Carryover` は当選者がいなかった回だけの仕組みになった**(C3-07)。`internal/commands/casino_announce.go` の「該当者なし — 賞金は繰り越し」はこの経路にだけ出るので文言は正しいまま。今後「賞金の一部が次回へ」という UI を足さないこと — 当選者がいた回に繰り越しは発生しない。
+- **C3-07 は危険地帯なので Astra を 1 周かけた**(`codex exec -m gpt-6-astra -s read-only`、対象はこの差分のみ)。判定は `NEXT_FINDINGS.md` を見る — `NEEDS_WORK` があれば次の反復が C3-08 より先に処理する。
+- **次は C3-08**(`TASKS.md` の未完の先頭。C-3a 区切りレビューの blocking 2 件目)。
 - **`TASKS.md` に未完は無い**(C3-01〜C3-06 すべて done)。次に進めるなら M1 へ戻って C-3b(`/duel`・シーズン制)の設計を詰めるか、下の残課題を拾う。
 - **`blocked/C3-06.md` はユーザー(人)待ち** — `Docs/agent-guide/architecture.md` の正本(MyWorkflow 側)へ写して `node MyWorkflow/deploy.mjs --apply todayistodayBot` で再展開するまで、展開コピーは C-2 までの記述のまま(宝くじ・ジャックポットが載っていない)。
 - **次は C3-06**(`TASKS.md` の未完の先頭)。C-3a で残るのはこれ 1 件で、掲示・コマンド・ストアはすべて着地済み。

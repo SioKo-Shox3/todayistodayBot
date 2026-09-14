@@ -1024,8 +1024,8 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 // ensureTodayRateIndexLocked, a rollover that every read path depends on and
 // that cannot fail. Refusing the payout outright (creditChipsLocked's
 // behaviour) would either destroy the prize or stall the rollover forever on
-// a winner sitting at the cap; crediting what fits and leaving the rest as
-// Carryover keeps every chip and lets the next draw pay it out. Caller must
+// a winner sitting at the cap; crediting what fits and letting the caller
+// send the rest to the jackpot pool keeps every chip in play. Caller must
 // already hold the Store's lock.
 func creditChipsCappedLocked(account *UserAccount, amount int64) int64 {
 	if amount <= 0 || account.Chips < 0 || account.Escrow < 0 {
@@ -1092,14 +1092,18 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 	// first: adding to a pool still sitting at a pre-C-3a 0 and only then
 	// raising it to the seed would swallow the cut.
 	seedJackpotLocked(economy)
-	economy.Jackpot += house
+	// prize-paid is 0 on every normal draw; it is non-zero only when the
+	// winner was at MaxChips. That remainder goes down the same path as the
+	// house's cut instead of carrying over: a carryover would hand THIS
+	// winner's prize to whoever wins the NEXT draw, someone else. Nothing is
+	// destroyed either — the pool pays back out on 7️⃣7️⃣7️⃣.
+	economy.Jackpot += house + (prize - paid)
 	lottery.LastDraw = &LotteryDraw{
 		Date: drawDate, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
 	}
-	// prize-paid is 0 on every normal draw; it is non-zero only when the
-	// winner was at MaxChips, and then the remainder funds the next draw
-	// rather than being destroyed.
-	lottery.Carryover = prize - paid
+	// Carryover belongs to the no-winner path alone: a draw that named a
+	// winner always reopens the pot empty.
+	lottery.Carryover = 0
 	lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 }
 
