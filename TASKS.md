@@ -298,3 +298,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/types.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: 既存 JSON(`unannounced` 無し)はそのまま読める(`omitempty` + nil スライス)。設計書 §3 の掲示の節に「掲示待ちは並べて持ち、送信成功で消す(最大 7 件)」を書く。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
+
+## C3-13: 永続化された数値を読み取り点で正規化し、算術の桁あふれを一箇所で断つ(C3-11 の差し戻し)
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の C3-11 差し戻し(`Carryover` が `math.MaxInt64` 付近だと `LotteryPrize` の加算があふれ、プールに空きがあっても賞金とハウス分が消える)を閉じる。個別の加算に検査を足すのではなく、**読み取り点で正規化する**規律で閉じる(`seedJackpotLocked` が `Jackpot` / `JackpotAccum` に対して既にやっていることの一般化)。親の決定(2026-09-15): (1) `normalizeLotteryLocked(lottery *Lottery)` を足し、`Sales` と `Carryover` を `[0, MaxChips]` へ、`Tickets` の各値を `[1, LotteryMaxTicketsPerDraw]` へ丸める(0 以下の要素は削除、`Tickets` が空なら nil に戻す)。(2) 日次ロールオーバー(`ensureTodayRateIndexLocked`)で、抽選・種入れの**前**に `normalizeLotteryLocked` を呼ぶ。購入(`BuyLotteryTickets`)と `LotteryStatus` はロールオーバーを通るので追加の呼び出しは要らない(通らない経路があれば、そこにも置く)。(3) `types.go` の桁あふれ余裕の説明に宝くじの行を足す — 正規化後は `Sales ≤ 1e12`・`Carryover ≤ 1e12` なので `prize = floor(Sales×90/100) + Carryover ≤ 2e12`、`int64` に対して 4.6e6 倍の余裕がある、と既存の分析と同じ論法で書く。(4) 設計書 §8 に「**永続化された数値は読み取り点で正常範囲へ正規化し、以後の算術はその範囲の内側で閉じる**。手編集・破損ファイルの値に対する防御はここ 1 箇所に集約する」を書く。(5) 回帰テスト: `Carryover = math.MaxInt64 - 40`・`Sales = 100`・`Jackpot = 5000`・当選者残高 900 で抽選を通すと、賞金もハウス分も消えず(正規化後の値で計算され)プールと当選者の残高が正しく増える / `Sales` が負・`Tickets` に 0 や負や 11 以上が混じったファイルを読んでも抽選が壊れない / 通常範囲では既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestLottery|TestStore|TestNormalize|TestEnsureTodayRate" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: 危険地帯(資金の保存則)。**この差し戻しは「個別の加算にガードを足す」では閉じない** — 直すたびに次の変数へ移る(ハウス分 → 残額 → 繰り越し と 2 回移った)。正規化点を 1 つ決めて、そこを通らない経路を無くすのが完了条件。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
