@@ -1283,3 +1283,39 @@ func TestMarkAnnounced_AdvancesTheMarkOnAForwardClock(t *testing.T) {
 		t.Fatalf("LastAnnounced = %q, want %q — a normal forward posting must still move the mark", got, "2026-09-14")
 	}
 }
+
+// TestCollectDailyAnnouncements_StaysQuietWhileTheClockIsBehindTheMark is the
+// collector's half of the high-water mark. MarkAnnounced only moves the mark
+// FORWARD, so a collector that asked "is today != the mark?" would answer yes
+// on every pass of a rolled-back day and repost it forever — the mark can
+// never come back down to match. Asking "is today AFTER the mark?" keeps the
+// two sides in step: the rolled-back day is already covered, so it is silent.
+func TestCollectDailyAnnouncements_StaysQuietWhileTheClockIsBehindTheMark(t *testing.T) {
+	var (
+		day13 = time.Date(2026, 9, 13, 10, 0, 0, 0, jst)
+		day15 = time.Date(2026, 9, 15, 10, 0, 0, 0, jst)
+	)
+	// 9/14 has been announced. Rates for 9/13 and 9/14 exist so the rolled-back
+	// pass rolls nothing over; the lottery is idle with nothing pending.
+	st, _ := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-14",`+
+		`"rates":[{"date":"2026-09-13","rate":100},{"date":"2026-09-14","rate":100}],`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,"unannounced":[]}}}`)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+
+	behind, err := st.collectDailyAnnouncements(day13)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements(day13): %v", err)
+	}
+	if len(behind) != 0 {
+		t.Fatalf("collected %d job(s) for a day the mark already covers (%+v) — a rolled-back clock would repost it on every pass", len(behind), behind)
+	}
+
+	// The mark must not jam the scheduler once the clock passes it again.
+	ahead, err := st.collectDailyAnnouncements(day15)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements(day15): %v", err)
+	}
+	if len(ahead) != 1 {
+		t.Fatalf("collected %d job(s) for a day past the mark, want 1 — the high-water mark must not silence the future", len(ahead))
+	}
+}

@@ -44,7 +44,7 @@ type AnnouncementJob struct {
 // collectDailyAnnouncements ensures every known guild's rate exists for
 // now's JST calendar date, then returns an AnnouncementJob for every guild
 // with an AnnounceChannelID configured that has not yet been announced
-// today (LastAnnounced != today; 設計書). Does NOT mark LastAnnounced (only
+// today (today > LastAnnounced, a high-water mark; 設計書). Does NOT mark LastAnnounced (only
 // MarkAnnounced does, after a confirmed send) and does NOT send anything.
 func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, error) {
 	today := jstDate(now)
@@ -58,7 +58,12 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			// handler goroutine, kills the whole process (§3.3).
 			economy := ensureGuildLocked(d, guildID)
 			rate := ensureTodayRateLocked(economy, now, s.rng)
-			if economy.AnnounceChannelID == "" || economy.LastAnnounced == today {
+			// `>=`, not `!=`: MarkAnnounced only ever moves LastAnnounced
+			// FORWARD, so a clock that rolls back would otherwise make every
+			// pass of the earlier day look unannounced and re-post it (the
+			// boundary can never catch up again). Comparing as a high-water
+			// mark keeps the two sides of the invariant in step.
+			if economy.AnnounceChannelID == "" || today <= economy.LastAnnounced {
 				continue
 			}
 			recent := economy.Rates
@@ -253,7 +258,7 @@ func runAnnouncePass(ctx context.Context, st *Store, callback AnnounceCallback, 
 // so the very next wake posts.
 //
 // NO DOUBLE FIRE, three independent reasons:
-//  1. collectDailyAnnouncements skips any guild with LastAnnounced == today,
+//  1. collectDailyAnnouncements skips any guild with LastAnnounced >= today,
 //     and MarkAnnounced sets exactly that after every successful send.
 //  2. The 09:00 lower bound means a pre-09:00 startup cannot consume the
 //     day's slot early.

@@ -136,6 +136,7 @@
 - (なし)
 
 ## Next
+- **C-3a は完了**(2026-09-15: C3-01〜C3-19 着地。Astra 1 周目 blocking 3 → 対応 → 2 周目 blocking 2(修正が持ち込んだ新規)→ 対応 → 未評価だった移行コミットの単発レビュー blocking 2 → 対応 → 収集側の比較を親が直して締め)。`main` へ ff 済み。次は C-3b(/duel + 月次シーズン制)の M1 設計。
 - **`TASKS.md` に未完のタスクは無い**(38 件すべて done。C3-19 が最後の 1 件)。`NEXT_FINDINGS.md` も見出しだけ。先へ進むには M1 へ戻って項目を足す。
 - **この差分のレビューは 2 周で打ち切り済み**(1 差分 2 周まで)。C3-19 は 2 周目レビュー(`.harness/reviews/2026-09-15-astra-c3-18.md`)の blocking 2 件を落としたもの。**次に評価者へ回すなら、それは新しい差分として**回す。
 - **「修復の条件に消費側の都合を混ぜない」が今回の一般則**(C3-18 の「宛先のあるギルドだけ修復する」を**取り消す**): 古い形式の修復は「その記録を**保存する価値があるか**」だけで決める。「今それを使えるか」(掲示先がある・今日が掲示日)は消費側の問い。混ぜると、使えるようになるまで待つつもりの記録が、**待っている間に上書きされて消える**。読み取り点に置いてあることは「いつでもやり直せる」を意味しない — 修復の材料(ここでは `LastDraw`)自体に寿命がある。
@@ -215,6 +216,8 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **掲示済み境界 `LastAnnounced` は high-water mark**(前進のみ)。収集側も `today > LastAnnounced` で揃える — 片側だけ単調にすると、時計が巻き戻った日を毎回掲示し続ける(境界が下がらないので追いつけない)。回帰は `TestMarkAnnounced_DoesNotLetAClockRollbackRepostADraw` と `TestCollectDailyAnnouncements_StaysQuietWhileTheClockIsBehindTheMark` の 2 本で挟んである。
+- **ループの穴**: `ALL_DONE` を返す反復(一覧の最後のタスク)は `--evaluate feature` だと評価者が回らない。最後の 1 件を確実に見せたいときは `--evaluate every` で回すか、着地後に単発でレビューする(C-3a では単発レビューが blocking 2 件を拾った)。MyWorkflow 側に所見として記録済み。
 - **正規化点は「読み取り経路」ではなく「口座に触る経路」に要る(C3-16)**: C3-13 / C3-14 で「読み取り点に正規化を置く」と決めたあとも、map を直接引く経路が 2 つ残っていた。見落としの形はどちらも同じ — `ensureAccountLocked(economy, userID)` ではなく `range economy.Users` で回しているので、正規化点の存在そのものが視界に入らない。**探すときは `grep -n "economy.Users" internal/casino/store.go` を使う**(`ensureAccountLocked` の grep では見つからない)。書き込み経路には `ensureAccountLocked`、口座を作りたくない表示経路には `normalizeAccountLocked` — 表示経路に前者を使うと初回ボーナスが湧くので、2 つを使い分ける。
 - **表駆動テストのケースは「実装のどの分岐に入るか」で選ぶ(C3-15)**: `DrawDate` の表に 2 ケースあっても、どちらも `drawLotteryLocked` の早期 return に落ちるなら**ロールオーバーは 1 度も走っていない**。未抽選(`""`)だけが抽選を走らせ、走ったあとの `DrawDate` を読む経路を通る — 「入力の見た目が違う」ではなく「通る経路が違う」がケースを足す理由。効き目は当選者なしの経路のスタンプを暦日へ変える mutation で確かめた(新ケースだけが落ちる)。
 - **設計書 `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61/69 行目の「昨日の当選」は C3-08 で実装とずれた** — `paths:` の外なので触らず C3-11 として切った。README には該当の文言は無い。
