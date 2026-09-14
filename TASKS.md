@@ -361,3 +361,73 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go
 - notes: (2) は宝くじだけでなくレート掲示にも効く(時計の巻き戻しで 9 時掲示が二度出るのも同じ原因)。日付の比較は文字列の辞書順で足りる(`YYYY-MM-DD` 固定長)。
+
+# フェーズ C-3b(/duel + 月次シーズン制)
+
+仕様は `Docs/superpowers/specs/2026-09-15-casino-c3b-design.md`(承認済み)。§ 番号はその文書。
+反復の中で設計を再検討せず、矛盾を見つけたら `blocked/<task>.md` に書いて止まる。C3 系(C-3a)は完了済み。
+**資金に触るタスクは §2 の契約を先に読む**(duel はゼロサム、賞与は意図的な新規発行、`SeasonNet` は通貨ではない)。
+
+## C3B-01: duel の純粋ロジックと預かり(§4.5・§2)
+- status: todo
+- done-when: `internal/casino/duel.go`: `DuelState{ChallengerID, OpponentID, Bet, Stage}`(`Stage` は待機/決着)、`FlipDuel(rng randSource) (challengerWins bool)`(コイントス。既存の `randSource` を使う)、`DuelPayout(bet int64, challengerWins bool) (challengerPayout, opponentPayout int64)`(勝者 `2*bet`・敗者 0)。`store.go` に `AcceptDuel(guild, challengerID, opponentID string, bet int64, challengerWins bool) (DuelSettlement, error)`: **1 回の `Update`** の中で、受け手から `bet` を預かり(残高不足・進行中ありは既存のセンチネルで拒否。挑戦者の預かりには触らない)、両者の `Escrow` を 0 にして勝者へ `2*bet` を入れ、両者の `SeasonNet` を更新(受け取った額 − 賭けた額)。`DeclineDuel(guild, challengerID) error`(挑戦者へ `bet` を返す = `SettleGame(payout = bet)` 相当、受け手は触らない)。`duel_test.go` / `store_test.go`: コイントスの決定性、精算額、**2 人の合計が不変**(ゼロサム)、受諾失敗で挑戦者の預かりが減らない、辞退で全額戻る、上限に座った勝者は入る分だけ入り `SeasonNet` も入った額で数える、並行受諾で二重精算が起きない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/duel.go, internal/casino/duel_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, internal/casino/errors.go
+- notes: 危険地帯。`Update` のクロージャ内から公開メソッドを呼ばない(絶対規則 3)。口座に触る経路は必ず `ensureAccountLocked`(C3-14 の正規化点)を通す。
+
+## C3B-02: `SeasonNet` を全ゲームの決着に配線する(§3)
+- status: todo
+- done-when: `UserAccount.SeasonNet`(C3B-01 で追加済み)を、既存の全ゲームの決着で更新する — スロット(`Spin`)、ハイ&ロー / ブラックジャック(`SettleGame`)、宝くじ(当選の入金と購入の支払い)。**1 回ごとに `SeasonNet += (実際に口座へ入った額 − 賭けた額)`**。デイリーボーナス・両替・`mint`・ウェルカムボーナス・シーズン賞与は**含めない**(§3)。`SettleGame` は「賭けた額」を知らないので、預かり(`Escrow`)を消す時点の値を使う(= 賭けた総額。ダブル込み)。読み取り点(`ensureAccountLocked`)で `SeasonNet` を `[-MaxChips, MaxChips]` へ正規化する。`store_test.go`: スロットの勝ち負け・H&L・BJ・duel・宝くじで `SeasonNet` が期待どおり動く / デイリーと両替と mint では動かない / 破損ファイルの巨大値が正規化される / 既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go
+- notes: 危険地帯。`SeasonNet` は順位のための集計値で通貨ではない(§2)— 保存則のテストに混ぜない。
+
+## C3B-03: 月次シーズンの切り替えと賞与(§4)
+- status: todo
+- done-when: `internal/casino/season.go`: `SeasonRanks(users map[string]*UserAccount, limit int) []SeasonRank`(純利の降順、同点は UserID 昇順、純利 0 は除く)、`SeasonBonus(rank int) int64`(1 位 10,000 / 2 位 5,000 / 3 位 2,500 / それ以外 0)。`types.go` に `SeasonMonth` / `LastSeason` / `SeasonResult` / `SeasonRank`(§4 の形)。`store.go` の日次ロールオーバー(`ensureTodayRateIndexLocked`)に `rolloverSeasonLocked(economy, month string)`: JST の月が `SeasonMonth` と違えば閉じる — 上位 3 名へ賞与を入れ(`creditChipsCappedLocked`。入り切らない分は捨てる。`SeasonRank.Bonus` は**実際に入った額**)、`LastSeason` を書き、全口座の `SeasonNet` を 0 にし、`SeasonMonth` を今月にする。未開始(`""`)なら賞与を配らず今月を開始するだけ。**月の比較は `SeasonMonth < month` の前進のみ**(時計の巻き戻しで二度閉じない。C3-19 と同じ規律)。`season_test.go` / `store_test.go`: 順位と同点の解決、賞与の額、純利 0 を数えない、月またぎで 1 回だけ閉じる、巻き戻りで閉じない、未開始ギルドは賞与なし、切り替え後に全員の `SeasonNet` が 0、賞与が上限で入り切らないときの `Bonus` の値、既存 JSON(フィールド無し)の互換。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/season.go, internal/casino/season_test.go, internal/casino/types.go, internal/casino/store.go, internal/casino/store_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
+- notes: 危険地帯(全口座を触る)。賞与は**意図的な新規発行**で、保存則の例外として設計書に書いてある(§2)— テストもその前提で書く。
+
+## C3B-04: `/duel` コマンドと受諾・辞退ボタン(§4.5・§5・§6)
+- status: todo
+- done-when: `internal/commands/duel.go`: `/duel <相手> <bet>`(ギルド専用宣言 + 実行時ガード、ベット幅 10〜1,000、自分自身と Bot を拒否、`EnsureCasinoAccess` → `OpenGame`(挑戦者)→ `DefaultSessions().Open` → 公開メッセージに embed(挑戦者・相手・ベット)と「⚔️ 受ける」「🚫 断る」)。`ComponentHandler`(prefix `duel`): **押せるのは受け手だけ**(盤面に持たせた受け手 ID で判定。他人には ephemeral で「❌ この挑戦はあなた宛てではありません」)。受諾は `AcceptDuel` → 結果を編集(コイン・勝者・配当・両者の残高)、ボタン無効化。受け手のチップ不足は ephemeral で断り盤面を残す。辞退は `DeclineDuel` → 「🚫 挑戦は断られました」に編集。C-2 の掃除人の自動決着(3 分)は `DeclineDuel` と同じ扱い(挑戦者へ返金、「⌛ 時間切れ — 挑戦は取り下げられました」)。`duel_test.go`: 表示の純粋関数、所有者(受け手)判定、自分自身/Bot の拒否、精算が編集より先(fake responder で順序)、決着後の押下、時間切れの文言。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/duel.go, internal/commands/duel_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/commands/casino_shared.go
+- notes: C-2 のセッション基盤をそのまま使う(`AutoResolve` の duel 版は「挑戦の取り下げ」)。通信エラーのログは `redactInteractionError` を通す。
+
+## C3B-05: `/season` コマンドと `/balance` の純利表示(§5)
+- status: todo
+- done-when: `internal/commands/season.go`: `/season`(今月の上位 10 名・自分の順位と純利・残り日数(月末まで)・前シーズンの結果)。`store.go` に `SeasonStatus(guild, user string, now time.Time) (SeasonView, error)`(ロールオーバーを通す)。`/balance` に「今月の純利」を 1 行足す。`/help` の一覧に `/duel` と `/season` を足す。`season_test.go` / `balance_test.go`: 表示の純粋関数(順位表・自分が圏外のとき・誰も遊んでいないとき・前シーズンなし)、残り日数の計算(月末・月初)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/season.go, internal/commands/season_test.go, internal/commands/balance.go, internal/commands/balance_test.go, internal/commands/help.go, internal/commands/help_test.go, internal/casino/store.go, internal/casino/store_test.go
+- notes: 順位表の整形は `/rank` の既存実装に倣う。
+
+## C3B-06: 9 時掲示のシーズン欄と結果の祝い(§4 掲示)
+- status: todo
+- done-when: `AnnouncementJob` に今月の上位 3 名と、閉じたシーズンの結果(あれば)を足し、`internal/commands/casino_announce.go` の embed に「🏆 シーズン(今月)」フィールドを足す。シーズンが閉じた回は**別メッセージ**で公開の結果発表(上位 3 名を @メンション、賞与額)。掲示チャンネル未設定なら送らない(結果は `/season` で見える)。C-3a の掲示待ち行列と同じく、**閉じたシーズンの結果も掲示に成功するまで保持する**(`LastSeason` は上書きされないので、掲示済みかどうかは `LastAnnounced` と同じ high-water 方式で判定する — 詳細は実装者が §4 と C3-19 の規律に沿って決め、選んだ方法を進捗に書く)。`casino_announce_test.go` / `announce_test.go`: フィールドの文言(遊んだ人がいない月を含む)、結果の祝いが閉じた回だけ送られる、送信失敗なら次の巡回でまた送られる。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/types.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go
+- notes: C-3a の宝くじの掲示と同じ形に揃える(取りこぼさない・二重に出さない)。
+
+## C3B-07: README・設計書の実測・architecture の追記案
+- status: todo
+- done-when: `README.md` のコマンド一覧に `/duel` と `/season` を足し、シーズンの説明(月次・純利順・上位 3 名に賞与・残高はリセットしない)を書く(公開物 — 過程を書かない)。設計書 §2 に実測(duel のゼロサムと賞与の発行額)を 1 段落。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3B-07.md` に正本へ写す追記(レイヤー表に duel / season、日次ロールオーバーで動くものに「月次シーズンの切り替え」、危険地帯 7 点目 = duel のゼロサムと賞与の意図的発行・全口座を触る切り替え)を書く。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./... -count=1`
+- verify: `go build -o bin/todayistodaybot ./cmd/bot`
+- paths: README.md, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
+- notes: `cmd/bot/main.go` は C-3b で変更しない(§8)。変更が要ると分かったら `blocked/C3B-07.md` に理由を書いて止まる。
