@@ -4,6 +4,10 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-07(README・設計書の実測・`architecture.md` の追記案)。証拠 `.harness/runs/20260915-064206/verify-C3B-07-{1,2,3,4}.txt`(4 本とも exit=0。4 本目は実測の根拠にした 5 テストの `-v` 出力)。
+  **実測の数字は全部テストから採った**(書いてから走らせたのではなく、走っているテストの期待値を写した): duel は 1,000+1,000 の 2 人が 200 を賭けて 1,200/800、保存ファイル上の `Chips + Escrow` 合計は 2,000 のまま(`TestAcceptDuel_MovesThePotToTheWinnerAndKeepsTheTwoAccountsSummedUnchanged`)。上限の例は `MaxChips − 100` の挑戦者が 400 ではなく 300 を受け取り `SeasonNet` は +100(`..._WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat`)。賞与は 1 ギルド 1 回の切り替えで最大 17,500 チップ、6 人の例で残高が 11,000/6,000/3,500(`TestStore_SeasonRollover_ClosesMonthPaysPodiumAndZeroesEveryAccount`)、上限に当たると `Bonus` は 3,000 / 0(`..._BonusCappedAtMaxChips_RecordsWhatLanded`)。
+  **README の `/duel` は「どちらも3分間…」の行の後ろに置いた**。その行はハイ&ローとブラックジャックの 2 本を指しており、間に 3 本目を挟むと「どちらも」が誰を指すか壊れる。duel の 3 分は**受諾を待つ時間**で、他 2 本の「操作が無い時間」とは別物なので、duel 自身の箇条書きで書いた。
+  **`Docs/agent-guide/architecture.md` は触っていない**(展開コピー)。追記案は `blocked/C3B-07.md` — レイヤー表の 1 行(`duel.go` / `season.go`)、日次ロールオーバーの項目を 3 つ → 4 つ(シーズンの切り替えを**宝くじの抽選の前**に。逆順だと月境界と同じ呼び出しに当たった抽選の純利が毎月 1 日に消える)、危険地帯 7 点目(duel のゼロサム・賞与の意図的発行 17,500・全口座を触る唯一の書き込み)。正本へ写して再展開するのは**人**。
 - C3B-06(9 時掲示のシーズン欄と閉じた回の結果発表)= コミット `2910ca0`。証拠 `.harness/runs/20260915-064206/verify-C3B-06-{1,2,3,4}.txt`(4 本とも exit=0)。
   **掲示済みの判定は `GuildEconomy.LastSeasonAnnounced`(月 `"2006-01"` の high-water)**。宝くじが**待ち行列**(`Unannounced`)を持つのは、掲示が止まっている間に抽選が毎日積み上がるから。シーズンは**月に1回しか閉じない**ので、保持するのは `LastSeason` 1 件で足り、必要なのは「その1件を channel が既に見たか」だけ = 境界1本。判定は `LastSeason.Month > LastSeasonAnnounced`(`!=` ではない — C3-19 と同じ理由で、時計が戻ったギルドが済んだ月を開き直して上位3名を二度 @メンションするのを断つ)。空文字の月は `MarkSeasonAnnounced` の no-op(`"" > x` は常に偽)なので、閉じた回を持たない巡回が境界を白紙に戻せない。
   **`LastAnnounced` と分けたのが要点**。embed と結果発表は**別メッセージで別々に失敗する**。1本の境界にすると、結果発表だけが落ちた朝に (a) 境界を進める = 祝いを失う、(b) 進めない = 翌朝 embed ごと二重掲示(宝くじ当選者も再 @メンション)、のどちらかしか選べない。2本あるので「embed は載った、結果は次の巡回へ」が言える。
@@ -188,7 +192,8 @@
 - (なし)
 
 ## Next
-- **次は C3B-07**(README・設計書の実測・architecture の追記案)= `TASKS.md` の最後の未完。C-3b の実装は C3B-06 で全部閉じた。README のコマンド一覧に `/duel` と `/season` が無いのはここで拾う(下の残件と同じもの)。
+- **次は C3B-08 → C3B-09**(反復 2 の評価者所見を `TASKS.md` へ落とした 2 件)。C-3b の機能実装と文書はこれで閉じたので、残るのは掲示の取りこぼし 2 件だけ。**C3B-08 が先** — 2 件とも `announce.go` の収集条件を触るので、待ち行列の形を決める方(P1)を先に閉じないと C3B-09 の差分が二度手間になる。`NEXT_FINDINGS.md` の該当節は、対応するタスクを閉じるときに消す(いまは残してある — 再現手順が所見の側にしか無い)。
+- **旧: 次は C3B-07**(README・設計書の実測・architecture の追記案)= `TASKS.md` の最後の未完。C-3b の実装は C3B-06 で全部閉じた。README のコマンド一覧に `/duel` と `/season` が無いのはここで拾う(下の残件と同じもの)。
 - **旧: 次は C3B-06**(9 時掲示のシーズン欄と結果の祝い)。表示側で残っているのは掲示だけ — `/season` と `/balance` は C3B-05 で閉じた。`SeasonStatus` と同じ数(上位 3 名・純利)を掲示が必要とするが、掲示は `AnnouncementJob` を組む側(`internal/casino/announce.go`)なので、`SeasonView` を再利用するのではなく `LastSeason` / `SeasonRanks` を直に読む形になる。
 - **`README.md` のコマンド一覧に `/duel` と `/season` はまだ無い**。C3B-05 の `paths:` に README が無かったので触っていない(`/help` はレジストリ生成なので自動で載る)。README を触るタスクで拾う。
 - **旧: 次は C3B-05**(`TASKS.md` の未完の先頭)。C3B-04 で C-3b のゲーム側は閉じた — 残るのは見せる側(`/season`、`/balance` の今月の純利行、9 時掲示のシーズン欄、`/help` と README の一覧)。

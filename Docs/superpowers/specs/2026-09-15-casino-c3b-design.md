@@ -29,6 +29,17 @@ C-2 までは「1 人 対 胴元」だけだった。C-3b は**人 対 人**の�
 - `SeasonNet` は**通貨ではない**(順位付けのための集計値)。上限で捨てられた配当があっても `SeasonNet` は
   「実際に口座へ入った額」で数える — 表示上の順位と手持ちの増減を食い違わせないため。
 
+**実測(duel のゼロサムと賞与の発行額)**: 1,000 チップずつ持つ 2 人が 200 チップで duel を決着させると、勝者 1,200・敗者 800 になり、
+2 人の `Chips + Escrow` の合計は始まりの 2,000 のまま動かない(`TestAcceptDuel_MovesThePotToTheWinnerAndKeepsTheTwoAccountsSummedUnchanged`
+が保存後のファイルから数える)。`SeasonNet` も +200 / −200 で合計 0 になる — 順位の集計値が duel で漂わない。ずれるのは上限に当たった
+ときだけで、`MaxChips − 100` の挑戦者が 200 を賭けて勝つと受け取るのは 400 ではなく余裕ぶんの 300、`SeasonNet` も +200 ではなく
+実際に増えた +100 になる(`TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat`)。賞与は対照的に**通貨が増える**側で、
+1 ギルドの 1 回の切り替えが発行するのは最大 10,000 + 5,000 + 2,500 = 17,500 チップ、それが月に 1 回きり(1,000 チップずつ持つ 6 人の
+うち純利 1,000 / 500 / 500 の 3 人が表彰台なら、残高は 11,000 / 6,000 / 3,500 になり、4 位と負け越しと未参加は 1,000 のまま:
+`TestStore_SeasonRollover_ClosesMonthPaysPodiumAndZeroesEveryAccount`)。上限で入り切らない分は捨てるので発行額が 17,500 を超えることはなく、
+`MaxChips − 3,000` にいた 1 位が受け取るのは 3,000、`MaxChips` に座った 2 位は 0、`SeasonRank.Bonus` に残るのは表の額ではなく**入った額**
+(`TestStore_SeasonRollover_BonusCappedAtMaxChips_RecordsWhatLanded`)。
+
 ## 3. 純利(`SeasonNet`)の定義
 
 - `UserAccount` に `SeasonNet int64`(`json:"season_net,omitempty"`)を足す。**ゲームの勝敗だけ**を積む:

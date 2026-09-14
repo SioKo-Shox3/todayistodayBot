@@ -424,10 +424,30 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: C-3a の宝くじの掲示と同じ形に揃える(取りこぼさない・二重に出さない)。
 
 ## C3B-07: README・設計書の実測・architecture の追記案
-- status: todo
+- status: done
 - done-when: `README.md` のコマンド一覧に `/duel` と `/season` を足し、シーズンの説明(月次・純利順・上位 3 名に賞与・残高はリセットしない)を書く(公開物 — 過程を書かない)。設計書 §2 に実測(duel のゼロサムと賞与の発行額)を 1 段落。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C3B-07.md` に正本へ写す追記(レイヤー表に duel / season、日次ロールオーバーで動くものに「月次シーズンの切り替え」、危険地帯 7 点目 = duel のゼロサムと賞与の意図的発行・全口座を触る切り替え)を書く。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./... -count=1`
 - verify: `go build -o bin/todayistodaybot ./cmd/bot`
 - paths: README.md, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
 - notes: `cmd/bot/main.go` は C-3b で変更しない(§8)。変更が要ると分かったら `blocked/C3B-07.md` に理由を書いて止まる。
+
+## C3B-08: 未掲示のシーズン結果を月替わりで失わない(所見 1、P1)
+- status: todo
+- done-when: 掲示できなかった `LastSeason` の結果が、次の月替わり(`rolloverSeasonLocked` の上書き)で消えない。C-3a の宝くじが持つ掲示待ち行列と同じ形にするか、`LastSeason` とは別に未掲示の 1 件を保持するかは実装者が §4 と C3-12 の規律に沿って決め、選んだ理由を進捗に書く。回帰テスト: 7/31 の巡回で結果送信だけ失敗 → 8/1 の巡回で 6 月の結果が再送される(掲示チャンネル未設定のまま月をまたいだ場合も同じ)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go
+- notes: 評価者(反復 2)の所見 1。`NEXT_FINDINGS.md` の該当節を、このタスクを閉じるときに消す。
+
+## C3B-09: 掲示済みの日でも未掲示のシーズン結果だけを再送する(所見 2、P2)
+- status: todo
+- done-when: embed 成功・結果送信失敗のあと、同じ日の次の巡回で結果だけが再送される。日次掲示の除外条件(`LastAnnounced`)と結果の収集条件を分け、embed を二重に出さずに結果だけ運ぶ。回帰テスト: 7/10 10 時に embed 成功・結果失敗 → 同日 11 時の巡回で「embed 累計 1 件・結果 1 件」。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/announce.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go
+- notes: 評価者(反復 2)の所見 2。C3B-08 と同じ経路を触るので、C3B-08 を先に閉じる。
