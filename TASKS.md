@@ -181,7 +181,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 反復の中で設計を再検討せず、矛盾を見つけたら `blocked/<task>.md` に書いて止まる。C2 系は完了済み。
 
 ## C3-01: ジャックポットのプール — 積立・7️⃣7️⃣7️⃣ で全額・種(§2)
-- status: todo
+- status: done
 - done-when: `internal/casino/types.go` の `GuildEconomy` に `Jackpot int64` と `JackpotAccum int64`(`json:"jackpot"` / `json:"jackpot_accum"`)を足す。`store.go` の `Spin` の `Update` の中で、①プールが 0 なら `JackpotSeed`(1,000)で初期化、②`JackpotAccum += bet*2; contrib = JackpotAccum/100; JackpotAccum %= 100; Jackpot += contrib`、③リールが 7️⃣7️⃣7️⃣ なら `payout += Jackpot; JackpotWon = Jackpot; Jackpot = JackpotSeed`、の順に行う(配当表 `slot.go` は変えない)。`SpinResult` に `JackpotWon` と `JackpotPool` を足す。レート生成(`ensureTodayRateLocked`)でもプールが 0 なら種で初期化する(掲示で 0 を見せない)。`store_test.go`: ベット 10 を 5 回で `Jackpot` が +1・`JackpotAccum` が 0、7️⃣7️⃣7️⃣(注入乱数)で `payout == bet*196 + pool` かつプールが 1,000 へ戻る、💎💎💎 ではプールが動かない、既存 JSON(フィールド無し)を読んで初回スピンで種が入る、通貨の保存則(`Chips` の増減 = 配当 − ベット、プールの増減 = 積立 − 発火)。既存の RTP 統計テストと並行テストが通る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestSpin|TestStore|TestJackpot|TestPayout" -count=1`

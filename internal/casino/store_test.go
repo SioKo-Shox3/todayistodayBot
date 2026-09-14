@@ -2379,3 +2379,254 @@ func TestRefundStaleEscrows_HandEditedOverTheCapKeepsEveryChip(t *testing.T) {
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips+500, 0, "")
 }
+
+// --- the jackpot pool (設計書 C-3a §2) ------------------------------------
+
+// seedJackpot writes a known pool and carry for guildID, bypassing accrual so
+// a test can start from any pool state. Unlike seedAccount it preserves the
+// guild's accounts and rate history.
+func seedJackpot(t *testing.T, st *Store, guildID string, pool, accum int64) {
+	t.Helper()
+	err := st.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		economy.Jackpot = pool
+		economy.JackpotAccum = accum
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding the jackpot for %s: %v", guildID, err)
+	}
+}
+
+// losingReels scripts a reel triple that pays nothing (🍋🍇🔔), so a test
+// about the POOL is not also a test about the payout table. scriptedIntn
+// wraps, so one triple drives any number of spins.
+func losingReels(t *testing.T) []int {
+	t.Helper()
+	return []int{symbolDraw(t, SymbolLemon), symbolDraw(t, SymbolGrape), symbolDraw(t, SymbolBell)}
+}
+
+// TestStore_Spin_AccruesTheSmallestBetWithoutLosingTheRemainder pins down the
+// reason the carry exists at all: the minimum bet's 2% is 0.2 chips, so an
+// accrual that moved whole chips only would truncate to 0 EVERY spin and the
+// pool would never grow from small play. Five 10-chip spins must add exactly
+// one chip and leave no carry behind.
+func TestStore_Spin_AccruesTheSmallestBetWithoutLosingTheRemainder(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 1000})
+	st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+
+	for spinNo := 1; spinNo <= 5; spinNo++ {
+		result, err := st.Spin("guild1", "user-1", 10)
+		if err != nil {
+			t.Fatalf("spin %d returned error: %v", spinNo, err)
+		}
+		if result.JackpotWon != 0 {
+			t.Fatalf("spin %d won %d from the pool on 🍋🍇🔔 — only 7️⃣7️⃣7️⃣ fires", spinNo, result.JackpotWon)
+		}
+		// The whole chip lands on the fifth spin, when the carry reaches 100.
+		wantPool, wantAccum := JackpotSeed, int64(20*spinNo)
+		if spinNo == 5 {
+			wantPool, wantAccum = JackpotSeed+1, 0
+		}
+		if result.JackpotPool != wantPool {
+			t.Fatalf("spin %d: JackpotPool = %d, want %d", spinNo, result.JackpotPool, wantPool)
+		}
+		economy := readGuild(t, path, "guild1")
+		if economy.Jackpot != wantPool || economy.JackpotAccum != wantAccum {
+			t.Fatalf("after spin %d the persisted pool is (Jackpot %d, JackpotAccum %d), want (%d, %d)",
+				spinNo, economy.Jackpot, economy.JackpotAccum, wantPool, wantAccum)
+		}
+	}
+}
+
+// TestStore_Spin_TripleSevenPaysTheWholePoolAndResetsToTheSeed is the firing
+// rule of 設計書 §2: the ×196 table payout AND the entire pool, in one credit,
+// after which the pool restarts from the seed. The pool paid out includes this
+// spin's own accrual — 積立 → 抽選 → 配当 is the order Spin's closure runs in.
+func TestStore_Spin_TripleSevenPaysTheWholePoolAndResetsToTheSeed(t *testing.T) {
+	st, path := newTempStore(t)
+	const startingChips = int64(50_000)
+	const bet = int64(100)
+	const poolBefore = int64(37_500)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: startingChips})
+	seedJackpot(t, st, "guild1", poolBefore, 0)
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolSeven)}}
+
+	result, err := st.Spin("guild1", "user-1", bet)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+
+	// bet*2 = 200 hundredths = 2 whole chips accrued before the draw resolves.
+	wantWon := poolBefore + 2
+	if result.JackpotWon != wantWon {
+		t.Fatalf("JackpotWon = %d, want %d (the pool at the moment it fired, this spin's own 2 percent included)", result.JackpotWon, wantWon)
+	}
+	if result.Payout != bet*196+wantWon {
+		t.Fatalf("Payout = %d, want %d (bet*196 + pool) — JackpotWon is a COMPONENT of Payout, not an extra credit", result.Payout, bet*196+wantWon)
+	}
+	if result.JackpotPool != JackpotSeed {
+		t.Fatalf("JackpotPool = %d, want the seed %d — the pool restarts from the seed, not from 0", result.JackpotPool, JackpotSeed)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if economy.Jackpot != JackpotSeed || economy.JackpotAccum != 0 {
+		t.Fatalf("persisted pool = (Jackpot %d, JackpotAccum %d), want (%d, 0)", economy.Jackpot, economy.JackpotAccum, JackpotSeed)
+	}
+	if got := economy.Users["user-1"].Chips; got != startingChips-bet+result.Payout {
+		t.Fatalf("persisted Chips = %d, want %d (start - bet + payout) — the deduction, the accrual and the whole payout are ONE transaction",
+			got, startingChips-bet+result.Payout)
+	}
+}
+
+// TestStore_Spin_TripleDiamondLeavesThePoolAlone guards the other half of the
+// rule: 💎💎💎 is a jackpot for the PUBLIC CELEBRATION only (IsJackpot), and
+// pays its ×98 from the table. The 10-chip bet's 2% cannot reach a whole chip,
+// so the pool here must not move by even one.
+func TestStore_Spin_TripleDiamondLeavesThePoolAlone(t *testing.T) {
+	st, path := newTempStore(t)
+	const bet = int64(10)
+	const poolBefore = int64(5_000)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: 1000})
+	seedJackpot(t, st, "guild1", poolBefore, 0)
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolDiamond)}}
+
+	result, err := st.Spin("guild1", "user-1", bet)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+	if !result.IsJackpot {
+		t.Fatalf("IsJackpot = false for 💎💎💎 — the celebration is unchanged by C-3a: %+v", result)
+	}
+	if result.JackpotWon != 0 {
+		t.Fatalf("JackpotWon = %d for 💎💎💎, want 0 — only 7️⃣7️⃣7️⃣ empties the pool", result.JackpotWon)
+	}
+	if result.Payout != bet*98 {
+		t.Fatalf("Payout = %d, want %d (the ×98 table payout, nothing from the pool)", result.Payout, bet*98)
+	}
+	if result.JackpotPool != poolBefore {
+		t.Fatalf("JackpotPool = %d, want %d unchanged", result.JackpotPool, poolBefore)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if economy.Jackpot != poolBefore || economy.JackpotAccum != bet*JackpotContributionPercent {
+		t.Fatalf("persisted pool = (Jackpot %d, JackpotAccum %d), want (%d, %d): the 2 percent is carried, not rounded into the pool",
+			economy.Jackpot, economy.JackpotAccum, poolBefore, bet*JackpotContributionPercent)
+	}
+}
+
+// preC3aFile is a data/casino.json exactly as the bot wrote it before the
+// jackpot fields existed: no "jackpot", no "jackpot_accum". Both unmarshal to
+// 0, and 0 is the one pool value that must never be shown or paid — hence the
+// seed. This is the upgrade path for every guild already on disk.
+const preC3aFile = `{"guild1":{"announce_channel_id":"chan-1","rates":[{"date":"2026-07-10","rate":100,"trend":"flat","event":""}],"last_announced":"","users":{"user-1":{"coins":0,"chips":1000,"last_daily_date":"","streak_days":0}}}}`
+
+func TestStore_Spin_SeedsThePoolOfAPreC3aFile(t *testing.T) {
+	st, path := newTempStore(t)
+	writeHandEditedFile(t, path, preC3aFile)
+	st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+
+	result, err := st.Spin("guild1", "user-1", 10)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+	if result.JackpotPool != JackpotSeed {
+		t.Fatalf("JackpotPool = %d on the first spin of a pre-C-3a file, want the seed %d", result.JackpotPool, JackpotSeed)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if economy.Jackpot != JackpotSeed {
+		t.Fatalf("persisted Jackpot = %d, want the seed %d — a file written before C-3a must be seeded, not left at 0", economy.Jackpot, JackpotSeed)
+	}
+}
+
+// TestStore_EnsureTodayRate_SeedsThePoolOfAPreC3aFile covers the OTHER seeding
+// point. Every display of the pool (/balance, /rank, the 9am announcement)
+// goes through today's rate, so a guild whose members have not spun since the
+// upgrade would otherwise be shown a pool of 0 that is really the seed.
+func TestStore_EnsureTodayRate_SeedsThePoolOfAPreC3aFile(t *testing.T) {
+	st, path := newTempStore(t)
+	writeHandEditedFile(t, path, preC3aFile)
+	st.rng = forbiddenRand{t: t, reason: "today's rate is already in the file, so no draw may happen"}
+
+	if _, err := st.EnsureTodayRate("guild1", fixedNow); err != nil {
+		t.Fatalf("EnsureTodayRate returned error: %v", err)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	if economy.Jackpot != JackpotSeed {
+		t.Fatalf("persisted Jackpot = %d after EnsureTodayRate, want the seed %d", economy.Jackpot, JackpotSeed)
+	}
+}
+
+// TestStore_Spin_ConservesChipsAndPool is the 危険地帯 regression of 設計書 §8:
+// across a run of spins with every outcome in it (loss, cherry pair, ×98 and
+// two 7️⃣7️⃣7️⃣ firings), currency may appear in exactly two places and nowhere
+// else. Both laws are checked against the numbers the RESULTS reported, so the
+// test cannot drift into re-implementing the payout table:
+//
+//	Chips: final - initial == Σpayout - Σbet
+//	Pool (in 1/100 chips, the unit the carry is kept in):
+//	  final - initial == Σ(bet × 2) - Σfired + one seed per firing
+func TestStore_Spin_ConservesChipsAndPool(t *testing.T) {
+	st, path := newTempStore(t)
+	const initialChips = int64(1_000_000)
+	const initialPool = int64(12_345)
+	const initialAccum = int64(73)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: initialChips})
+	seedJackpot(t, st, "guild1", initialPool, initialAccum)
+
+	// Four spins' worth of draws, cycled: 7️⃣7️⃣7️⃣ (fires), 🍒🍋🍒 (pair
+	// refund), 🍋🍇🔔 (loss), 💎💎💎 (×98, pool untouched). scriptedIntn wraps,
+	// so eight spins run the cycle twice and fire the pool twice.
+	seven, cherry, lemon := symbolDraw(t, SymbolSeven), symbolDraw(t, SymbolCherry), symbolDraw(t, SymbolLemon)
+	grape, bell, diamond := symbolDraw(t, SymbolGrape), symbolDraw(t, SymbolBell), symbolDraw(t, SymbolDiamond)
+	st.rng = &scriptedIntn{t: t, intns: []int{
+		seven, seven, seven,
+		cherry, lemon, cherry,
+		lemon, grape, bell,
+		diamond, diamond, diamond,
+	}}
+
+	bets := []int64{10, 37, 250, 1000}
+	var totalBet, totalPayout, totalContribUnits, totalDrained int64
+	fires := 0
+	for i := 0; i < 8; i++ {
+		bet := bets[i%len(bets)]
+		result, err := st.Spin("guild1", "user-1", bet)
+		if err != nil {
+			t.Fatalf("spin %d returned error: %v", i, err)
+		}
+		totalBet += bet
+		totalPayout += result.Payout
+		totalContribUnits += bet * JackpotContributionPercent
+		if result.JackpotWon > 0 {
+			fires++
+			totalDrained += result.JackpotWon
+		}
+		economy := readGuild(t, path, "guild1")
+		if economy.Jackpot != result.JackpotPool {
+			t.Fatalf("spin %d: result reported JackpotPool %d but the file holds %d", i, result.JackpotPool, economy.Jackpot)
+		}
+	}
+	if fires != 2 {
+		t.Fatalf("the scripted cycle fired the pool %d times, want 2 — the conservation law is untested without a firing", fires)
+	}
+
+	economy := readGuild(t, path, "guild1")
+	gotChips := economy.Users["user-1"].Chips
+	if wantChips := initialChips - totalBet + totalPayout; gotChips != wantChips {
+		t.Fatalf("Chips = %d, want %d (initial - Σbet + Σpayout): chips appeared or vanished outside the payout",
+			gotChips, wantChips)
+	}
+	// In 1/100-chip units, so the carry is part of the sum rather than a
+	// rounding excuse. A firing removes the whole pool and puts the seed back.
+	gotUnits := economy.Jackpot*jackpotAccumScale + economy.JackpotAccum
+	wantUnits := initialPool*jackpotAccumScale + initialAccum + totalContribUnits -
+		totalDrained*jackpotAccumScale + int64(fires)*JackpotSeed*jackpotAccumScale
+	if gotUnits != wantUnits {
+		t.Fatalf("pool = %d hundredths, want %d (initial + Σaccrual - Σfired + seeds): the pool moved outside accrual and firing",
+			gotUnits, wantUnits)
+	}
+}

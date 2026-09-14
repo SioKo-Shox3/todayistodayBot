@@ -354,6 +354,12 @@ func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) 
 // that has to show the history AROUND that entry. The index is -1 when no
 // stored entry backs the rate — the synthesised 基準100 fallback below.
 func ensureTodayRateIndexLocked(economy *GuildEconomy, today string, rng randSource) (DailyRate, int) {
+	// Seed the jackpot pool here as well as in Spin (設計書 C-3a §2) — on
+	// behalf of both this and ensureTodayRateLocked. This is the read path
+	// every display goes through (/balance, /rank, /rate, the 9am
+	// announcement), so a guild whose members have not spun since the upgrade
+	// would otherwise be shown a pool of 0 chips that is really 1,000.
+	seedJackpotLocked(economy)
 	// Drop unusable today records rather than appending after them, so the
 	// history never ends up holding two entries for the same date, and so the
 	// regeneration below starts from the last VALID day instead of from a
@@ -685,8 +691,55 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 	return result, err
 }
 
-// Spin atomically deducts bet chips, resolves the spin (via the pure `spin`,
-// using s.rng), credits any payout, and persists — all in one Update
+// --- the slot jackpot pool (設計書 C-3a §2) -------------------------------
+//
+// The pool is HOUSE money, not anyone's balance: it is funded from the edge
+// the payout table already keeps, so it takes part in no account's
+// Chips + Escrow conservation law. Its own law, which store_test.go pins
+// down, is that economy.Jackpot moves ONLY by an accrual (accrueJackpotLocked)
+// or by a 7️⃣7️⃣7️⃣ firing in Spin — nothing else in this package writes it.
+
+// seedJackpotLocked raises a pool below JackpotSeed back up to the seed, so
+// no reader ever sees an unseeded 0. Every pre-C-3a data/casino.json
+// unmarshals to Jackpot 0, and that is the case this exists for; the
+// comparison is `<` rather than `== 0` because no legitimate sequence can
+// produce anything in between — the pool is seeded at JackpotSeed, only ever
+// grows, and is reset to JackpotSeed when it fires — so a value in (0, seed)
+// can only come from a hand edit or a partial write, and repairing it here is
+// the same discipline ensureTodayRateIndexLocked applies to a corrupt rate.
+//
+// The carry is normalised at the same time: a NEGATIVE JackpotAccum (again,
+// only reachable by hand edit) would make accrueJackpotLocked's division
+// hand back a negative contribution and SHRINK the pool, since Go's / and %
+// both truncate towards zero. A carry at or above the scale needs no repair —
+// the next accrual converts it. Caller must already hold the Store's lock.
+func seedJackpotLocked(economy *GuildEconomy) {
+	if economy.Jackpot < JackpotSeed {
+		economy.Jackpot = JackpotSeed
+	}
+	if economy.JackpotAccum < 0 {
+		economy.JackpotAccum = 0
+	}
+}
+
+// accrueJackpotLocked seeds the pool if needed, then feeds it this spin's
+// JackpotContributionPercent of bet. The contribution is accumulated in
+// 1/100-chip units and only whole chips are moved into the pool, so the
+// minimum bet (10 chips → 0.2 chips per spin) accrues in full across five
+// spins instead of truncating to nothing every time. Called from inside
+// Spin's Update, before the reels are resolved: a 7️⃣7️⃣7️⃣ wins the pool
+// INCLUDING its own contribution (設計書 §2's 積立 → 抽選 → 配当 order).
+// Caller must already hold the Store's lock.
+func accrueJackpotLocked(economy *GuildEconomy, bet int64) {
+	seedJackpotLocked(economy)
+	economy.JackpotAccum += bet * JackpotContributionPercent
+	economy.Jackpot += economy.JackpotAccum / jackpotAccumScale
+	economy.JackpotAccum %= jackpotAccumScale
+}
+
+// Spin atomically deducts bet chips, accrues the jackpot pool, resolves the
+// spin (via the pure `spin`, using s.rng), credits any payout — the pool
+// included when the reels are 7️⃣7️⃣7️⃣ — and persists, all in one Update
 // ("控除→抽選→払い戻しの永続化", 設計書). Reading s.rng is safe only because
 // the draw happens inside the closure, i.e. under the store's lock:
 // *rand.Rand is not safe for concurrent use. Does NOT perform the reveal
@@ -706,9 +759,16 @@ func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 			return &ErrInsufficientChips{Balance: account.Chips}
 		}
 		account.Chips -= bet
+		accrueJackpotLocked(economy, bet)
 		result = spin(bet, s.rng)
+		if result.Reels == jackpotReels {
+			result.JackpotWon = economy.Jackpot
+			result.Payout += economy.Jackpot
+			economy.Jackpot = JackpotSeed
+		}
+		result.JackpotPool = economy.Jackpot
 		if err := creditChipsLocked(account, result.Payout); err != nil {
-			return err // aborts: the deduction above is discarded with the transaction
+			return err // aborts: the deduction AND the accrual above are discarded with the transaction
 		}
 		return nil
 	})

@@ -32,10 +32,18 @@ type Data map[string]*GuildEconomy
 // GuildEconomy is one guild's entire casino state: where the 9am
 // announcement goes, the recent daily-rate history, the last announced JST
 // date, and every account in that guild.
+// The jackpot pair is deliberately NOT omitempty: 0 is the one value that
+// carries meaning — "this guild has never been seeded" — and it is exactly
+// what a pre-C-3a data/casino.json unmarshals to. seedJackpotLocked turns
+// that 0 into JackpotSeed at the first spin or daily-rate generation, so an
+// omitempty that erased a genuine 0 would be indistinguishable from a pool
+// that had just been won and reset (also JackpotSeed, never 0).
 type GuildEconomy struct {
 	AnnounceChannelID string                  `json:"announce_channel_id"`
 	Rates             []DailyRate             `json:"rates"`          // oldest..newest, capped at 30 entries
 	LastAnnounced     string                  `json:"last_announced"` // JST calendar date "2026-07-10"
+	Jackpot           int64                   `json:"jackpot"`        // slot jackpot pool in chips; >= JackpotSeed once seeded
+	JackpotAccum      int64                   `json:"jackpot_accum"`  // carry of the 2% accrual, in 1/100 chips; always [0, 100)
 	Users             map[string]*UserAccount `json:"users"`
 }
 
