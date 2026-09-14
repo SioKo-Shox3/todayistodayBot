@@ -143,12 +143,12 @@ func TestSessionWithSessionRemovesAFinishedBoard(t *testing.T) {
 	// verbatim and the session stays.
 	sentinel := errors.New("move rejected")
 	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
-		return true, sentinel
+		return false, sentinel
 	}); !errors.Is(err, sentinel) {
 		t.Fatalf("WithSession with a failing fn: got %v, want the fn's error", err)
 	}
 	if _, ok := m.Get(opened.ID); !ok {
-		t.Fatal("session removed although fn returned an error")
+		t.Fatal("session removed although fn returned done=false with an error")
 	}
 
 	// The finishing move drops it from both maps: pressing the button again
@@ -176,6 +176,37 @@ func TestSessionWithSessionRemovesAFinishedBoard(t *testing.T) {
 	// cleared too, not just the id map).
 	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); err != nil {
 		t.Fatalf("Open after the previous game finished: %v", err)
+	}
+}
+
+// A board can finish AND fail at the same time (the hand is settled, the
+// follow-up reports an error). done alone decides removal: leaving such a
+// session addressable would let a second press settle the same hand twice
+// and would keep it in the sweeper's queue.
+func TestSessionWithSessionRemovesAFinishedBoardThatAlsoErrored(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	sentinel := errors.New("settled but reporting")
+	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
+		return true, sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Fatalf("WithSession with done=true and an error: got %v, want the fn's error", err)
+	}
+	if _, ok := m.Get(opened.ID); ok {
+		t.Fatal("finished session is still addressable after fn returned done=true with an error")
+	}
+	if swept := m.Sweep(clock.Now().Add(time.Hour)); len(swept) != 0 {
+		t.Fatalf("Sweep still sees the finished session: got %d, want 0", len(swept))
+	}
+	// The guild+user index was cleared too, so the player is not locked out.
+	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); err != nil {
+		t.Fatalf("Open after the errored finish: %v", err)
 	}
 }
 

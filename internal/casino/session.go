@@ -196,8 +196,10 @@ func (m *SessionManager) Get(id string) (Session, bool) {
 // against the same hand. fn reports whether the board is finished; a
 // finished session is removed from the maps immediately, so the second
 // press gets ErrSessionNotFound instead of settling the hand twice. fn's
-// error is returned as-is and does NOT remove the session — a rejected move
-// (e.g. ErrDoubleUnavailable) leaves the board playable.
+// error is returned as-is; done alone decides removal, so a rejected move
+// (e.g. ErrDoubleUnavailable, done=false) leaves the board playable while a
+// board that finished AND reported an error still leaves the maps — a
+// finished board must never stay addressable.
 //
 // LastActionAt is refreshed on every successful call, so an active player
 // never trips the idle sweep.
@@ -211,12 +213,12 @@ func (m *SessionManager) WithSession(id string, fn func(*Session) (done bool, er
 	}
 
 	done, err := fn(session)
-	if err != nil {
-		return err
-	}
 	if done {
 		m.removeLocked(session)
-		return nil
+		return err
+	}
+	if err != nil {
+		return err
 	}
 	session.LastActionAt = m.now()
 	return nil
