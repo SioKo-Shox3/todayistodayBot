@@ -126,3 +126,43 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build ./... && go vet ./...`
 - paths: README.md
 - notes: C2-08 で見つけた取りこぼし。README は公開物 — 過程を書かない。
+
+# C-2 区切りレビュー(1 周目)の対応
+
+所見の全文は `.harness/reviews/2026-09-14-astra-casino-c2-round1.md`。blocking 3 件を C2-10〜C2-12、non-blocking のうち安く直せる 2 件を C2-13 で扱う。
+設計判断は親が決めた(下記 notes)。仕様 §番号は `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`。
+
+## C2-10: 掃除人の精算失敗で配当を失わない(所見 1、P1)
+- status: todo
+- done-when: `Sweep` で map から消した後に `SettleGame` が失敗すると、確定した配当(H&L のポット)が失われ、口座は `Escrow` が残って新規ゲームも始められない。直し方(親の決定): `SessionManager.Sweep(now)` は期限切れセッションを**消さずに `Expired` 状態にして返す**(以後の押下は「終了しています」、`Open` は進行中として拒否)。掃除人は `AutoResolve` → `SettleGame` が**成功したときだけ** `Remove(id)` で消す。失敗したら状態と確定配当(`PendingPayout int64`)をセッションに残し、次の Sweep が `Expired` のものを再度精算する(30 秒ごとの再試行)。再試行が成功したらメッセージ編集も行う。`session_test.go`: `Sweep` が同じセッションを `Expired` として再度返す、`Remove` 後は返さない。`casino_sessions_test.go`: 精算を 1 回失敗させると次の Sweep で同じ配当(例: ポット 173)が精算され、`Escrow` が 0 になる。`Expired` 中の押下が「終了しています」を返す。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestSession" -count=1`
+- verify: `go test ./internal/commands/... -run "TestRunSessionSweeper|TestHighLow|TestBlackjack" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/commands/highlow.go, internal/commands/blackjack.go
+- notes: 精算の再試行は「同じ payout を二度払わない」こと — `SettleGame` は `Escrow == 0` なら `ErrNoGameInProgress` を返すので、成功後の二重呼び出しはそこで止まる(その場合も `Remove` する)。
+
+## C2-11: 盤面更新の通信失敗後、古い表示のまま操作を受け付けない(所見 2、P1)
+- status: todo
+- done-when: H&L で盤面を進めた後のメッセージ編集が失敗すると、表示は前のカードのまま内部は次のカードになり、次の押下が表示と違う判定で決着する。直し方(親の決定): セッションに `NeedsRedraw bool` を持ち、編集失敗時に立てる。次の押下では**手を進めずに**現在の盤面でメッセージを再描画し、押した人に ephemeral で「🔄 盤面を更新しました。もう一度選んでください」を返してフラグを下ろす(再描画も失敗したら立てたまま)。BJ も同じ経路にする。`highlow_test.go` / `blackjack_test.go`: 編集失敗 → 次の押下は判定せず再描画だけ(fake responder で記録)→ その次の押下で判定される。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestHighLow|TestBlackjack" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/highlow.go, internal/commands/highlow_test.go, internal/commands/blackjack.go, internal/commands/blackjack_test.go, internal/commands/casino_shared.go
+- notes: 「精算が先、表示は後」の規律は変えない。再描画の失敗をログに出すときは `redactInteractionError` を通す。
+
+## C2-12: 時間切れの決着に勝敗・手札を表示し、精算失敗時は金額行を出さない(所見 3・non-blocking 2)
+- status: todo
+- done-when: 掃除人の「⌛ 時間切れ — 自動決着」は、各ゲームの結果描画(H&L: 最終カード・連勝・配当、BJ: ディーラーの伏せ札公開・最終点・勝敗)を使い、時間切れの説明行を添える(元の盤面 embed を置き換えるのではなく結果 embed に更新)。ボタンは無効化して残す(C2-08 の修正どおり)。H&L のキャッシュアウトで精算が失敗したときの案内は「配当: 0枚 / 残高: 0枚」を出さず、金額行を省いて「⚠️ 精算に失敗しました。次回の自動処理で精算されます」だけにする(BJ と同じ)。`casino_sessions_test.go`: 時間切れ BJ の勝ち/負け/プッシュで伏せ札と勝敗が本文にある。`highlow_test.go`: 精算失敗の案内に金額行が無い。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -run "TestRunSessionSweeper|TestHighLow|TestBlackjack" -count=1`
+- paths: internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/commands/highlow.go, internal/commands/highlow_test.go, internal/commands/blackjack.go, internal/commands/blackjack_test.go
+- notes: C2-10 の再試行で精算が後から成功したときも同じ結果描画で編集する。
+
+## C2-13: README の総資産式に預かりを含め、小額ベットの RTP を文書化する(non-blocking 1・3)
+- status: todo
+- done-when: `README.md` の総資産の説明を `コイン × レート + チップ + 預かり中のチップ` に直す(`/rank` の実装 `TopAssets` と一致)。ハイ&ローの倍率は x100 整数の切り捨てなので小額ベット(10〜20)では 1 手の RTP が 95 % を下回る(丸め損はハウス側という C-1 の規則どおり) — `highlow_test.go` に「ベット 11 で初手の全ランク・有効な方向を等確率で選んだときの期待 RTP が 93 %以上 95 %以下」を固定する期待値テストを足し、`Docs/superpowers/specs/2026-09-14-casino-c2-design.md` §6 に「RTP 95 % はポットが大きいときの値。ベット 10 台では丸めで 93〜94 %」と 1 行書く。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestHighLow" -count=1`
+- paths: README.md, internal/casino/highlow_test.go, Docs/superpowers/specs/2026-09-14-casino-c2-design.md
+- notes: 倍率式は変えない(仕様)。README は公開物 — 過程を書かない。
