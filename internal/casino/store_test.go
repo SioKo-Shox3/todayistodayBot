@@ -2928,11 +2928,14 @@ func TestStore_JackpotCapNormalisesAHandEditedPool(t *testing.T) {
 		}
 	})
 
-	t.Run("a carryover that overflows the prize cannot drain the pool", func(t *testing.T) {
-		// LotteryPrize computes share+carryover, which wraps NEGATIVE here.
-		// creditChipsCappedLocked then pays 0, so house+(prize-paid) is a
-		// large negative addend — the second reproduction in the C3-07
-		// evaluation, which used to SHRINK the pool by it.
+	t.Run("a carryover near MaxInt64 is normalised, so neither the prize nor the cut is lost", func(t *testing.T) {
+		// The C3-11 regression. LotteryPrize computes share+carryover, which
+		// WRAPPED NEGATIVE on this input: creditChipsCappedLocked then paid
+		// the winner 0, house+(prize-paid) came out hugely negative and moved
+		// nothing, and the prize and the 10% cut both vanished while the pool
+		// still had room. normalizeLotteryLocked pulls Carryover down to
+		// MaxChips at the rollover's read point, so the whole draw is
+		// computed on in-range values and every chip lands somewhere.
 		st, path := newTempStore(t)
 		st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
 		const guildID, userID = "guild1", "u1"
@@ -2951,14 +2954,206 @@ func TestStore_JackpotCapNormalisesAHandEditedPool(t *testing.T) {
 		if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
 			t.Fatalf("EnsureTodayRate: %v", err)
 		}
+		// Sales 100 (2 tickets at 50), Carryover clamped to MaxChips:
+		//   prize = 100*90/100 + 1e12 = 1e12+90, house = 100-90 = 10.
+		// The winner holds 900 after the purchase, so the cap lets through
+		// 1e12-900 and leaves a remainder of 990 — that remainder plus the
+		// cut, 1000 chips, is what the pool must receive.
+		const (
+			wantPaid      = MaxChips - 900
+			wantRemainder = (MaxChips + 90) - wantPaid
+			wantPool      = 5_000 + wantRemainder + 10
+		)
 		economy := readGuild(t, path, guildID)
-		if economy.Jackpot != 5_000 {
-			t.Fatalf("pool = %d, want 5000 unchanged: a wrapped, negative addend must move nothing", economy.Jackpot)
+		account := economy.Users[userID]
+		if account == nil {
+			t.Fatalf("the winner's account is missing")
+		}
+		if account.Chips != MaxChips {
+			t.Fatalf("winner chips = %d, want %d (900 + the %d the cap let through) — the prize must not vanish",
+				account.Chips, MaxChips, wantPaid)
+		}
+		if economy.Jackpot != wantPool {
+			t.Fatalf("pool = %d, want %d (5000 + the %d remainder + the 10 house cut) — the cut must not vanish either",
+				economy.Jackpot, wantPool, wantRemainder)
 		}
 		if economy.Jackpot < JackpotSeed || economy.Jackpot > MaxJackpot {
 			t.Fatalf("pool = %d, outside [%d, %d]", economy.Jackpot, JackpotSeed, MaxJackpot)
 		}
+		if got := economy.Lottery.LastDraw; got == nil || got.Prize != wantPaid {
+			t.Fatalf("LastDraw = %+v, want Prize %d — the recorded prize is what was CREDITED", got, wantPaid)
+		}
+		// The pot reopens empty and in range, so the next draw starts clean
+		// rather than inheriting the hand-edited number.
+		if economy.Lottery.Carryover != 0 || economy.Lottery.Sales != 0 {
+			t.Fatalf("reopened pot = Carryover %d / Sales %d, want 0 / 0",
+				economy.Lottery.Carryover, economy.Lottery.Sales)
+		}
 	})
+}
+
+// TestNormalizeLottery_PullsHandEditedValuesIntoRange pins the normalisation
+// point itself (設計書 C-3a §8): every persisted lottery number is dragged
+// back into the range the arithmetic was sized for, and a value already in
+// range is left exactly alone.
+func TestNormalizeLottery_PullsHandEditedValuesIntoRange(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   Lottery
+		want Lottery
+	}{
+		{
+			name: "a normal pot is untouched",
+			in:   Lottery{Sales: 500, Carryover: 300, Tickets: map[string]int{"u1": 1, "u2": 10}},
+			want: Lottery{Sales: 500, Carryover: 300, Tickets: map[string]int{"u1": 1, "u2": 10}},
+		},
+		{
+			name: "negative sales and carryover become zero",
+			in:   Lottery{Sales: -50, Carryover: -1},
+			want: Lottery{Sales: 0, Carryover: 0},
+		},
+		{
+			name: "sales and carryover past MaxChips are truncated to it",
+			in:   Lottery{Sales: math.MaxInt64, Carryover: math.MaxInt64 - 40},
+			want: Lottery{Sales: MaxChips, Carryover: MaxChips},
+		},
+		{
+			name: "non-positive holdings are deleted, oversized ones trimmed",
+			in:   Lottery{Tickets: map[string]int{"zero": 0, "neg": -3, "big": 11, "ok": 4}},
+			want: Lottery{Tickets: map[string]int{"big": LotteryMaxTicketsPerDraw, "ok": 4}},
+		},
+		{
+			name: "a map left empty goes back to nil",
+			in:   Lottery{Tickets: map[string]int{"zero": 0}},
+			want: Lottery{Tickets: nil},
+		},
+		{
+			name: "an already-nil map stays nil",
+			in:   Lottery{Sales: 1},
+			want: Lottery{Sales: 1, Tickets: nil},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.in
+			normalizeLotteryLocked(&got)
+			if got.Sales != tc.want.Sales || got.Carryover != tc.want.Carryover {
+				t.Fatalf("Sales/Carryover = %d/%d, want %d/%d",
+					got.Sales, got.Carryover, tc.want.Sales, tc.want.Carryover)
+			}
+			if (got.Tickets == nil) != (tc.want.Tickets == nil) {
+				t.Fatalf("Tickets = %v, want nil-ness %v", got.Tickets, tc.want.Tickets == nil)
+			}
+			if len(got.Tickets) != len(tc.want.Tickets) {
+				t.Fatalf("Tickets = %v, want %v", got.Tickets, tc.want.Tickets)
+			}
+			for id, n := range tc.want.Tickets {
+				if got.Tickets[id] != n {
+					t.Fatalf("Tickets[%q] = %d, want %d (whole map %v)", id, got.Tickets[id], n, got.Tickets)
+				}
+			}
+		})
+	}
+}
+
+// TestLotteryDraw_SurvivesAHandEditedPot runs a real draw off a file whose
+// Sales is negative and whose Tickets hold junk counts. Before the
+// normalisation point this either mispaid or risked a wrapped weight total
+// in PickLotteryWinner; now the junk holders are simply not in the draw and
+// the negative sales pays nothing.
+func TestLotteryDraw_SurvivesAHandEditedPot(t *testing.T) {
+	st, path := newTempStore(t)
+	// Exactly one roll, for the single surviving holder.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"ok": 100, "zero": 100, "neg": 100})
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, guildID).Lottery
+		lottery.DrawDate = jstDate(fixedNow)
+		lottery.Sales = -1_000
+		lottery.Carryover = 200
+		lottery.Tickets = map[string]int{"ok": 999, "zero": 0, "neg": -5}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the hand-edited pot: %v", err)
+	}
+	seedJackpot(t, st, guildID, 5_000, 0)
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate: %v", err)
+	}
+	economy := readGuild(t, path, guildID)
+	draw := economy.Lottery.LastDraw
+	if draw == nil {
+		t.Fatalf("no draw was recorded — the junk pot must still name the one real holder")
+	}
+	// Sales normalises to 0, so the prize is the carryover alone and the
+	// house cut is 0. "ok" is trimmed to the 10-ticket cap and is the only
+	// entrant left, so it wins and its 100 chips grow by 200.
+	if draw.WinnerID != "ok" {
+		t.Fatalf("winner = %q, want \"ok\" — holdings of 0 and -5 bought nothing", draw.WinnerID)
+	}
+	if draw.TicketsSold != LotteryMaxTicketsPerDraw || draw.Buyers != 1 {
+		t.Fatalf("draw = %d tickets / %d buyers, want %d / 1", draw.TicketsSold, draw.Buyers, LotteryMaxTicketsPerDraw)
+	}
+	if draw.Prize != 200 {
+		t.Fatalf("prize = %d, want 200 — a negative Sales normalises to 0, leaving the carryover", draw.Prize)
+	}
+	if got := economy.Users["ok"].Chips; got != 300 {
+		t.Fatalf("winner chips = %d, want 300 (100 + the 200 prize)", got)
+	}
+	if economy.Jackpot != 5_000 {
+		t.Fatalf("pool = %d, want 5000 unchanged — normalised sales of 0 yields no house cut", economy.Jackpot)
+	}
+	// The junk holders never had chips taken and must not have gained any.
+	for _, id := range []string{"zero", "neg"} {
+		if got := economy.Users[id].Chips; got != 100 {
+			t.Fatalf("%s chips = %d, want 100 untouched", id, got)
+		}
+	}
+}
+
+// TestLotteryRollover_NormalisesTheStoredPotBeforeAnyRead pins the ORDER the
+// C3-11 regression turned on: the clamp has to happen before the draw and
+// the seeding read the numbers, not after. A pot whose day is already
+// stamped runs no draw, so what the file holds afterwards is the
+// normalisation and nothing else.
+func TestLotteryRollover_NormalisesTheStoredPotBeforeAnyRead(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 100})
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, guildID).Lottery
+		// Stamped for a day AFTER the read below, so drawLotteryLocked
+		// declines and only the normalisation can have written anything.
+		lottery.DrawDate = jstDate(daysAfter(5))
+		lottery.Sales = math.MaxInt64
+		lottery.Carryover = -7
+		lottery.Tickets = map[string]int{"u1": 42}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	view, err := st.LotteryStatus(guildID, "u1", fixedNow)
+	if err != nil {
+		t.Fatalf("LotteryStatus: %v", err)
+	}
+	// prize = floor(MaxChips*90/100) + 0 — a number, not a wrapped negative.
+	if want := MaxChips * LotteryPrizePercent / 100; view.Prize != want {
+		t.Fatalf("view prize = %d, want %d", view.Prize, want)
+	}
+	if view.UserTickets != LotteryMaxTicketsPerDraw {
+		t.Fatalf("view tickets = %d, want %d", view.UserTickets, LotteryMaxTicketsPerDraw)
+	}
+
+	economy := readGuild(t, path, guildID)
+	if economy.Lottery.Sales != MaxChips || economy.Lottery.Carryover != 0 {
+		t.Fatalf("persisted pot = Sales %d / Carryover %d, want %d / 0 — the clamp must be WRITTEN, not just applied to a copy",
+			economy.Lottery.Sales, economy.Lottery.Carryover, MaxChips)
+	}
+	if economy.Lottery.Tickets["u1"] != LotteryMaxTicketsPerDraw {
+		t.Fatalf("persisted holding = %d, want %d", economy.Lottery.Tickets["u1"], LotteryMaxTicketsPerDraw)
+	}
 }
 
 // TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult covers

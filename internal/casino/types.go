@@ -158,6 +158,17 @@ type UserAccount struct {
 // headroom BEFORE adding. So the pool stays in range whatever the addend
 // is — even one that has already wrapped somewhere upstream. The overflow
 // is not merely unlikely here, it is unreachable.
+//
+// The daily lottery's pot is bounded by the same value through the same
+// device: normalizeLotteryLocked pins Sales and Carryover into [0, MaxChips]
+// at the one read point every caller passes through, so the widest
+// intermediate LotteryPrize computes is sales*90 = 9e13 and the widest
+// result is prize = floor(sales*90/100) + carryover <= 9e11 + 1e12 < 2e12 —
+// 4.6e6x below math.MaxInt64. house = sales - share is bounded by sales, and
+// the pool's own credit is capped at MaxJackpot on top of that. Without the
+// clamp none of this holds: a Carryover near math.MaxInt64 wraps the very
+// first addition, and the negative prize that falls out costs the winner
+// their payout and the house its cut at once.
 const (
 	MaxChips   int64 = 1_000_000_000_000 // 1e12
 	MaxCoins   int64 = 1_000_000_000_000 // 1e12

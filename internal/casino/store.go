@@ -362,6 +362,13 @@ func ensureTodayRateIndexLocked(economy *GuildEconomy, now time.Time, rng randSo
 	// every display goes through (/balance, /rank, /rate, the 9am
 	// announcement), so a guild whose members have not spun since the upgrade
 	// would otherwise be shown a pool of 0 chips that is really 1,000.
+	// Normalise the persisted lottery numbers BEFORE either the seeding or
+	// the draw reads them (設計書 C-3a §8). Both of those compute with Sales
+	// and Carryover, so a clamp applied afterwards would be a clamp applied
+	// to a value that has already wrapped. Every command and the
+	// announcement sweep reach the lottery through this function, so this
+	// one call is the whole guard — there is no second read path to cover.
+	normalizeLotteryLocked(&economy.Lottery)
 	seedJackpotLocked(economy)
 	// Roll the daily lottery over at the very same point, for the very same
 	// reason the rate is generated here (設計書 C-3a §3 の取りこぼし防止): this
@@ -1099,6 +1106,64 @@ func creditChipsCappedLocked(account *UserAccount, amount int64) int64 {
 	}
 	account.Chips += amount
 	return amount
+}
+
+// normalizeLotteryLocked is the lottery's normalisation point, the exact
+// counterpart of seedJackpotLocked for the pool: after it returns, every
+// persisted number in `lottery` is inside the range the arithmetic below
+// was sized for, no matter what was on disk. 設計書 C-3a §8 states the rule
+// this implements — a persisted number is pulled back into its legal range
+// at the point it is READ, and every later computation stays inside that
+// range.
+//
+// It exists because the alternative does not converge. Bolting an overflow
+// check onto each individual addition fixes the one variable it names and
+// moves the failure to the next one: guarding the pool's credit left the
+// house cut exposed, guarding that left the remainder exposed, and the
+// remainder left Carryover exposed — a file holding Carryover near
+// math.MaxInt64 wrapped LotteryPrize's `share + carryover` to a negative
+// prize, and both the prize AND the house cut then vanished while the pool
+// still had room. One clamp at the read point closes all of them at once,
+// and closes the ones nobody has thought of yet.
+//
+// Sales and Carryover are pinned to [0, MaxChips]. Negative is the case
+// that corrupts arithmetic (Go's / truncates toward zero, so a negative
+// sales hands back a house cut that SHRINKS the pool); MaxChips is the same
+// ceiling every account balance obeys, so a legitimately-grown pot never
+// reaches it — only a hand edit does, and truncating there is the same
+// "the cap is the only leak" contract creditJackpotCappedLocked already
+// carries.
+//
+// Tickets entries are pinned to [1, LotteryMaxTicketsPerDraw], the range
+// BuyLotteryTickets already enforces: a non-positive holding bought nothing
+// so it is deleted outright, and an oversized one is trimmed to the cap so
+// PickLotteryWinner's weighted walk cannot be handed a total that wraps. An
+// emptied map goes back to nil so it serialises as the zero Lottery does.
+// Caller must already hold the Store's lock.
+func normalizeLotteryLocked(lottery *Lottery) {
+	if lottery.Sales < 0 {
+		lottery.Sales = 0
+	} else if lottery.Sales > MaxChips {
+		lottery.Sales = MaxChips
+	}
+	if lottery.Carryover < 0 {
+		lottery.Carryover = 0
+	} else if lottery.Carryover > MaxChips {
+		lottery.Carryover = MaxChips
+	}
+	// Deleting during a range over a map is defined in Go: an entry removed
+	// before it is reached is simply not produced.
+	for id, n := range lottery.Tickets {
+		switch {
+		case n <= 0:
+			delete(lottery.Tickets, id)
+		case n > LotteryMaxTicketsPerDraw:
+			lottery.Tickets[id] = LotteryMaxTicketsPerDraw
+		}
+	}
+	if len(lottery.Tickets) == 0 {
+		lottery.Tickets = nil
+	}
 }
 
 // lotterySummaryLocked totals the pot currently being sold into: tickets

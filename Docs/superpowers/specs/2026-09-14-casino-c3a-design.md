@@ -119,3 +119,13 @@ internal/commands/slot.go / casino_announce.go   ジャックポット行・宝�
   `[JackpotSeed, MaxJackpot]` に正規化する。この 2 つがあるので、手編集で `math.MaxInt64` が入っていても加算が桁あふれしない
   (上限を超える加算は加える前に余裕ぶんへ切り詰められる)。口座側の `MaxChips` が超過分を捨てるのと同じ契約で、事故ではなく仕様。
   別文脈の評価者を通す(`--evaluate feature`)。
+- **永続化された数値は読み取り点で正常範囲へ正規化し、以後の算術はその範囲の内側で閉じる。** 手編集・破損ファイル・
+  途中で切れた書き込みが持ち込む値に対する防御は、その 1 か所へ集約する。個別の加算にガードを足す直し方は収束しない —
+  名指しした変数は直るが、破綻は次の変数へ移るだけで、実際に C-3a では プールへの加算 → ハウス分 → 残額 → 繰り越し と
+  3 度移った。現在の正規化点は 2 つで、どちらも日次ロールオーバー(`ensureTodayRateIndexLocked`)の先頭にある:
+  `seedJackpotLocked` が `Jackpot` を `[JackpotSeed, MaxJackpot]` へ、`normalizeLotteryLocked` が `Sales` と `Carryover` を
+  `[0, MaxChips]` へ、`Tickets` の各値を `[1, LotteryMaxTicketsPerDraw]` へ丸める(0 以下は削除)。
+  正規化を**抽選と種入れより前に**置くのが要件 — 後ろに置くと、既に桁あふれた値を丸めることになる。
+  正規化後は `prize = floor(Sales×90/100) + Carryover ≤ 2e12` で `int64` に対して 4.6e6 倍の余裕があり、
+  `MaxChips`・`MaxCoins` の余裕分析(`types.go`)と同じ論法で桁あふれが到達不能になる。
+  新しい読み取り経路を足すときは、ロールオーバーを通るかを確認する。通らないなら、そこにも正規化点を置く。

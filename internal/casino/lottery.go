@@ -90,9 +90,14 @@ func nextLotteryDrawAt(lastDrawDate string, now time.Time) time.Time {
 // Go's / truncates toward zero, so a negative sales would otherwise hand
 // back a negative prize and a house cut that SHRINKS the jackpot pool.
 //
-// Cannot overflow: sales is chips that were actually debited from accounts,
-// so it is bounded by MaxChips (1e12), and 1e12*90 = 9e13 is about 102,000x
-// below math.MaxInt64.
+// Cannot overflow WHEN CALLED ON NORMALISED INPUT, which is the contract
+// normalizeLotteryLocked establishes at the rollover every caller passes
+// through: sales and carryover are both in [0, MaxChips] (1e12), so
+// sales*90 = 9e13 and share+carryover < 2e12, the latter 4.6e6x below
+// math.MaxInt64. The clamps below repair the SIGN of a hand-edited value but
+// deliberately do not re-clamp the magnitude — a second ceiling here would
+// be a second place to keep in step with MaxChips, and the caller that
+// skipped the rollover would still be wrong about everything else it read.
 func LotteryPrize(sales, carryover int64) (prize, house int64) {
 	if sales < 0 {
 		sales = 0

@@ -50,30 +50,6 @@ C3-07 で「当選者がいた回の繰り越し」は無くなったのに、�
 
 `go test ./... -count=1` は再実行せず、保存出力のみ確認しました。
 
-## 反復 2 — 評価者(codex)の判定: NEEDS_WORK
-
-対象: C3-11 ジャックポットのプールに上限を敷き、桁あふれを構造的に不可能にする(C3-07 の差し戻し)
-
-**[P2] プールに空きがあっても、桁あふれした賞金が消えます。** `done-when` の所見1の解消と「上限で入り切らない分だけが消える」を満たしません。[加算箇所](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store.go:1161)
-
-追加テストと同じ `Sales=100`、`Carryover=math.MaxInt64-40`、`Jackpot=5000`、当選者残高900で、コード読解とPythonの64ビット演算から以下を確認しました。
-
-- `LotteryPrize` の加算があふれ、賞金は `-9223372036854775759`。
-- 当選者への入金もプールへの入金も0。
-- `Carryover` と `Sales` は0になり、プールに空きがあるまま賞金・ハウス分が消失。
-
-[追加テスト](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store_test.go:2955)は、この状態を「プール5000のまま」として合格させています。
-
-最小修正候補は、賞金計算と残額の合算で桁あふれを防ぎ、口座・プールの空きへ配分してから超過分だけを捨てることです。同テストで当選者への入金とプールへの移送も検証してください。
-
-差分は許可範囲内です。証拠の `verify-C3-11-{1,2,3}.txt` と `recheck-C3-11-2-{1,2,3}.txt` は開いて確認し、すべて `exit=0`、全8パッケージ `ok` でした。
-
-再検証できなかったコマンド（すべて一時ディレクトリ作成時の `Access is denied`。合格には算入していません）:
-
-- `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
-- `go test ./internal/casino/... -run "TestJackpot|TestStore|TestLottery|TestSpin" -count=1`
-- `go test ./... -count=1`
-
 ## 反復 3 — 評価者(codex)の判定: NEEDS_WORK
 
 対象: C3-12 未掲示の当選を 1 枠で上書きしない — 掲示待ちの回を並べて持つ(C3-08 の差し戻し)
