@@ -39,12 +39,15 @@ func (c *DailyCommand) Handle(s *discordgo.Session, i *discordgo.InteractionCrea
 	if msg := requireGuildContext(i); msg != "" {
 		content = msg
 	} else {
-		now, userID := time.Now(), resolveUserID(i)
-		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, now); err != nil { // §3.8
+		userID := resolveUserID(i)
+		if err := c.store.EnsureCasinoAccess(i.GuildID, userID, time.Now()); err != nil { // §3.8
 			slog.Error("casino: EnsureCasinoAccess failed", "command", "daily", "error", err)
 			content = "❌ カジノの初期化に失敗しました。"
 		} else {
-			result, err := c.store.ClaimDaily(i.GuildID, userID, now)
+			// No instant is passed: ClaimDaily reads the clock inside its own
+			// Update closure, so the claimed date is decided under the store
+			// lock and cannot be stale by the time the write lands.
+			result, err := c.store.ClaimDaily(i.GuildID, userID)
 			switch {
 			case errors.Is(err, casino.ErrAlreadyClaimedToday):
 				content = "❌ 本日は既に受け取り済みです。また明日お越しください。"

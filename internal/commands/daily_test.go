@@ -44,7 +44,9 @@ func TestDailyCommand_FirstAccess_OpensAccountWithWelcomeBonus(t *testing.T) {
 	if before.Account.Chips != 1000 {
 		t.Fatalf("expected the 1,000-chip welcome bonus on first access, got %d", before.Account.Chips)
 	}
-	result, err := store.ClaimDaily("g1", "u1", now)
+	// ClaimDaily takes no instant: it reads the store's clock inside its own
+	// Update closure, so the claimed date is decided under the lock.
+	result, err := store.ClaimDaily("g1", "u1")
 	if err != nil {
 		t.Fatalf("ClaimDaily: %v", err)
 	}

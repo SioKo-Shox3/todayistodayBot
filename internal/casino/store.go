@@ -26,6 +26,13 @@ type Store struct {
 	// read ONLY while mu is held (i.e. from inside an Update closure):
 	// *rand.Rand is not safe for concurrent use.
 	rng randSource
+	// clock is the wall-clock source for the operations that decide a JST
+	// calendar date for themselves (ClaimDaily). nil means time.Now. Like
+	// rng it is read ONLY while mu is held, so the date a claim is stamped
+	// with is chosen inside the single-writer critical section: two /daily
+	// invocations whose instants straddle midnight can no longer be applied
+	// in the wrong order. Tests pin it; production never sets it.
+	clock func() time.Time
 }
 
 // New returns a Store backed by path. Production code should use Default()
@@ -190,6 +197,16 @@ var jst = time.FixedZone("JST", 9*3600)
 // jstDate formats t's JST calendar date as "2006-01-02". Never depend on
 // time.Local here: the bot's host may run in any zone.
 func jstDate(t time.Time) string { return t.In(jst).Format("2006-01-02") }
+
+// nowLocked returns the current instant from the store's clock (time.Now
+// unless a test pinned it). Read s.clock only from inside an Update closure,
+// i.e. with s.mu held — same discipline as s.rng.
+func (s *Store) nowLocked() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
+}
 
 // jstYesterday returns the JST calendar date one day before t's JST date.
 // It converts to JST FIRST and only then subtracts a day: doing
@@ -436,18 +453,30 @@ type DailyClaimResult struct {
 }
 
 // ClaimDaily pays out today's daily bonus to guildID/userID (JST calendar
-// date), auto-creating the account (welcome bonus) on first interaction.
-// Returns ErrAlreadyClaimedToday (no mutation) if already claimed today,
-// or ErrChipCapExceeded (also no mutation) if the payout would break
-// MaxChips.
-func (s *Store) ClaimDaily(guildID, userID string, now time.Time) (DailyClaimResult, error) {
-	today := jstDate(now)
-	yesterday := jstYesterday(now) // NOT jstDate(now.AddDate(0,0,-1)) — see jstYesterday's doc
+// date of the store's clock, read under the lock), auto-creating the account
+// (welcome bonus) on first interaction. Returns ErrAlreadyClaimedToday (no
+// mutation) if today is not strictly AFTER the last claimed date — that
+// covers both a second claim on the same day and a claim whose date has gone
+// backwards — or ErrChipCapExceeded (also no mutation) if the payout would
+// break MaxChips.
+func (s *Store) ClaimDaily(guildID, userID string) (DailyClaimResult, error) {
 	var result DailyClaimResult
 	err := s.Update(func(d *Data) error {
+		// The claim's instant is read HERE, under the lock — not by the
+		// caller before it. A pre-lock read lets two /daily invocations that
+		// straddle midnight reach the store in the reverse order of the
+		// instants they carry.
+		now := s.nowLocked()
+		today := jstDate(now)
+		yesterday := jstYesterday(now) // NOT jstDate(now.AddDate(0,0,-1)) — see jstYesterday's doc
 		economy := ensureGuildLocked(d, guildID)
 		account := ensureAccountLocked(economy, userID)
-		if account.LastDailyDate == today {
+		// LastDailyDate is a "2006-01-02" string, so a lexical comparison IS
+		// the calendar comparison: the claim date is monotonically
+		// non-decreasing. Rejecting an EARLIER date as well as an equal one
+		// is what stops the D→D+1→D→D+1 sequence from paying four times for
+		// two days.
+		if account.LastDailyDate != "" && today <= account.LastDailyDate {
 			return ErrAlreadyClaimedToday
 		}
 		streak := 1

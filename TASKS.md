@@ -8,7 +8,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 `Docs/agent-guide/` と `CLAUDE.md` / `AGENTS.md` は MyWorkflow から展開される写しなので**編集しない**。絶対規則 3(`casino.Default()` 越しの単一ライター、`Update` 内で再ロックしない)を守る。
 
 ## R-001: `/daily` の受給日を後退させない(日付境界の二重受給)
-- status: todo
+- status: done
 - done-when: 所見 1(P1)。`internal/casino/store.go` の `ClaimDaily` が「受給日と一致」しか拒まないため、`ClaimDaily(D)→(D+1)→(D)→(D+1)` が 4 回とも成功する。受給日が最後の受給日より**前**の要求も拒む(`ErrDailyAlreadyClaimed` 相当のセンチネルで。受給日は単調非減少)。`internal/commands/daily.go` が**ロック取得前**に時刻を取っている点も直し、時刻はロックの内側(`Update` のクロージャ内、または `Store` に注入した clock)で取る。回帰テスト: 上の 4 回のシーケンスで後半 2 回が拒否され支給合計が 450 で止まる。既存の daily テストは全て通る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestStore|TestClaimDaily|TestDaily" -count=1`

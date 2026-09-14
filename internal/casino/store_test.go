@@ -28,6 +28,15 @@ func newTempStore(t *testing.T) (*Store, string) {
 	return New(path), path
 }
 
+// at pins the store's clock to tm and returns the store, so a claim reads
+// as st.at(day).ClaimDaily(...). Production never sets s.clock; the methods
+// that decide a JST date for themselves take no instant from the caller,
+// exactly so that the date is chosen under the lock.
+func (s *Store) at(tm time.Time) *Store {
+	s.clock = func() time.Time { return tm }
+	return s
+}
+
 // seedAccount writes a known balance for guildID/userID, bypassing the
 // credit helpers so cap-boundary tests can start from any balance.
 func seedAccount(t *testing.T, st *Store, guildID, userID string, account UserAccount) {
@@ -848,7 +857,7 @@ func TestStore_EnsureCasinoAccess_ThenFailingOperation_KeepsAccountAndBonus(t *t
 func TestStore_ClaimDaily_FirstClaim(t *testing.T) {
 	st, path := newTempStore(t)
 
-	result, err := st.ClaimDaily("guild1", "user-1", fixedNow)
+	result, err := st.at(fixedNow).ClaimDaily("guild1", "user-1")
 	if err != nil {
 		t.Fatalf("ClaimDaily returned error: %v", err)
 	}
@@ -867,12 +876,12 @@ func TestStore_ClaimDaily_FirstClaim(t *testing.T) {
 
 func TestStore_ClaimDaily_SameDayTwice(t *testing.T) {
 	st, path := newTempStore(t)
-	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+	if _, err := st.at(fixedNow).ClaimDaily("guild1", "user-1"); err != nil {
 		t.Fatalf("first ClaimDaily returned error: %v", err)
 	}
 
 	// Later the same JST calendar day.
-	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow.Add(8*time.Hour)); !errors.Is(err, ErrAlreadyClaimedToday) {
+	if _, err := st.at(fixedNow.Add(8*time.Hour)).ClaimDaily("guild1", "user-1"); !errors.Is(err, ErrAlreadyClaimedToday) {
 		t.Fatalf("second ClaimDaily on the same JST day = %v, want ErrAlreadyClaimedToday", err)
 	}
 
@@ -884,11 +893,11 @@ func TestStore_ClaimDaily_SameDayTwice(t *testing.T) {
 
 func TestStore_ClaimDaily_ConsecutiveDay(t *testing.T) {
 	st, path := newTempStore(t)
-	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+	if _, err := st.at(fixedNow).ClaimDaily("guild1", "user-1"); err != nil {
 		t.Fatalf("day 1 ClaimDaily returned error: %v", err)
 	}
 
-	result, err := st.ClaimDaily("guild1", "user-1", daysAfter(1))
+	result, err := st.at(daysAfter(1)).ClaimDaily("guild1", "user-1")
 	if err != nil {
 		t.Fatalf("day 2 ClaimDaily returned error: %v", err)
 	}
@@ -904,15 +913,15 @@ func TestStore_ClaimDaily_ConsecutiveDay(t *testing.T) {
 
 func TestStore_ClaimDaily_GapResetsStreak(t *testing.T) {
 	st, path := newTempStore(t)
-	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); err != nil {
+	if _, err := st.at(fixedNow).ClaimDaily("guild1", "user-1"); err != nil {
 		t.Fatalf("day 1 ClaimDaily returned error: %v", err)
 	}
-	if _, err := st.ClaimDaily("guild1", "user-1", daysAfter(1)); err != nil {
+	if _, err := st.at(daysAfter(1)).ClaimDaily("guild1", "user-1"); err != nil {
 		t.Fatalf("day 2 ClaimDaily returned error: %v", err)
 	}
 
 	// Day 3 skipped entirely; claim again on day 4.
-	result, err := st.ClaimDaily("guild1", "user-1", daysAfter(3))
+	result, err := st.at(daysAfter(3)).ClaimDaily("guild1", "user-1")
 	if err != nil {
 		t.Fatalf("day 4 ClaimDaily returned error: %v", err)
 	}
@@ -932,7 +941,7 @@ func TestStore_ClaimDaily_SeventhDayJackpot(t *testing.T) {
 	want := []int64{200, 250, 300, 350, 400, 450, 1000}
 	var total int64
 	for day := 0; day < 7; day++ {
-		result, err := st.ClaimDaily("guild1", "user-1", daysAfter(day))
+		result, err := st.at(daysAfter(day)).ClaimDaily("guild1", "user-1")
 		if err != nil {
 			t.Fatalf("day %d ClaimDaily returned error: %v", day+1, err)
 		}
@@ -951,11 +960,62 @@ func TestStore_ClaimDaily_SeventhDayJackpot(t *testing.T) {
 	}
 }
 
+// TestStore_ClaimDaily_DateNeverMovesBackwards is the regression for the
+// day-boundary double claim: two /daily invocations that straddle midnight
+// can reach the store in the reverse order of their instants, and a store
+// that only rejects "same date as the last claim" pays out D, D+1, D, D+1 —
+// four bonuses for two days. The claimed date must be monotonically
+// non-decreasing, so the last two requests are rejected and the payout stops
+// at 200+250=450.
+func TestStore_ClaimDaily_DateNeverMovesBackwards(t *testing.T) {
+	st, path := newTempStore(t)
+
+	var total int64
+	for _, step := range []struct {
+		name string
+		now  time.Time
+	}{
+		{"day D", fixedNow},
+		{"day D+1", daysAfter(1)},
+	} {
+		result, err := st.at(step.now).ClaimDaily("guild1", "user-1")
+		if err != nil {
+			t.Fatalf("%s ClaimDaily returned error: %v", step.name, err)
+		}
+		total += result.Amount
+	}
+	if total != 450 {
+		t.Fatalf("the two forward claims paid %d chips, want 450 (200+250)", total)
+	}
+
+	// The two stragglers: an instant from the day already claimed, then one
+	// from the day whose claim already landed.
+	for _, step := range []struct {
+		name string
+		now  time.Time
+	}{
+		{"day D again (backwards)", fixedNow},
+		{"day D+1 again", daysAfter(1)},
+	} {
+		if _, err := st.at(step.now).ClaimDaily("guild1", "user-1"); !errors.Is(err, ErrAlreadyClaimedToday) {
+			t.Fatalf("%s = %v, want ErrAlreadyClaimedToday — the claimed date must never move backwards", step.name, err)
+		}
+	}
+
+	account := readAccount(t, path, "guild1", "user-1")
+	if account.Chips != welcomeBonusChips+450 {
+		t.Fatalf("Chips = %d, want %d — the rejected claims must pay nothing", account.Chips, welcomeBonusChips+450)
+	}
+	if account.StreakDays != 2 || account.LastDailyDate != jstDate(daysAfter(1)) {
+		t.Fatalf("account = %+v, want StreakDays 2 and LastDailyDate %q", account, jstDate(daysAfter(1)))
+	}
+}
+
 func TestStore_ClaimDaily_ChipCapExceeded_NoMutation(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccounts(t, st, "guild1", map[string]UserAccount{"user-1": {Chips: MaxChips, Coins: 7}})
 
-	if _, err := st.ClaimDaily("guild1", "user-1", fixedNow); !errors.Is(err, ErrChipCapExceeded) {
+	if _, err := st.at(fixedNow).ClaimDaily("guild1", "user-1"); !errors.Is(err, ErrChipCapExceeded) {
 		t.Fatalf("ClaimDaily at MaxChips = %v, want ErrChipCapExceeded", err)
 	}
 
@@ -1007,7 +1067,7 @@ func TestStore_ClaimDaily_NonJSTLocation_StreakFollowsJSTCalendar(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			st, path := newTempStore(t)
 
-			first, err := st.ClaimDaily("guild1", "user-1", tc.first)
+			first, err := st.at(tc.first).ClaimDaily("guild1", "user-1")
 			if err != nil {
 				t.Fatalf("first ClaimDaily returned error: %v", err)
 			}
@@ -1015,7 +1075,7 @@ func TestStore_ClaimDaily_NonJSTLocation_StreakFollowsJSTCalendar(t *testing.T) 
 				t.Fatalf("first claim NewStreak = %d, want 1", first.NewStreak)
 			}
 
-			second, err := st.ClaimDaily("guild1", "user-1", tc.second)
+			second, err := st.at(tc.second).ClaimDaily("guild1", "user-1")
 			if err != nil {
 				t.Fatalf("second ClaimDaily returned error: %v", err)
 			}
@@ -1590,7 +1650,9 @@ func TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption(t *testing.T) 
 	st := New(filepath.Join(dir, "casino.json"))
 	const guildID = "guild1"
 	const n = 30
-	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+	// Pin the clock BEFORE the goroutines start: s.clock is written once here
+	// and only read (under the lock) afterwards.
+	st.at(time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC))
 
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -1598,7 +1660,7 @@ func TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption(t *testing.T) 
 		go func(i int) {
 			defer wg.Done()
 			userID := fmt.Sprintf("user-%d", i)
-			if _, err := st.ClaimDaily(guildID, userID, now); err != nil {
+			if _, err := st.ClaimDaily(guildID, userID); err != nil {
 				t.Errorf("ClaimDaily(%s): %v", userID, err)
 			}
 			if _, err := st.Spin(guildID, userID, 50); err != nil {
