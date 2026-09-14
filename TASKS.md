@@ -133,7 +133,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 設計判断は親が決めた(下記 notes)。仕様 §番号は `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`。
 
 ## C2-10: 掃除人の精算失敗で配当を失わない(所見 1、P1)
-- status: todo
+- status: done
 - done-when: `Sweep` で map から消した後に `SettleGame` が失敗すると、確定した配当(H&L のポット)が失われ、口座は `Escrow` が残って新規ゲームも始められない。直し方(親の決定): `SessionManager.Sweep(now)` は期限切れセッションを**消さずに `Expired` 状態にして返す**(以後の押下は「終了しています」、`Open` は進行中として拒否)。掃除人は `AutoResolve` → `SettleGame` が**成功したときだけ** `Remove(id)` で消す。失敗したら状態と確定配当(`PendingPayout int64`)をセッションに残し、次の Sweep が `Expired` のものを再度精算する(30 秒ごとの再試行)。再試行が成功したらメッセージ編集も行う。`session_test.go`: `Sweep` が同じセッションを `Expired` として再度返す、`Remove` 後は返さない。`casino_sessions_test.go`: 精算を 1 回失敗させると次の Sweep で同じ配当(例: ポット 173)が精算され、`Escrow` が 0 になる。`Expired` 中の押下が「終了しています」を返す。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestSession" -count=1`

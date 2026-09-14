@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -70,32 +71,57 @@ func runSessionSweeper(ctx context.Context, editor boardEditor, mgr *casino.Sess
 }
 
 // sweepIdleBoards runs one pass: 設計書 §5's Sweep → AutoResolve → settle →
-// edit, in that order. Sweep has already removed each board from the manager
-// and handed it to this goroutine alone, so the state below may be read and
-// resolved without the manager's lock, and a button pressed a moment too late
-// gets ErrSessionNotFound instead of a second settlement.
+// 消す → edit, in that order. Sweep has marked each board expired and handed
+// it to this goroutine alone — every press path refuses an expired board — so
+// the state below may be read and resolved without the manager's lock, and a
+// button pressed a moment too late gets ErrSessionNotFound instead of a
+// second settlement.
 //
-// One failing board never stops the pass: the others are already out of the
-// manager and nothing else will come back for them.
+// The board is removed only AFTER the settlement has landed. A settlement
+// that fails leaves the board expired, carrying the payout it already
+// resolved, and the next pass (CasinoSweepInterval later) pays that same
+// number: dropping the board here would lose the payout AND leave the stake
+// in escrow, where it blocks every new game until the next restart.
+//
+// One failing board never stops the pass.
 func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casinoBank, now time.Time) {
 	for _, session := range mgr.Sweep(now) {
-		resolver, resolvable := session.State.(casino.AutoResolver)
-		if !resolvable {
-			// Unreachable while every registered game implements it; the
-			// board is already gone, so the escrow it holds now waits for
-			// RefundStaleEscrows at the next restart. That is worth a loud line.
-			slog.Error("casino: a swept board cannot resolve itself", "game", string(session.Game), "state", fmt.Sprintf("%T", session.State))
-			continue
+		if !session.PayoutResolved {
+			resolver, resolvable := session.State.(casino.AutoResolver)
+			if !resolvable {
+				// Unreachable while every registered game implements it. Nothing
+				// can decide what this board owes, so retrying it forever would
+				// only keep its owner locked out of new games: drop it and leave
+				// the escrow to RefundStaleEscrows at the next restart. That is
+				// worth a loud line.
+				slog.Error("casino: a swept board cannot resolve itself", "game", string(session.Game), "state", fmt.Sprintf("%T", session.State))
+				mgr.Remove(session.ID)
+				continue
+			}
+			// Once per board, never on a retry: AutoResolve draws cards, so a
+			// second call would decide a different game than the one the
+			// first pass already committed to.
+			session.PendingPayout = resolver.AutoResolve()
+			session.PayoutResolved = true
 		}
 
 		// Chips before pixels: a settlement that is not persisted must not be
 		// announced, and an edit that fails must never be retried into a
 		// second payout (the same order settle() keeps for a press).
-		settled, err := bank.SettleGame(session.GuildID, session.UserID, resolver.AutoResolve())
+		settled, err := bank.SettleGame(session.GuildID, session.UserID, session.PendingPayout)
 		if err != nil {
-			slog.Error("casino: settling a timed-out board failed", "game", string(session.Game), "error", redactInteractionError(err))
+			if errors.Is(err, casino.ErrNoGameInProgress) {
+				// The escrow is already closed: a press got there first, or an
+				// earlier retry paid and failed on something after the payout.
+				// There is nothing left to pay, so stop retrying this board.
+				slog.Warn("casino: a timed-out board had no stake left to settle", "game", string(session.Game))
+				mgr.Remove(session.ID)
+				continue
+			}
+			slog.Error("casino: settling a timed-out board failed, retrying at the next sweep", "game", string(session.Game), "error", redactInteractionError(err))
 			continue
 		}
+		mgr.Remove(session.ID)
 		editTimedOutBoard(editor, session, settled)
 	}
 }
@@ -132,9 +158,10 @@ func editTimedOutBoard(editor boardEditor, session *casino.Session, settled casi
 // sweeper has an answer either way — a game that does not implement it simply
 // loses its buttons, which is strictly what this file did before.
 //
-// state is the swept session's board. Sweep already removed it from the
-// manager and handed it to this goroutine alone, so reading it here needs no
-// lock (the same licence sweepIdleBoards uses for AutoResolve).
+// state is the swept session's board. Sweep marked it expired and handed it
+// to this goroutine alone (and the settlement above has already removed it),
+// so reading it here needs no lock — the same licence sweepIdleBoards uses
+// for AutoResolve.
 type timedOutBoardRenderer interface {
 	DisabledComponents(sessionID string, state any) []discordgo.MessageComponent
 }

@@ -60,6 +60,24 @@ type Session struct {
 	LastActionAt time.Time
 	Ref          MessageRef
 
+	// Expired marks a board the idle sweep has taken over. A timeout does
+	// NOT delete the board any more: the payout only becomes real once
+	// casino.Store.SettleGame has persisted it, so a board whose settlement
+	// failed has to stay somewhere the next sweep can find it. An expired
+	// board is refused by every caller-facing path (Get, Hold, WithSession,
+	// Touch, Close) and keeps its owner's "one game at a time" slot, which
+	// is what stops a new game from opening on top of an escrow that is
+	// still held. Only Remove drops it.
+	Expired bool
+
+	// PendingPayout is what AutoResolve produced for this expired board, and
+	// PayoutResolved says whether it ran at all — a losing hand pays 0, so
+	// the amount alone cannot answer that. A retried settlement pays exactly
+	// this number instead of resolving the board a second time: AutoResolve
+	// draws cards, so a second call would decide a different game.
+	PendingPayout  int64
+	PayoutResolved bool
+
 	// busy counts the operations currently running on this board (Hold /
 	// Release). Guarded by the manager's mutex like every other mutable
 	// field, and deliberately unexported: it is the manager's bookkeeping,
@@ -149,6 +167,11 @@ func newSessionID() (string, error) {
 // chips into escrow, because a second OpenGame would strand the first
 // stake (see Store.OpenGame's ErrGameInProgress, the persisted half of the
 // same rule).
+//
+// An EXPIRED board counts as one in progress: its stake is still in escrow
+// until the sweeper's settlement lands, and Store.OpenGame would refuse the
+// new bet anyway. The two halves of the rule must agree, or the player gets
+// a board here that the store then refuses to stake.
 func (m *SessionManager) Open(guildID, userID string, game GameKind, state any, ref MessageRef) (*Session, error) {
 	id, err := newSessionID()
 	if err != nil {
@@ -191,7 +214,7 @@ func (m *SessionManager) Get(id string) (Session, bool) {
 	defer m.mu.Unlock()
 
 	session, ok := m.sessions[id]
-	if !ok {
+	if !ok || session.Expired {
 		return Session{}, false
 	}
 	return *session, true
@@ -214,7 +237,11 @@ func (m *SessionManager) WithSession(id string, fn func(*Session) (done bool, er
 	defer m.mu.Unlock()
 
 	session, ok := m.sessions[id]
-	if !ok {
+	if !ok || session.Expired {
+		// Expired: the sweep goroutine owns this board and is settling it.
+		// Letting fn run here would move a hand the payout was already
+		// decided from, and the press would be paid out of an escrow the
+		// sweeper is about to close.
 		return ErrSessionNotFound
 	}
 
@@ -249,7 +276,7 @@ func (m *SessionManager) Hold(id string) (Session, bool) {
 	defer m.mu.Unlock()
 
 	session, ok := m.sessions[id]
-	if !ok {
+	if !ok || session.Expired {
 		return Session{}, false
 	}
 	session.busy++
@@ -276,27 +303,37 @@ func (m *SessionManager) Touch(id string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if session, ok := m.sessions[id]; ok {
+	if session, ok := m.sessions[id]; ok && !session.Expired {
 		session.LastActionAt = now
 	}
 }
 
-// Sweep removes every session idle for longer than the TTL, EXCEPT the ones a
-// press is holding (Hold), and returns them.
-// Removal happens inside the same critical section as the deadline test, so
-// a session is handed to exactly one caller, once: the sweep goroutine can
-// settle it (AutoResolve → SettleGame → edit the message) outside the lock
-// without racing a button press, because the presser now gets
-// ErrSessionNotFound.
+// Sweep marks every session idle for longer than the TTL as Expired and
+// returns it, together with every board an earlier sweep already expired —
+// those are the ones whose settlement failed, and the sweep interval is their
+// retry interval. The boards a press is holding (Hold) are skipped.
 //
-// The returned sessions are no longer reachable from the manager, so the
-// caller may read and mutate their State freely.
+// An expired board STAYS in the maps, unreachable: Get, Hold, WithSession,
+// Touch and Close all refuse it, so the sweep goroutine owns it alone and may
+// read and mutate its State and PendingPayout outside the lock — the same
+// licence removal used to give, without the hole removal left. Removing the
+// board before Store.SettleGame had persisted the payout LOST that payout and
+// stranded the stake in escrow, where it also blocked every new game until
+// the next restart. The caller removes the board with Remove, once the
+// settlement has landed (or the store has said there is nothing left to pay).
 func (m *SessionManager) Sweep(now time.Time) []*Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	var expired []*Session
 	for _, session := range m.sessions {
+		if session.Expired {
+			// Handed out before and still here: its settlement did not land.
+			// Hand it over again rather than wait out another TTL — the
+			// player's chips are held until this board is paid.
+			expired = append(expired, session)
+			continue
+		}
 		if session.busy > 0 {
 			// A press owns this board right now. Its LastActionAt is only
 			// refreshed when WithSession returns, so the board can look idle
@@ -305,26 +342,53 @@ func (m *SessionManager) Sweep(now time.Time) []*Session {
 			continue
 		}
 		if now.Sub(session.LastActionAt) >= m.ttl {
+			// Expiring inside the same critical section as the deadline test
+			// is what hands the board to exactly one caller: a press arriving
+			// a moment later gets ErrSessionNotFound, not a second settlement.
+			session.Expired = true
 			expired = append(expired, session)
 		}
-	}
-	for _, session := range expired {
-		m.removeLocked(session)
 	}
 	return expired
 }
 
-// Close removes a session without running the board, for the paths that
-// settle outside WithSession (a cancelled /highlow, a failed Discord edit
-// that leaves nothing to press). It reports whether the session was still
-// live, so the caller can tell "I closed it" from "somebody else already
-// did" and avoid paying twice.
-func (m *SessionManager) Close(id string) bool {
+// Remove drops a board for good. It is the sweeper's half of the expiry
+// protocol — called only once Store.SettleGame has persisted the payout, or
+// has reported that there is no escrow left to pay — so a board that is gone
+// from here is a board whose chips have already moved. Unlike Close it takes
+// an expired board too: the sweeper is the caller that owns those.
+//
+// Reports whether the board was still there, so a caller can tell "I removed
+// it" from "somebody else already did".
+func (m *SessionManager) Remove(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	session, ok := m.sessions[id]
 	if !ok {
+		return false
+	}
+	m.removeLocked(session)
+	return true
+}
+
+// Close removes a LIVE session without running the board, for the paths that
+// settle outside WithSession (a cancelled /highlow, a failed Discord edit
+// that leaves nothing to press). It reports whether the session was still
+// live, so the caller can tell "I closed it" from "somebody else already
+// did" and avoid paying twice. An expired board counts as somebody else's
+// (Remove is the sweeper's door).
+func (m *SessionManager) Close(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[id]
+	if !ok || session.Expired {
+		// An expired board belongs to the sweep until its settlement lands.
+		// Reporting false is what keeps the undelivered-board refund in
+		// /highlow and /blackjack from handing back a stake the sweeper is
+		// about to settle — the same "somebody else owns it now" answer a
+		// board that is already gone gives.
 		return false
 	}
 	m.removeLocked(session)

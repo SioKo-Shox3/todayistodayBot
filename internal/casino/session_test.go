@@ -234,7 +234,7 @@ func TestSessionWithSessionRefreshesTheIdleDeadline(t *testing.T) {
 	}
 }
 
-func TestSessionSweepReturnsOnlyExpiredSessionsAndOnlyOnce(t *testing.T) {
+func TestSessionSweepReturnsOnlyIdleSessions(t *testing.T) {
 	start := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := newFixedClock(start)
 	m := NewSessionManager(clock.Now, 3*time.Minute)
@@ -263,25 +263,27 @@ func TestSessionSweepReturnsOnlyExpiredSessionsAndOnlyOnce(t *testing.T) {
 	if swept[0].Ref != testRef {
 		t.Fatalf("swept session lost its MessageRef: %+v", swept[0].Ref)
 	}
+	if !swept[0].Expired {
+		t.Error("the swept session is not marked Expired, so nothing refuses a press on it")
+	}
 	if _, ok := m.Get(old.ID); ok {
 		t.Fatal("swept session is still addressable")
 	}
 	if _, ok := m.Get(fresh.ID); !ok {
-		t.Fatal("Sweep removed a session that was not idle yet")
+		t.Fatal("Sweep expired a session that was not idle yet")
 	}
 
-	// A second sweep at the same instant must not hand the same board to a
-	// second settlement — that is what would pay the player twice.
-	if again := m.Sweep(clock.Now()); len(again) != 0 {
-		t.Fatalf("second Sweep at the same instant: got %d sessions, want 0", len(again))
+	// The board is removed by its settlement, not by the timeout; only then
+	// is the player free to start a new game. Until it lands the stake is
+	// still in escrow, so a new board would have nothing to stake.
+	if !m.Remove(old.ID) {
+		t.Fatal("Remove did not take the expired board")
 	}
-
-	// The swept player is free to start a new game.
 	if _, err := m.Open("guild-1", "user-old", GameHighLow, &struct{}{}, testRef); err != nil {
-		t.Fatalf("Open after being swept: %v", err)
+		t.Fatalf("Open after the swept board was settled and removed: %v", err)
 	}
 
-	// Once the survivor goes past the TTL it is swept in turn, and never again.
+	// Once the survivor goes past the TTL it is expired in turn.
 	clock.advance(3 * time.Minute)
 	swept = m.Sweep(clock.Now())
 	ids := make(map[string]bool, len(swept))
@@ -291,8 +293,111 @@ func TestSessionSweepReturnsOnlyExpiredSessionsAndOnlyOnce(t *testing.T) {
 	if !ids[fresh.ID] {
 		t.Fatalf("Sweep did not return the now-idle session %q (got %d sessions)", fresh.ID, len(swept))
 	}
-	if again := m.Sweep(clock.Now()); len(again) != 0 {
-		t.Fatalf("re-sweep: got %d sessions, want 0", len(again))
+}
+
+// C2-10: a board is removed by its settlement, not by the timeout. Sweep
+// therefore keeps handing back a board it already expired — that is the
+// retry — and stops only once Remove says the chips have landed.
+func TestSessionSweepKeepsReturningAnExpiredBoardUntilRemoved(t *testing.T) {
+	start := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	clock := newFixedClock(start)
+	m := NewSessionManager(clock.Now, 3*time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	clock.advance(3 * time.Minute)
+	if swept := m.Sweep(clock.Now()); len(swept) != 1 || swept[0].ID != opened.ID {
+		t.Fatalf("first Sweep: got %d sessions, want the idle one", len(swept))
+	}
+
+	// The settlement failed, so nothing removed the board. The next pass —
+	// one sweep interval later, not another TTL later — must hand back the
+	// SAME session, still expired.
+	clock.advance(30 * time.Second)
+	again := m.Sweep(clock.Now())
+	if len(again) != 1 || again[0].ID != opened.ID {
+		t.Fatalf("the retry Sweep: got %d sessions, want the expired board back", len(again))
+	}
+	if !again[0].Expired {
+		t.Error("the board handed back by the retry is not marked Expired")
+	}
+
+	// The payout the sweeper parks on the board survives to the retry: Sweep
+	// hands out the board itself, not a copy, so the retry pays the number
+	// the first pass resolved instead of resolving the hand again.
+	again[0].PendingPayout = 173
+	again[0].PayoutResolved = true
+	retried := m.Sweep(clock.Now())
+	if len(retried) != 1 || retried[0].PendingPayout != 173 || !retried[0].PayoutResolved {
+		t.Fatalf("the resolved payout did not survive the retry: %+v", retried)
+	}
+
+	// Settled at last: Remove is what ends the retries.
+	if !m.Remove(opened.ID) {
+		t.Fatal("Remove did not take the expired board")
+	}
+	if swept := m.Sweep(clock.Now()); len(swept) != 0 {
+		t.Fatalf("Sweep after Remove: got %d sessions, want 0 — a removed board must never be paid again", len(swept))
+	}
+	if m.Remove(opened.ID) {
+		t.Error("Remove reported true twice for one board")
+	}
+}
+
+// An expired board belongs to the sweep goroutine alone: it is settling that
+// hand outside the manager's lock. Every press path must therefore refuse it
+// (the command layer's ⌛「この盤面はもう終了しています」), and its owner stays
+// blocked from a new game until the stake in escrow has actually been paid.
+func TestSessionExpiredBoardIsRefusedByEveryPressPath(t *testing.T) {
+	start := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	clock := newFixedClock(start)
+	m := NewSessionManager(clock.Now, 3*time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	clock.advance(3 * time.Minute)
+	if swept := m.Sweep(clock.Now()); len(swept) != 1 {
+		t.Fatalf("Sweep: got %d sessions, want the idle one", len(swept))
+	}
+
+	if _, ok := m.Get(opened.ID); ok {
+		t.Error("Get answered for an expired board")
+	}
+	if _, ok := m.Hold(opened.ID); ok {
+		t.Error("Hold accepted an expired board, so a press would play a hand the sweeper is settling")
+	}
+	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
+		t.Error("WithSession ran fn on an expired board")
+		return true, nil
+	}); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("WithSession on an expired board: got %v, want ErrSessionNotFound", err)
+	}
+	if m.Close(opened.ID) {
+		t.Error("Close claimed an expired board, which would refund a stake the sweeper is about to settle")
+	}
+
+	// Touch must not push back the deadline of a board the sweep already owns.
+	m.Touch(opened.ID, clock.Now().Add(time.Hour))
+	if swept := m.Sweep(clock.Now()); len(swept) != 1 {
+		t.Fatalf("Sweep after a Touch on an expired board: got %d, want the same board back", len(swept))
+	}
+
+	// The stake is still in escrow, so the account still has a game in
+	// progress: Store.OpenGame would refuse the next bet, and the manager
+	// must give the same answer rather than deal a board nothing can stake.
+	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); !errors.Is(err, ErrGameInProgress) {
+		t.Errorf("Open while the previous board is expired: got %v, want ErrGameInProgress", err)
+	}
+
+	m.Remove(opened.ID)
+	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); err != nil {
+		t.Errorf("Open after the expired board was settled and removed: %v", err)
 	}
 }
 
@@ -479,6 +584,12 @@ func TestSessionSweepSkipsAHeldBoard(t *testing.T) {
 	}
 	if _, live := m.Get(held.ID); !live {
 		t.Error("the held board was swept away from the press that holds it")
+	}
+
+	// The sweeper settles the board it was handed and removes it; without
+	// that the next pass hands the same one back (the C2-10 retry).
+	if !m.Remove(idle.ID) {
+		t.Fatal("Remove did not take the swept board")
 	}
 
 	// Released and still idle: the next pass takes it. A hold that outlived

@@ -218,9 +218,9 @@ func TestSweepIdleBoardsPaysOnceWhenTheEditFails(t *testing.T) {
 	editor.took(t)
 }
 
-// A settlement the store refuses leaves the board gone and the stake in
-// escrow, where RefundStaleEscrows returns it at the next restart. What must
-// NOT happen is an edit telling the player they were paid.
+// A settlement the store refuses leaves the stake in escrow. What must NOT
+// happen is an edit telling the player they were paid — and (C2-10) the board
+// must stay, because it is the only record of the payout that was decided.
 func TestSweepIdleBoardsSaysNothingWhenTheSettlementFails(t *testing.T) {
 	board := &fixedResolver{payout: 250}
 	bank, mgr, opened := sweepFixture(t, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
@@ -231,8 +231,77 @@ func TestSweepIdleBoardsSaysNothingWhenTheSettlementFails(t *testing.T) {
 
 	editor.idle(t)
 	if chips, escrow := sweepChipsOf(t, bank); chips != 900 || escrow != 100 {
-		t.Errorf("account: got %d chips / %d escrow, want 900 / 100 — the stake waits for RefundStaleEscrows", chips, escrow)
+		t.Errorf("account: got %d chips / %d escrow, want 900 / 100 — the stake is still on the table", chips, escrow)
 	}
+	if mgr.Len() != 1 {
+		t.Errorf("%d boards left, want the unsettled one kept for the next pass", mgr.Len())
+	}
+}
+
+// C2-10: the payout is only real once the store has it. A board dropped on a
+// failed settlement took the payout with it and left the stake in escrow,
+// where it also blocked every new game until the next restart. The next pass
+// now pays the SAME amount and only then lets the board go.
+func TestSweepIdleBoardsRetriesTheSameSettlementAtTheNextPass(t *testing.T) {
+	board := &fixedResolver{payout: 173}
+	bank, mgr, opened := sweepFixture(t, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	editor := newRecordingEditor()
+
+	bank.settleErr = errors.New("the store refused this payout")
+	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
+	editor.idle(t)
+
+	// The store is well again, and the sweeper comes back one interval later.
+	bank.settleErr = nil
+	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL+CasinoSweepInterval))
+
+	if board.resolved != 1 {
+		t.Errorf("AutoResolve was called %d times, want exactly 1 — a retry must pay the payout the first pass decided, not deal a new one", board.resolved)
+	}
+	if bank.settles != 2 {
+		t.Errorf("SettleGame was called %d times, want 2 (one refusal, one retry)", bank.settles)
+	}
+	if chips, escrow := sweepChipsOf(t, bank); chips != 1073 || escrow != 0 {
+		t.Errorf("account: got %d chips / %d escrow, want 1073 / 0 (1000 - ベット100 + ポット173)", chips, escrow)
+	}
+	if mgr.Len() != 0 {
+		t.Errorf("%d boards left after the retry settled, want 0", mgr.Len())
+	}
+
+	// The closing message is the retry's job too: the player learns the hand
+	// is over on the pass that actually paid them.
+	edit := editor.took(t)
+	if edit.ID != "m1" {
+		t.Errorf("the retry edited %q, want the board's own message m1", edit.ID)
+	}
+	if embed := (*edit.Embeds)[0]; !strings.Contains(embed.Description, "配当: 173枚") {
+		t.Errorf("the closing line does not name the retried payout: %q", embed.Description)
+	}
+}
+
+// The retry stops at the store's own "there is no game here": an escrow that
+// a press (or an earlier retry that failed after the payout landed) already
+// closed has nothing left to pay, and retrying it forever would keep its
+// owner locked out of new games.
+func TestSweepIdleBoardsDropsABoardWhoseStakeIsAlreadyGone(t *testing.T) {
+	board := &fixedResolver{payout: 250}
+	bank, mgr, opened := sweepFixture(t, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	editor := newRecordingEditor()
+
+	// Somebody else closed the escrow between the timeout and this pass.
+	if _, err := bank.Store.SettleGame("g1", "u1", 100); err != nil {
+		t.Fatalf("closing the escrow behind the sweeper: %v", err)
+	}
+
+	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if mgr.Len() != 0 {
+		t.Errorf("%d boards left, want 0 — a board with no stake left must not be retried forever", mgr.Len())
+	}
+	if chips, escrow := sweepChipsOf(t, bank); chips != 1000 || escrow != 0 {
+		t.Errorf("account: got %d chips / %d escrow, want 1000 / 0 — the sweeper must not pay a second time", chips, escrow)
+	}
+	editor.idle(t)
 }
 
 // --- the loop --------------------------------------------------------------
@@ -269,8 +338,8 @@ func TestRunSessionSweeperSweepsOnEveryTickAndStopsWithTheContext(t *testing.T) 
 }
 
 // A session carrying something that is not a board cannot be resolved, and
-// guessing a payout for it would invent chips. It is dropped (Sweep already
-// removed it) with its stake left for RefundStaleEscrows.
+// guessing a payout for it would invent chips. It is dropped — no retry can
+// ever help it — with its stake left for RefundStaleEscrows.
 func TestSweepIdleBoardsPaysNothingForAStateItCannotResolve(t *testing.T) {
 	bank, mgr, opened := sweepFixture(t, struct{}{}, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 	editor := newRecordingEditor()
@@ -283,7 +352,46 @@ func TestSweepIdleBoardsPaysNothingForAStateItCannotResolve(t *testing.T) {
 	if chips, escrow := sweepChipsOf(t, bank); chips != 900 || escrow != 100 {
 		t.Errorf("account: got %d chips / %d escrow, want 900 / 100", chips, escrow)
 	}
+	if mgr.Len() != 0 {
+		t.Errorf("%d boards left, want 0 — an unresolvable board must not be retried forever", mgr.Len())
+	}
 	editor.idle(t)
+}
+
+// C2-10: while a board waits for its settlement to be retried it belongs to
+// the sweeper, so the buttons under it must answer the ⌛ closing line rather
+// than play a hand whose payout is already decided.
+func TestSweepIdleBoardsLeavesTheTimedOutBoardUnpressable(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+	editor := newRecordingEditor()
+
+	bank.settleErr = errors.New("the store refused this payout")
+	sweepIdleBoards(editor, c.sessions, bank, time.Now().Add(2*casino.DefaultSessionTTL))
+	if bank.settles != 1 {
+		t.Fatalf("SettleGame was called %d times, want the one refusal the rest of this test builds on", bank.settles)
+	}
+
+	if got := c.press(t, r, sessionID, highLowActionCashOut).Data.Content; got != highLowSessionOverMessage {
+		t.Errorf("pressing a board that is waiting for its retry answered %q, want %q", got, highLowSessionOverMessage)
+	}
+	if got := highLowEscrowOf(t, bank); got != 100 {
+		t.Errorf("escrow after the refused press: got %d, want the stake (100) still held for the retry", got)
+	}
+
+	// And the retry still pays: the press did not consume the board.
+	bank.settleErr = nil
+	sweepIdleBoards(editor, c.sessions, bank, time.Now().Add(2*casino.DefaultSessionTTL))
+	if bank.settles != 2 {
+		t.Errorf("SettleGame was called %d times, want 2 (the refusal and the retry)", bank.settles)
+	}
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow after the retry: got %d, want 0", got)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d boards left after the retry settled, want 0", c.sessions.Len())
+	}
 }
 
 // --- 評価者の指摘(反復 1): 時間切れのボタンは無効化して残す ----------------
@@ -303,7 +411,7 @@ func TestSweepIdleBoardsKeepsTheGamesButtonsDisabled(t *testing.T) {
 	bank, mgr, opened := sweepFixture(t, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 	// sweepFixture opens every board as high&low; this hand is a blackjack
 	// one, and the sweeper must route by the session's own game.
-	mgr.Close(firstSessionID(t, mgr))
+	dropFixtureBoard(t, mgr)
 	session, err := mgr.Open("g1", "u1", casino.GameBlackjack, blackjackProbe(100, seed), casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 	if err != nil {
 		t.Fatalf("opening the blackjack board: %v", err)
@@ -356,12 +464,18 @@ func TestSweepIdleBoardsClearsTheButtonsOfAGameThatCannotRedrawThem(t *testing.T
 	}
 }
 
-// firstSessionID returns the ID of the manager's only board.
-func firstSessionID(t *testing.T, mgr *casino.SessionManager) string {
+// dropFixtureBoard throws away the single board sweepFixture opened, so the
+// test can open its own in its place. It goes through Sweep + Remove because
+// that is the only way to name a board the manager did not hand back — and
+// Close would refuse the expired board anyway, since an expired board belongs
+// to the sweeper.
+func dropFixtureBoard(t *testing.T, mgr *casino.SessionManager) {
 	t.Helper()
 	expired := mgr.Sweep(time.Now().Add(100 * 365 * 24 * time.Hour))
 	if len(expired) != 1 {
 		t.Fatalf("the fixture holds %d boards, want exactly 1", len(expired))
 	}
-	return expired[0].ID
+	if !mgr.Remove(expired[0].ID) {
+		t.Fatal("Remove did not take the fixture board")
+	}
 }
