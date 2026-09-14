@@ -1075,3 +1075,34 @@ func TestHighLowKeepsTheRedrawFlagWhenTheRedrawItselfFails(t *testing.T) {
 		t.Errorf("the board moved on while its picture was stale\n%s", body)
 	}
 }
+
+// C2-12: a refused settlement produced no payout and no balance, so the
+// closing message must not print a pair of zeroes in their place — a player
+// whose pot is still owed to them would read「配当: 0枚」as having lost it.
+// The hand itself still shows (blackjack's refusal has said this much since
+// C2-07).
+func TestHighLowNamesNoAmountsWhileTheSettlementIsRefused(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+
+	bank.settleErr = errors.New("the store refused this payout")
+	body := highLowBodyOf(t, c.press(t, r, sessionID, highLowActionCashOut))
+
+	for _, forbidden := range []string{"配当:", "残高:"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("the refusal prints %q, but the store produced no such number:\n%s", forbidden, body)
+		}
+	}
+	if !strings.Contains(body, "💰 キャッシュアウト(0連勝)") {
+		t.Errorf("the refusal lost the result of the board it is holding:\n%s", body)
+	}
+
+	// And the retry that succeeds names both numbers: the silence above is
+	// about the refusal, not about high&low.
+	bank.settleErr = nil
+	body = highLowBodyOf(t, c.press(t, r, sessionID, casinoActionSettle))
+	if want := casinoPayoutLine(100, 1000); !strings.Contains(body, want) {
+		t.Errorf("the settled retry does not name the money: want %q in\n%s", want, body)
+	}
+}

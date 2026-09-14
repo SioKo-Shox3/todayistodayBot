@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/SioKo-Shox3/todayistodayBot/internal/casino"
@@ -30,6 +31,11 @@ const CasinoSweepInterval = 30 * time.Second
 
 // casinoTimeoutTitle is what an auto-resolved board becomes (設計書 §5).
 const casinoTimeoutTitle = "⌛ 時間切れ — 自動決着"
+
+// casinoTimeoutNotice is the line that says WHY this board ended without the
+// player pressing anything. It sits above the game's own result rendering:
+// the result answers "what happened to my chips", this answers "why now".
+const casinoTimeoutNotice = "操作がないまま時間切れになったので自動で決着しました。"
 
 // boardEditor is the Discord surface the sweeper needs. It edits with the BOT
 // token rather than an interaction token: the board is swept three minutes
@@ -139,7 +145,7 @@ func editTimedOutBoard(editor boardEditor, session *casino.Session, settled casi
 	}
 
 	edit := discordgo.NewMessageEdit(session.Ref.ChannelID, session.Ref.MessageID)
-	edit.SetEmbeds([]*discordgo.MessageEmbed{casinoTimeoutEmbed(settled)})
+	edit.SetEmbeds([]*discordgo.MessageEmbed{timedOutBoardEmbed(session, settled)})
 	// 設計書 §4/§8: a settled board keeps its buttons, greyed out. The labels
 	// are the GAME's (they carry its hand and its odds), so the sweeper asks
 	// the game that registered this custom_id prefix to redraw them disabled
@@ -181,12 +187,47 @@ func disabledComponentsFor(session *casino.Session) []discordgo.MessageComponent
 	return []discordgo.MessageComponent{}
 }
 
-// casinoTimeoutEmbed is the closing message of an auto-resolved board. It
-// names the money the settlement actually produced, and no game detail: the
-// hand or the card row is still above it in the channel.
+// timedOutBoardResultRenderer is the other optional half of a game's closing
+// edit: the body. The sweeper's edit REPLACES the board, so a bare money line
+// would leave the player with no record of the hand that was decided without
+// them — the dealer's hole card is turned over by AutoResolve itself and, once
+// the embed is gone, nowhere else. A game that implements this draws the same
+// result it would have drawn for a press; the sweeper adds the ⌛ reason.
+type timedOutBoardResultRenderer interface {
+	TimedOutEmbed(state any, settled casino.SettleResult) *discordgo.MessageEmbed
+}
+
+// timedOutBoardEmbed is the closing message of an auto-resolved board: the
+// game's own result rendering when it has one, and the money alone when it
+// does not. Like disabledComponentsFor it routes on the session's game, and
+// reads the swept state without a lock for the same reason (the board belongs
+// to this goroutine, and the settlement above has already removed it).
+func timedOutBoardEmbed(session *casino.Session, settled casino.SettleResult) *discordgo.MessageEmbed {
+	if handler, found := registeredComponents[string(session.Game)]; found {
+		if renderer, draws := handler.(timedOutBoardResultRenderer); draws {
+			if embed := renderer.TimedOutEmbed(session.State, settled); embed != nil {
+				return embed
+			}
+		}
+	}
+	return casinoTimeoutEmbed(settled)
+}
+
+// casinoTimeoutEmbed is the fallback closing message: the money the
+// settlement actually produced, and no game detail, for a board whose game
+// cannot draw its own result.
 func casinoTimeoutEmbed(settled casino.SettleResult) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
 		Title:       casinoTimeoutTitle,
-		Description: fmt.Sprintf("操作がないまま時間切れになったので自動で決着しました。\n配当: %d枚 / 残高: %d枚", settled.Payout, settled.Chips),
+		Description: casinoTimeoutNotice + "\n" + casinoPayoutLine(settled.Payout, settled.Chips),
+	}
+}
+
+// casinoTimedOutEmbed wraps a game's result body in the ⌛ closing message:
+// same title for every game, the reason first, the result below it.
+func casinoTimedOutEmbed(resultLines []string) *discordgo.MessageEmbed {
+	return &discordgo.MessageEmbed{
+		Title:       casinoTimeoutTitle,
+		Description: strings.Join(append([]string{casinoTimeoutNotice, ""}, resultLines...), "\n"),
 	}
 }

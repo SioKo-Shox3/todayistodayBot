@@ -479,3 +479,113 @@ func dropFixtureBoard(t *testing.T, mgr *casino.SessionManager) {
 		t.Fatal("Remove did not take the fixture board")
 	}
 }
+
+// --- C2-12: 時間切れの決着は結果を見せる ------------------------------------
+
+// The sweeper's edit REPLACES the board, so the money line alone erased the
+// hand: the dealer's hole card is turned over by AutoResolve and, once the
+// board embed is gone, appears nowhere else. The closing message must carry
+// the game's own result — both hands face up and the verdict — for a win, a
+// loss and a push alike.
+func TestSweepIdleBoardsShowsTheTimedOutHandAndItsVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result casino.BlackjackResult
+	}{
+		{"勝ち", casino.BlackjackPlayerWin},
+		{"負け", casino.BlackjackDealerWin},
+		{"プッシュ", casino.BlackjackPush},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetComponentsForTest()
+			t.Cleanup(resetComponentsForTest)
+			RegisterComponent(&BlackjackCommand{}) // the real renderer, not a stand-in
+
+			seed := blackjackAutoStandSeedFor(t, tc.result)
+			// The same hand the sweeper will resolve, played out here so the
+			// assertions below name the game's numbers rather than restate
+			// blackjack's rules.
+			probe := blackjackProbe(100, seed)
+			wantPayout := probe.AutoResolve()
+
+			bank, mgr, opened := sweepFixture(t, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+			dropFixtureBoard(t, mgr) // sweepFixture opens every board as high&low
+			if _, err := mgr.Open("g1", "u1", casino.GameBlackjack, blackjackProbe(100, seed), casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
+				t.Fatalf("opening the blackjack board: %v", err)
+			}
+
+			editor := newRecordingEditor()
+			sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+			embed := (*editor.took(t).Embeds)[0]
+			if embed.Title != casinoTimeoutTitle {
+				t.Errorf("title: got %q, want %q", embed.Title, casinoTimeoutTitle)
+			}
+			if !strings.Contains(embed.Description, casinoTimeoutNotice) {
+				t.Errorf("the closing message does not say why the hand ended:\n%s", embed.Description)
+			}
+			if want := blackjackHand(probe.Dealer()); !strings.Contains(embed.Description, want) {
+				t.Errorf("the dealer's hole card is still hidden: want %q in\n%s", want, embed.Description)
+			}
+			if strings.Contains(embed.Description, blackjackHiddenCard) {
+				t.Errorf("a settled hand still shows a face-down card:\n%s", embed.Description)
+			}
+			if want := blackjackHeadline(snapshotBlackjack(probe)); !strings.Contains(embed.Description, want) {
+				t.Errorf("the closing message does not say who won: want %q in\n%s", want, embed.Description)
+			}
+			if want := casinoPayoutLine(wantPayout, 900+wantPayout); !strings.Contains(embed.Description, want) {
+				t.Errorf("the closing message does not name the money: want %q in\n%s", want, embed.Description)
+			}
+		})
+	}
+}
+
+// blackjackAutoStandSeedFor finds a shoe whose playable hand ends in `want`
+// once the sweeper auto-stands it. The predicate resolves a throwaway copy:
+// what a test needs to name is the hand AFTER the dealer has played.
+func blackjackAutoStandSeedFor(t *testing.T, want casino.BlackjackResult) int64 {
+	t.Helper()
+	return blackjackSeedWhere(t, "a playable hand that auto-stands into the wanted result", func(g *casino.BlackjackGame) bool {
+		if g.State() != casino.BlackjackPlaying {
+			return false
+		}
+		g.AutoResolve()
+		return g.Result() == want
+	})
+}
+
+// The same for high&low: AutoResolve is a cash-out, so the closing message
+// carries the card the board stopped on, the streak it paid for, and the
+// money — not just the money.
+func TestSweepIdleBoardsShowsTheTimedOutBoardsCardAndStreak(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+	RegisterComponent(&HighLowCommand{})
+
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	startHighLow(t, c, r, 100)
+	editor := newRecordingEditor()
+
+	sweepIdleBoards(editor, c.sessions, bank, time.Now().Add(2*casino.DefaultSessionTTL))
+
+	embed := (*editor.took(t).Embeds)[0]
+	if embed.Title != casinoTimeoutTitle {
+		t.Errorf("title: got %q, want %q", embed.Title, casinoTimeoutTitle)
+	}
+	if !strings.Contains(embed.Description, casinoTimeoutNotice) {
+		t.Errorf("the closing message does not say why the board ended:\n%s", embed.Description)
+	}
+	// The board the command dealt: same bet, same generator, same first card.
+	probe := casino.NewHighLow(100, zeroRng{})
+	if want := probe.Current().String(); !strings.Contains(embed.Description, want) {
+		t.Errorf("the closing message does not show the final card %q:\n%s", want, embed.Description)
+	}
+	if !strings.Contains(embed.Description, "💰 キャッシュアウト(0連勝)") {
+		t.Errorf("the closing message does not name the auto cash-out and its streak:\n%s", embed.Description)
+	}
+	// The pot is the untouched bet, and it comes back on top of the 900 left.
+	if want := casinoPayoutLine(100, 1000); !strings.Contains(embed.Description, want) {
+		t.Errorf("the closing message does not name the money: want %q in\n%s", want, embed.Description)
+	}
+}

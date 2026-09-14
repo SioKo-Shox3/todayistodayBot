@@ -254,6 +254,16 @@ const casinoActionSettle = "settle"
 // landed. The 🔁 button under it is the retry.
 const casinoSettleFailedMessage = "❌ 精算に失敗しました。もう一度お試しください。"
 
+// casinoPayoutLine is the one line that names money. It exists so that the
+// games and the sweeper cannot word it differently — and, more importantly,
+// so that "there are no numbers to print yet" is a decision about whether to
+// CALL it rather than a pair of zeroes formatted into it. A settlement that
+// was refused produced neither number: printing 0/0 tells a player who is
+// owed their pot that they were paid nothing.
+func casinoPayoutLine(payout, balance int64) string {
+	return fmt.Sprintf("配当: %d枚 / 残高: %d枚", payout, balance)
+}
+
 // casinoRedrawnMessage answers the press that spent itself repairing a stale
 // board (casino.Session.NeedsRedraw). The press took no game action, and the
 // picture it was aimed at is gone, so the player is told to choose again

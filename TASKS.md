@@ -152,7 +152,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 「精算が先、表示は後」の規律は変えない。再描画の失敗をログに出すときは `redactInteractionError` を通す。
 
 ## C2-12: 時間切れの決着に勝敗・手札を表示し、精算失敗時は金額行を出さない(所見 3・non-blocking 2)
-- status: todo
+- status: done
 - done-when: 掃除人の「⌛ 時間切れ — 自動決着」は、各ゲームの結果描画(H&L: 最終カード・連勝・配当、BJ: ディーラーの伏せ札公開・最終点・勝敗)を使い、時間切れの説明行を添える(元の盤面 embed を置き換えるのではなく結果 embed に更新)。ボタンは無効化して残す(C2-08 の修正どおり)。H&L のキャッシュアウトで精算が失敗したときの案内は「配当: 0枚 / 残高: 0枚」を出さず、金額行を省いて「⚠️ 精算に失敗しました。次回の自動処理で精算されます」だけにする(BJ と同じ)。`casino_sessions_test.go`: 時間切れ BJ の勝ち/負け/プッシュで伏せ札と勝敗が本文にある。`highlow_test.go`: 精算失敗の案内に金額行が無い。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestRunSessionSweeper|TestHighLow|TestBlackjack" -count=1`

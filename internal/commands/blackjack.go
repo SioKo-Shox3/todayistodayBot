@@ -213,20 +213,43 @@ func blackjackHeadline(board blackjackBoard) string {
 	}
 }
 
-// blackjackResultEmbed renders a finished hand with the dealer's hole card
-// turned over. payout/balance are what Store.SettleGame actually paid.
-func blackjackResultEmbed(board blackjackBoard, payout, balance int64) *discordgo.MessageEmbed {
-	lines := []string{
+// blackjackResultLines is a finished hand with the dealer's hole card turned
+// over, WITHOUT the money: both hands face up and the line that says who won.
+// Split out because the closing edits that cannot name money (a refused
+// payout) or word it themselves (the sweeper) need exactly this much.
+func blackjackResultLines(board blackjackBoard) []string {
+	return []string{
 		fmt.Sprintf("あなたの手: **%s**(%d)", blackjackHand(board.Player), board.PlayerValue),
 		fmt.Sprintf("ディーラー: **%s**(%d)", blackjackHand(board.Dealer), board.DealerValue),
 		"",
 		blackjackHeadline(board),
-		fmt.Sprintf("配当: %d枚 / 残高: %d枚", payout, balance),
 	}
+}
+
+// blackjackResultEmbed renders a finished hand with the dealer's hole card
+// turned over. payout/balance are what Store.SettleGame actually paid.
+func blackjackResultEmbed(board blackjackBoard, payout, balance int64) *discordgo.MessageEmbed {
+	lines := append(blackjackResultLines(board), casinoPayoutLine(payout, balance))
 	return &discordgo.MessageEmbed{
 		Title:       "🂡 ブラックジャック — 結果",
 		Description: strings.Join(lines, "\n"),
 	}
+}
+
+// TimedOutEmbed draws the closing message of a hand the sweeper auto-stood
+// (C2-12). AutoResolve plays the dealer out, so the hole card is already
+// turned over in state — and this edit replaces the board that was hiding it,
+// which makes this the only place the player can ever see what they lost to.
+//
+// state is the swept hand, owned by the sweeper's goroutine alone, so
+// snapshotting it here needs no lock (the same licence DisabledComponents has).
+func (c *BlackjackCommand) TimedOutEmbed(state any, settled casino.SettleResult) *discordgo.MessageEmbed {
+	game, isBlackjack := state.(*casino.BlackjackGame)
+	if !isBlackjack {
+		return nil
+	}
+	board := snapshotBlackjack(game)
+	return casinoTimedOutEmbed(append(blackjackResultLines(board), casinoPayoutLine(settled.Payout, settled.Chips)))
 }
 
 // blackjackPendingEmbed is the finished hand shown while its payout has not
@@ -234,15 +257,9 @@ func blackjackResultEmbed(board blackjackBoard, payout, balance int64) *discordg
 // ones Store.SettleGame refused to produce, and inventing them here is how a
 // player ends up believing they were paid.
 func blackjackPendingEmbed(board blackjackBoard) *discordgo.MessageEmbed {
-	lines := []string{
-		fmt.Sprintf("あなたの手: **%s**(%d)", blackjackHand(board.Player), board.PlayerValue),
-		fmt.Sprintf("ディーラー: **%s**(%d)", blackjackHand(board.Dealer), board.DealerValue),
-		"",
-		blackjackHeadline(board),
-	}
 	return &discordgo.MessageEmbed{
 		Title:       "🂡 ブラックジャック — 結果",
-		Description: strings.Join(lines, "\n"),
+		Description: strings.Join(blackjackResultLines(board), "\n"),
 	}
 }
 

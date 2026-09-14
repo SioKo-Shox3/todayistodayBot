@@ -210,7 +210,11 @@ type highLowResult struct {
 	Balance   int64
 }
 
-func highLowResultEmbed(result highLowResult) *discordgo.MessageEmbed {
+// highLowResultLines is how the board ended, WITHOUT the money: the card that
+// decided it and the headline that names the ending. Split out because two
+// callers must not print the money — a settlement that was refused has no
+// numbers yet, and the sweeper's closing edit words them itself.
+func highLowResultLines(result highLowResult) []string {
 	var lines []string
 	if result.Guessed {
 		guess := "⬇️ ロー"
@@ -229,11 +233,47 @@ func highLowResultEmbed(result highLowResult) *discordgo.MessageEmbed {
 	default:
 		lines = append(lines, fmt.Sprintf("💰 キャッシュアウト(%d連勝)", result.Streak))
 	}
-	lines = append(lines, fmt.Sprintf("配当: %d枚 / 残高: %d枚", result.Payout, result.Balance))
+	return lines
+}
+
+func highLowResultEmbed(result highLowResult) *discordgo.MessageEmbed {
+	lines := append(highLowResultLines(result), casinoPayoutLine(result.Payout, result.Balance))
 	return &discordgo.MessageEmbed{
 		Title:       "🃏 ハイ&ロー — 結果",
 		Description: strings.Join(lines, "\n"),
 	}
+}
+
+// highLowPendingEmbed is the finished board shown while its payout has not
+// landed. It prints no 配当/残高 line, for the same reason blackjack's does
+// not: those are the two numbers Store.SettleGame refused to produce, and the
+// zeroes a result embed would show in their place read as "you won nothing"
+// to a player whose pot is still owed to them.
+func highLowPendingEmbed(result highLowResult) *discordgo.MessageEmbed {
+	return &discordgo.MessageEmbed{
+		Title:       "🃏 ハイ&ロー — 結果",
+		Description: strings.Join(highLowResultLines(result), "\n"),
+	}
+}
+
+// TimedOutEmbed draws the closing message of a board the sweeper auto-cashed
+// out (C2-12). AutoResolve IS CashOut, so the ending is the same one the 💰
+// button produces; the final card is spelled out because this edit replaces
+// the board that was showing it.
+//
+// state is the swept board, owned by the sweeper's goroutine alone, so
+// snapshotting it here needs no lock (the same licence DisabledComponents has).
+func (c *HighLowCommand) TimedOutEmbed(state any, settled casino.SettleResult) *discordgo.MessageEmbed {
+	game, isHighLow := state.(*casino.HighLowGame)
+	if !isHighLow {
+		return nil
+	}
+	board := snapshotHighLow(game)
+	lines := append(
+		[]string{fmt.Sprintf("最終カード: **%s**", board.Current)},
+		highLowResultLines(highLowResult{Ending: highLowEndCashedOut, Bet: board.Bet, Streak: board.Streak})...,
+	)
+	return casinoTimedOutEmbed(append(lines, casinoPayoutLine(settled.Payout, settled.Chips)))
 }
 
 // highLowButtons builds the three buttons. A guess no remaining card can win
@@ -591,7 +631,7 @@ func (c *HighLowCommand) settle(r interactionResponder, i *discordgo.Interaction
 		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
 			Data: &discordgo.InteractionResponseData{
-				Embeds:     []*discordgo.MessageEmbed{highLowResultEmbed(pending.Result)},
+				Embeds:     []*discordgo.MessageEmbed{highLowPendingEmbed(pending.Result)},
 				Content:    casinoSettleFailedMessage,
 				Components: settleRetryButtons(string(casino.GameHighLow), sessionID),
 			},
