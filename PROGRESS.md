@@ -4,6 +4,13 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-16(正規化点を通らずに口座を触る経路を塞ぐ)= コミット `64f28e4`。`NEXT_FINDINGS.md` を見出しだけに戻した(反復 2 の節を削除)。
+  **(1) `RefundStaleEscrows`**: 口座を `economy.Users` から直接引いて `moveFromEscrowLocked` に渡していたので、C3-14 で置いた正規化点を通らなかった。`moveFromEscrowLocked` は `Chips += Escrow` なので、手編集の `Chips = Escrow = math.MaxInt64` で**和が折り返して `Chips = -2` が保存される** — 次の読み取りがそれを 0 に丸め、「チップを絶対に消さない」が契約の唯一の操作が全部消す。ループを `for userID, account := range` にして、nil と `Escrow <= 0` を弾いたあと **(既に非 nil でも)** `ensureAccountLocked` を通してから足す。
+  **(2) 掃いて見つけたもう 1 か所 = `topAssetsLocked`**(`store.go` 558 付近)。ここも `economy.Users` を直接回すので、手編集の `MaxInt64` 口座で `Chips + Escrow + Coins*rate` が折り返し、**その口座が首位ではなく最下位に並ぶ**(エラーも panic も出ない)。ここは `ensureAccountLocked` ではなく **`normalizeAccountLocked` を使った** — 既にある項目を丸めるのと口座を**作る**のは別で、作ると「順位を第三者が見た」だけで未プレイの人に 1,000 チップの初回ボーナスが湧く(nil を repair せず skip しているのと同じ理由)。
+  **`grep -n "economy.Users" internal/casino/store.go` は 246/247/249(= `ensureAccountLocked` 自身)・564/565(順位)・1112(返金)の 3 か所に落ち着いた** — map を直接回すのは後ろの 2 つだけで、どちらも要素を正規化してから使う。
+  **効き目の確認**: 正規化を外す mutation 2 本で、それぞれ**新テスト 1 件だけ**が落ちる — `mutation-C3-16-no-normalise.txt`(`persisted Chips -2`)/ `mutation-C3-16-rank-no-normalise.txt`(折り返した口座が 2 位に沈む)。既存の C-2 返金テスト 3 件は期待値を 1 つも変えていない(`MaxChips+500` のケースは両フィールドとも上限内なので正規化が素通りする)。
+  **(3) 差し戻しの最後の 1 件**(`NEXT_FINDINGS.md` の所見 1、親が「C3-16 と一緒に」と判断済み): 未抽選ギルドの `LotteryStatus` を**購入を挟まずに**呼ぶテストを足した(`TestLotteryStatus_NeverDrawnGuildNamesThisMorningsDraw`)。C3-15 の表のケースは `BuyLotteryTickets` 経由なので、status が読む時点では購入自身のロールオーバーが `DrawDate` を**既にスタンプ済み** — 本当に未抽選のギルドには一度も聞いていなかった。当選者なしの `DrawDate` スタンプを暦日へ変える mutation で落ちることを確認(`mutation-C3-16-status-calendar-day.txt`: `NextDrawAt = 2026-09-15 09:00`、期待は 9/14 09:00)。
+  検証出力: `.harness/runs/20260915-022052/verify-C3-16-{1,2,3}.txt`(build+vet exit=0 / casino ok / `go test ./...` 8 パッケージ ok、いずれも exit=0)、`verify-C3-16-4-refund-subtests.txt`(返金 4 件 PASS)、`pre-fix-C3-16-red.txt`(修正前の赤)。
 - C3-15(未抽選の「次回抽選」テストを足し、旧挙動のコメントを消す)= コミット `95a6347`。`NEXT_FINDINGS.md` を見出しだけに戻した(C3-09 の差し戻し・所見 4・C3-12 の paths 違反の 3 節を削除)。
   **(1) 未抽選のケース**: `TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn` の表に「the guild has never drawn」を足した。**既存 2 ケースは購入の中で抽選が走らない** — どちらも `DrawDate` が `lotteryDrawDate(08:59:59)` 以上で `drawLotteryLocked` が即 return する。`DrawDate == ""` だけが `"" < "2026-09-13"` でロールオーバーを実際に走らせる経路で、そこが表に無かった。売上も券も 0 なので `PickLotteryWinner` は `rng` を読まずに `""` を返し(`total <= 0` の早期 return)、rolls 空の `lotteryRand` のままで足りる。
   **効き目の確認**: 当選者なしの経路の `DrawDate` スタンプを抽選日(9/13)から暦日(9/14)へ変えると、**新ケースだけが** `NextDrawAt = 2026-09-15 09:00` で落ち、既存 2 ケースは通る(`mutation-C3-15-never-drawn.txt`)。9 時間のずれ(`lotteryDrawDate` の `Hour() < 9` 補正)を踏み抜く唯一のケースになっている。
@@ -111,6 +118,8 @@
 - (なし)
 
 ## Next
+- **`TASKS.md` に未完のタスクは無い**(C3-16 が最後の 1 件)。先へ進むには M1 へ戻って項目を足す。`NEXT_FINDINGS.md` も見出しだけで、残課題は無い。次の区切りは**評価者(Astra)を通すところ** — C3-14 / C3-15 / C3-16 は 3 件とも危険地帯(資金の保存則)なので、段階が探索期でも評価は必須。
+- **口座の正規化はこれで閉じた。** `internal/casino/store.go` で `economy.Users` を直接引くのは `ensureAccountLocked` だけ。新しい読み取り経路を足すときは、そこを通すか(書き込み経路)`normalizeAccountLocked` を呼ぶか(口座を作りたくない表示経路)のどちらかにする。どちらも通さない経路を足すと、C3-13 / C3-14 / C3-16 で閉じた穴がその経路から開き直す。
 - **次は C3-16(正規化点を通らずに口座を触る経路 `RefundStaleEscrows` を塞ぐ)**。`TASKS.md` の未完はこれ 1 件。入力は反復 1 の評価者の指摘で、`NEXT_FINDINGS.md` からは消してある(C3-16 が同じ内容を持っている)。
 - **`NEXT_FINDINGS.md` は空(見出しだけ)になった。** 残っていた 3 節はすべて処理済み — C3-09 の差し戻しと所見 4 は今回閉じ、C3-12 の paths 違反は親が「処理不要」と判断済み。次の評価で `NEEDS_WORK` が出たらここへ書く。
 - **タスクの `paths:` が実在しないファイルを指していた**(`internal/casino/announce_test.go`。実際は `internal/commands/casino_announce_test.go`)。C3-12 のときと同じく**コードではなく記録の方を実態へ直した** — `TASKS.md` の `paths:` を書き換え、理由を `notes:` に残した。`paths:` はタスクを書いた時点の推測なので、実装中に実在しないと分かったら直すのが正しい(狭すぎる `paths:` を守って done-when を落とす方が高くつく)。
@@ -179,6 +188,7 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **正規化点は「読み取り経路」ではなく「口座に触る経路」に要る(C3-16)**: C3-13 / C3-14 で「読み取り点に正規化を置く」と決めたあとも、map を直接引く経路が 2 つ残っていた。見落としの形はどちらも同じ — `ensureAccountLocked(economy, userID)` ではなく `range economy.Users` で回しているので、正規化点の存在そのものが視界に入らない。**探すときは `grep -n "economy.Users" internal/casino/store.go` を使う**(`ensureAccountLocked` の grep では見つからない)。書き込み経路には `ensureAccountLocked`、口座を作りたくない表示経路には `normalizeAccountLocked` — 表示経路に前者を使うと初回ボーナスが湧くので、2 つを使い分ける。
 - **表駆動テストのケースは「実装のどの分岐に入るか」で選ぶ(C3-15)**: `DrawDate` の表に 2 ケースあっても、どちらも `drawLotteryLocked` の早期 return に落ちるなら**ロールオーバーは 1 度も走っていない**。未抽選(`""`)だけが抽選を走らせ、走ったあとの `DrawDate` を読む経路を通る — 「入力の見た目が違う」ではなく「通る経路が違う」がケースを足す理由。効き目は当選者なしの経路のスタンプを暦日へ変える mutation で確かめた(新ケースだけが落ちる)。
 - **設計書 `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61/69 行目の「昨日の当選」は C3-08 で実装とずれた** — `paths:` の外なので触らず C3-11 として切った。README には該当の文言は無い。
 - **`codex exec` は stdin を閉じないと無限に待つ**(2026-09-14, C3-07 の評価者で 22 分溶かした)。プロンプトを引数で渡しても
