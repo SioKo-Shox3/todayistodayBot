@@ -4,6 +4,11 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-09(「次回抽選」を確定済みの抽選日から出す)= コミット `7e7f48f`。`BuyLotteryTickets` / `LotteryStatus` が返す `NextDrawAt` は `nextRunAt(now)` そのままで、**要求が拾った `now` と、ロックが空くまでに進んだ状態の二つの時計がずれると過去の 09:00 を指した** — 08:59:59 に読まれた購入が 9 時掲示スケジューラの抽選の後に処理されると、`DrawDate` は既に当日で `drawLotteryLocked` は正しく再抽選を拒む(券は翌日分に入る)のに、画面は済んだ 09:00 を「次回」と出していた。
+  `internal/casino/lottery.go` に `nextLotteryDrawAt(lastDrawDate string, now time.Time) time.Time` を足し、`nextRunAt(now)` と「`lastDrawDate` の翌日 09:00 JST」の**遅い方**を返す。**`nextRunAt` のシグネチャは変えていない**(9 時掲示スケジューラが同じ関数を使っている)。渡すのは**ロールオーバー後の** `lottery.DrawDate` — `ensureTodayRateLocked` の前に読むと当日分の抽選が反映されず、直そうとしたずれがそのまま残る。
+  `DrawDate == ""`(未抽選)と**パースできない文字列**(手編集)は `nextRunAt(now)` へ落とす。翌日の算出は `time.Date(y, m, day+1, 9, ...)` で、月末は `time.Date` の正規化に任せる(9/30 → 10/1)。
+  テストは 2 本 — `lottery_test.go` の `TestNextLotteryDrawAt_NeverAnswersADrawThatHasAlreadyRun`(表駆動 6 件: 当日抽選済み / 通常 / 未抽選 / 何日も古い `DrawDate` が答えを過去へ引き戻さない / 月末 / 壊れた文字列)と、`store_test.go` の `TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn`(購入と status の**両方**が同じ答えを返すことを固定。片方だけ直すと画面が自己矛盾する)。後者は `rolls` を空にした `lotteryRand` を差すので、想定外の抽選が走ればその場で落ちる。
+  検証出力: `.harness/runs/20260914-222248/verify-C3-09-{1,2,3}.txt`(build+vet exit=0 / 絞り込み `-v` で新テスト両方 PASS・exit=0 / `go test ./...` 8 パッケージ ok exit=0)、`mutation-C3-09.txt`(両方の呼び出しを `nextRunAt(now)` へ戻すと `NextDrawAt = 07-11 09:00, want 07-12 09:00` で落ちる)。
 - C3-07(上限で受け取れなかった賞金をプールへ)= 次のコミット。`drawLotteryLocked` は当選者が `MaxChips` で賞金を受け取り切れないとき残額を `lottery.Carryover` へ入れていた — これは**その人の賞金を次回の別の当選者へ渡す**経路だった。親の決定どおり `economy.Jackpot += house + (prize - paid)` に変え、当選者がいた回の `Carryover` は必ず 0 にした。`Carryover` を使うのは `winner == ""` の回だけになった(型注釈どおり)。`LastDraw.Prize` は実際に払った `paid` のまま(C3-06 で祝いが `Prize == 0` でも出るようにしてあるので、上限に張り付いた当選者も名前は出る)。`seedJackpotLocked` の後で足す順序は据え置き(C3-01 の落とし穴)。
   **`prize - paid` が負にならないことが前提** — `creditChipsCappedLocked` は `headroom` が `amount` より小さいときだけ切り詰め、`amount` を超えて払う経路が無いので `paid <= prize`。ここが崩れるとプールが減る。
   テストは `TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward` を `..._SendsTheRemainderToTheJackpot` に書き換えた。固定したのは 4 点 — 入金は入る分だけ(`u1` は `MaxChips` のまま・`LastDraw.Prize` は 50)、プールは 50 増える(ハウス 10 + 残額 40)、`Carryover` は 0、翌日 `u2` だけが 1 枚買った回の当選金は 45(= `floor(50×0.9)`。繰り越しが生きていれば 85 になる)。保存則(チップの増加 + プールの増加 == 売上 + 前回繰り越し)も同じテストで検査する。既存の `totalChips` ヘルパ(`store_test.go` 2655)を使う — **同名のヘルパを書き足すと `redeclared` でコンパイルが落ちる**。
@@ -75,6 +80,9 @@
 - (なし)
 
 ## Next
+- **次は C3-10**(`TASKS.md` の未完の先頭。💎💎💎 の説明を「払い出しは無いが積立は行う」に直す)。残りは C3-10・C3-11(設計書の掲示文言)・C3-11(プールの上限。**同じ番号が 2 つある** — 拾うときに取り違えない)・C3-12(未掲示の当選を並べて持つ)。
+- **`NEXT_FINDINGS.md` は C3-07 の 4 件がまだ未処理**(プールの桁あふれ → C3-11 として切り出し済み / 当選者がいない回でハウス分が消える / `creditChipsCappedLocked` の headroom / 旧挙動のコメント)。加えて反復 2 の C3-08 差し戻し(未掲示の当選が次の抽選で上書きされる)が C3-12 に対応する。**タスク化済みのものと未タスクのものが混ざっている**ので、次に触る人は節ごとに対応先を確かめてから消すこと。
+- **`NextDrawAt` は「次の 09:00」ではなく「この券が引かれる 09:00」になった**(C3-09)。ここへ第三の呼び出しを足すときは `nextRunAt(now)` を直接使わず `nextLotteryDrawAt(lottery.DrawDate, now)` を通す。逆に**9 時掲示スケジューラの待ち時間は `nextRunAt` のまま**でよい — あちらは「次にいつ起きるか」であって「どの回か」ではないので、抽選日で押し出すと掲示が 1 日飛ぶ。
 - **次は C3-09**(`TASKS.md` の未完の先頭。「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す)。そのあと C3-10(💎💎💎 の説明)と、C3-08 が切り出した C3-11(設計書の掲示文言)。
 - **`NEXT_FINDINGS.md` の C3-07 所見 1・2・3 は未処理**(プールへの加算の桁あふれ / 当選者がいない回でハウス分が消える / `creditChipsCappedLocked` の headroom)。所見 2 は「通貨は消えない」に直接反するので、C3-09 より先に拾う価値がある。所見 1 は**設計判断が要る**(飽和加算で済ませるか、不正値の検査を 1 か所へ集約するか)ので、決められなければ `blocked/` へ落として親へ。
 - **掲示の `LotteryDraw` は「今日精算した回」ではなく「まだ掲示していない回」**(C3-08)。ここへ新しいフィルタ(日数の上限など)を足すと、また取りこぼしの経路ができる。古い当選が延々と出ないことを保証しているのは `LastAnnounced` の更新であって日付の一致ではない。
