@@ -307,3 +307,21 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/types.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: 危険地帯(資金の保存則)。**この差し戻しは「個別の加算にガードを足す」では閉じない** — 直すたびに次の変数へ移る(ハウス分 → 残額 → 繰り越し と 2 回移った)。正規化点を 1 つ決めて、そこを通らない経路を無くすのが完了条件。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
+
+## C3-14: 当選者がいない回のハウス分を消さず、口座の空き計算のあふれも正規化で断つ
+- status: todo
+- done-when: `NEXT_FINDINGS.md`「C3-07 の区切り評価」の所見 2・3 を閉じる。(1) **当選者なしの回でハウス分が消える**: `drawLotteryLocked` の `winner == ""` の経路は `lottery.Carryover = prize` だけを残し、`house` をどこにも入れていない(売上 100・券なしなら 90 が繰り越り、ハウス分 10 が消える)。当選者がいた回と同じ結論に揃える — `seedJackpotLocked` の後に `creditJackpotCappedLocked(economy, house)` を通す。保存則のテストを「当選者がいない回でも `Chips の増減 + プールの増減 + 繰り越しの増減 = 売上`」で固定する。(2) **`creditChipsCappedLocked` の `headroom` があふれる**: `MaxChips - account.Escrow - account.Chips` は手編集で `Chips = Escrow = MaxInt64` のとき負に回り込む。C3-13 で決めた規律どおり**読み取り点で正規化する** — 口座を読む共通点(`ensureAccountLocked`)で `Coins` / `Chips` / `Escrow` を `[0, MaxChips]`(コインは `[0, MaxCoins]`)へ丸め、`headroom` の式自体は変えない。`types.go` の桁あふれ余裕の説明に口座の行を足す。回帰テスト: `Chips = Escrow = math.MaxInt64` のファイルを読んでも入金が負にならず口座が上限で頭打ちになる / 通常範囲では既存の期待値が 1 つも変わらない(既存の口座テストが全部通る)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/types.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: 危険地帯(資金の保存則)。(2) は C3-13 と同じ「正規化点を 1 つ決める」規律の口座版 — 加算側に個別ガードを足さない。閉じたら `NEXT_FINDINGS.md` の当該節の所見 2・3 を消す。
+
+## C3-15: 未抽選の「次回抽選」テストを足し、旧挙動のコメントを消す
+- status: todo
+- done-when: (1) C3-09 の差し戻し(`NEXT_FINDINGS.md` の「反復 3 — C3-09」の節)を閉じる — `internal/casino/store_test.go` 3604 付近の表駆動テストに **未抽選(`lastDrawDate: ""`)** のケースを足し、`now = 2026-09-14 08:59:59 JST` で購入・status の `NextDrawAt` がどちらも同日 09:00(`nextRunAt(now)`)になることを固定する。(2) `NEXT_FINDINGS.md`「C3-07 の区切り評価」の所見 4 を閉じる — `internal/commands/casino_announce.go` 108 付近の「the pot rolls forward」という**旧挙動の説明コメント**と、`internal/casino/announce_test.go` 457 付近の同じ趣旨のコメントを現在の挙動(当選者がいた回は繰り越さない。上限で入り切らなかった分と、当選者がいない回の賞金だけが次回へ)に直す。**コメントだけを直し、テストの中身は触らない**。(3) 閉じた節を `NEXT_FINDINGS.md` から消し、paths 違反の節(反復 3 — C3-12、親の判断で処理不要)も消して、ファイルを見出しだけに戻す。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestBuyLotteryTickets|TestLotteryStatus|TestAnnounce" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store_test.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, NEXT_FINDINGS.md
+- notes: どちらも小さい。テストの追加はケース 1 行と期待値だけで、既存の表の形を変えない。
