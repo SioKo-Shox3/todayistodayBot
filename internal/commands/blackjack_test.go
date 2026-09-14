@@ -624,6 +624,7 @@ func TestBlackjackRetriesOnlyTheSettlementAfterARefusedPayout(t *testing.T) {
 	if resp.Data.Content != casinoSettleFailedMessage {
 		t.Errorf("a refused payout says %q, want %q", resp.Data.Content, casinoSettleFailedMessage)
 	}
+	assertNoAutomaticSettlementPromise(t, resp.Data.Content)
 	retry := highLowRetryButtonOf(t, resp)
 	if _, _, action, ok := ParseCustomID(retry.CustomID); !ok || action != casinoActionSettle {
 		t.Fatalf("the button under a refused payout is %q, want the %q action", retry.CustomID, casinoActionSettle)

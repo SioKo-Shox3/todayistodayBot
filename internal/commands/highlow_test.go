@@ -829,6 +829,25 @@ func highLowChipsOf(t *testing.T, bank *flakyBank) int64 {
 	return view.Account.Chips
 }
 
+// assertNoAutomaticSettlementPromise fixes the WORDING of a refused payout, not
+// only the field it lands in. A settled board has already left the manager
+// (WithSession done=true), so the sweeper never looks at it again: the sole
+// automatic settlement left is RefundStaleEscrows at the next startup, and that
+// returns the escrow rather than paying the pot. A message that told the player
+// to wait would therefore promise something that never arrives — the 🔁 retry
+// is theirs to press. See §9 of the C-2 design.
+func assertNoAutomaticSettlementPromise(t *testing.T, content string) {
+	t.Helper()
+	for _, promise := range []string{"自動", "次回", "お待ち"} {
+		if strings.Contains(content, promise) {
+			t.Errorf("a refused payout says %q, which promises a settlement (%q) that never comes", content, promise)
+		}
+	}
+	if !strings.Contains(content, "もう一度") {
+		t.Errorf("a refused payout says %q, which never asks for the manual retry", content)
+	}
+}
+
 // A refused payout must leave something to press. The board is gone from the
 // manager, so without a record the stake would sit in escrow until the next
 // restart and every later press would answer the ⌛ "already finished" line.
@@ -844,6 +863,7 @@ func TestHighLowRetriesOnlyTheSettlementAfterARefusedPayout(t *testing.T) {
 	if resp.Data.Content != casinoSettleFailedMessage {
 		t.Errorf("a refused payout says %q, want %q", resp.Data.Content, casinoSettleFailedMessage)
 	}
+	assertNoAutomaticSettlementPromise(t, resp.Data.Content)
 	retry := highLowRetryButtonOf(t, resp)
 	if _, _, action, ok := ParseCustomID(retry.CustomID); !ok || action != casinoActionSettle {
 		t.Fatalf("the button under a refused payout is %q, want the %q action", retry.CustomID, casinoActionSettle)

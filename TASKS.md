@@ -168,7 +168,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 倍率式は変えない(仕様)。README は公開物 — 過程を書かない。
 
 ## C2-14: 精算失敗の契約(手動再試行)を設計書へ明記する(反復 3 の評価者指摘)
-- status: todo
+- status: done
 - done-when: `Docs/superpowers/specs/2026-09-14-casino-c2-design.md` §9 に「決着した盤面は `WithSession(done=true)` でセッションから外れるため掃除人は二度と見ない。精算が拒まれたときの案内は `casinoSettleFailedMessage`(手動の 🔁 再試行)で、自動の再精算は次回起動の `RefundStaleEscrows` だけ」を書く — C2-12 の done-when が求めた「次回の自動処理で精算されます」は待てば済むという嘘になるため採らない、という判断を正本に残す。案内文が `Data.Content` ごと固定されていることを `highlow_test.go` / `blackjack_test.go` の既存テストで確認し、足りなければ足す。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestHighLow|TestBlackjack|TestSweepIdleBoards" -count=1`
