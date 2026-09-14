@@ -79,3 +79,29 @@ C3-07 で「当選者がいた回の繰り越し」は無くなったのに、�
 - `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
 - `go test ./internal/casino/... -run "TestLottery|TestStore|TestDrawLottery" -count=1`
 - `go test ./... -count=1`
+
+## 反復 2 — 評価者(codex)の判定: NEEDS_WORK
+
+対象: C3-08 掲示できなかった回の当選を、次の掲示で取りこぼさない(所見 2)
+
+**[P2] 次の抽選が発生すると、未掲示の当選が上書きされます。** `done-when` の「前日分を次の掲示で取りこぼさない」が未達です。
+
+[announce.go:84](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce.go:84) の条件変更は指定どおりですが、その前の `ensureTodayRateLocked` が抽選を実行し、[store.go:1101](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store.go:1101) で `LastDraw` を置き換えます。
+
+再現手順（コード読解で確認、実行再現は未実施）:
+
+1. `LastAnnounced = 2026-09-12`。14日8時に復旧し、13日付の当選者u1を精算する。9時前なので掲示されない。
+2. 14日8時30分にu2が宝くじを購入する。
+3. 14日9時の収集で当日分が抽選され、`LastDraw` がu2に置き換わる。jobにはu2だけが入り、13日のu1は永久に失われる。
+
+[追加テスト](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/announce_test.go:841) は次回の購入券が空のケースに限定され、この経路を検証していません。
+
+修正候補は、未掲示の抽選結果を `LastDraw` とは別に永続保持し、送信成功した結果だけを消すことです。上記の購入を挟む回帰テストも追加してください。保存構造の変更には対象パスの拡張が必要です。
+
+保存された `verify-C3-08-{1,2,3,4}` と `recheck-C3-08-2-{1,2,3}` は実ファイルを確認し、すべて `exit=0`。旧条件へのmutationは追加テストが失敗して `exit=1`。実装変更は指定4ファイル内です。
+
+再検証できなかったコマンド（いずれも一時ディレクトリ作成時の `Access is denied`。合格には算入していません）:
+
+- `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
+- `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced" -count=1`
+- `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement" -count=1`
