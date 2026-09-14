@@ -233,3 +233,43 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build -o bin/todayistodaybot ./cmd/bot`
 - paths: README.md, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md, blocked/C3-06.md
 - notes: `cmd/bot/main.go` は C-3a で変更しない(§7)。変更が要ると分かったら `blocked/C3-06.md` に理由を書いて止まる。
+
+# C-3a 区切りレビュー(1 周目)の対応
+
+所見の全文は `.harness/reviews/2026-09-14-astra-casino-c3a-round1.md`。blocking 3 件を C3-07〜C3-09、non-blocking 1 件を C3-10 で扱う。
+仕様 § は `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md`。
+
+## C3-07: 上限で受け取れなかった賞金を、次の当選者ではなくジャックポットのプールへ送る(所見 1)
+- status: todo
+- done-when: `drawLotteryLocked`(`internal/casino/store.go` 1090 付近)は、当選者が `MaxChips` で賞金を受け取り切れないとき残額を `lottery.Carryover` に入れており、**次回の別の当選者へその人の賞金が移る**。親の決定(2026-09-14): 受け取れなかった残額は **ジャックポットのプールへ送る**(`economy.Jackpot += prize - paid`。ハウス分と同じ経路・`seedJackpotLocked` の後)。C-1 の「丸め損は常にハウス側」と同じ扱いで、通貨は消えず、他人の手にも渡らない(プールは 7️⃣7️⃣7️⃣ で全員に戻る)。`Carryover` は**当選者がいなかった回だけ**使う(`winner == ""` の経路のまま)。当選者がいた回は `lottery.Carryover = 0`。`LastDraw.Prize` は実際に払った `paid` のまま。設計書 §3 に「上限で受け取れなかった分はプールへ」を 1 行書く。`store_test.go`: 既存の「残額が次回へ繰り越る」期待(3174 付近)を書き換え、**残高上限の u1 が当選 → 入金は入る分だけ・残額はプールに入る・`Carryover` は 0・次回 u2 だけが買っても u1 の残額は u2 へ渡らない**を固定する。保存則(チップの増加 + プールの増加 = 売上 + 前回繰り越し)も併せて検査する。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestLottery|TestStore|TestDrawLottery" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: 危険地帯(資金の保存則)。`blocked/C3-06.md` の「差額は `Carryover = prize − paid` で次回へ送る」という記述も、このタスクで**新しい挙動に書き直す**(正本への反映は親が行う)。
+
+## C3-08: 掲示できなかった回の当選を、次の掲示で取りこぼさない(所見 2)
+- status: todo
+- done-when: `CollectDailyAnnouncements`(`internal/casino/announce.go` 73 付近)は `LastDraw.Date == today` の回だけを掲示対象にするため、9 時に Bot が落ちていて翌朝 9 時前に復旧すると、起動時に精算された前日付の当選が**一度も掲示されず祝われない**。条件を「**まだ掲示していない回**」= `last.Date > economy.LastAnnounced` に変える(`MarkAnnounced` は送信成功時だけ `LastAnnounced = date` を書くので、掲示に失敗した回は次の巡回で再度対象になる)。`announce_test.go`: 12 日に掲示済み(`LastAnnounced = 12 日`)・13 日付の当選が残っている状態で 14 日の掲示を集めると、13 日付の `LotteryDraw` が job に入る / 掲示成功後(`LastAnnounced = 14 日`)は同じ回が二度入らない / 当日付の当選は従来どおり入る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced" -count=1`
+- verify: `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement" -count=1`
+- paths: internal/casino/announce.go, internal/casino/announce_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go
+- notes: 掲示の文言(「昨日の当選」)は日付が今日とは限らなくなるので、`LastDraw.Date` を使う表現(例「9/13 の当選」)へ合わせる。掲示チャンネル未設定のギルドは従来どおり対象外。
+
+## C3-09: 「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す(所見 3)
+- status: todo
+- done-when: `BuyLotteryTickets` と `LotteryStatus`(`internal/casino/store.go` 1181 / 1219 付近)は `nextRunAt(now)` をそのまま返すため、9 時直前に受け付けた要求が 9 時の抽選の後に処理されると、**既に済んだ 09:00 を「次回」と表示する**(券は正しく次回分に入る)。ロールオーバー後の `lottery.DrawDate` から次回を出す — `nextLotteryDrawAt(lastDrawDate string, now time.Time) time.Time`(`internal/casino/lottery.go` か `announce.go`)を足し、`nextRunAt(now)` と「`lastDrawDate` の翌日 09:00 JST」の**遅い方**を返す。両方の呼び出しをこれに差し替える。`store_test.go`: 9/14 08:59:59 の `now` で、`DrawDate` が既に 9/14 のときの購入・status がどちらも 9/15 09:00 を返す / 通常(`DrawDate` が 9/13)は 9/14 09:00 を返す / 一度も抽選していない(`DrawDate == ""`)ときは `nextRunAt(now)` のまま。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -run "TestLottery|TestNextRunAt|TestNextLotteryDraw|TestBuyLottery" -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/announce.go, internal/casino/announce_test.go
+- notes: `nextRunAt` は 9 時掲示スケジューラも使っているので**シグネチャを変えない**(新しい関数を足して宝くじ側だけ差し替える)。
+
+## C3-10: 💎💎💎 の説明を「払い出しは無いが積立は行う」に直す(non-blocking 1)
+- status: todo
+- done-when: `README.md`(67 付近)と設計書 §2 の実測(36 付近)にある「💎💎💎 はプールを 1 チップも動かさない」は、そのスピン自身の積立を無視していて誤り(プール 5,000・ベット 100 の 💎💎💎 はプールが 5,002 になる)。「💎💎💎 はプールからの**払い出しが無い**(積立は他のスピンと同じように行われる)」へ直す。設計書の実測文も条件(ベット 10・端数 0)を明記するか、積立込みの値へ直す。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./... -count=1`
+- paths: README.md, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: README は公開物 — 過程を書かない。
