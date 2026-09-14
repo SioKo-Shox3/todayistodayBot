@@ -15,19 +15,27 @@
 
 - C2-01(ボタン基盤: `custom_id` の生成/解析・`ComponentHandler` の自己登録・`DispatchComponent`・所有者検査)。`internal/commands/components.go` と `components_test.go`、`cmd/bot/main.go` に `InteractionMessageComponent` の分岐 1 つ。検証出力: `.harness/runs/20260914-121315/verify-C2-01-{1,2,3,4}.txt`(build+vet clean / 対象テスト 32 PASS・FAIL 0 / `./cmd/...` ok / `go test ./...` 8 パッケージ ok)。
 
+- C2-01 の評価者指摘(`custom_id` の 100 文字判定がバイト数)= c666f3c。`ParseCustomID` の長さ判定を `utf8.RuneCountInString` に直した。Discord の上限は文字数なので、日本語 80 文字のセッション ID を含む 100 文字・260 バイトの ID は受理されなければならない。回帰は `components_test.go` の境界表に多バイトの 100 文字(受理)と 101 文字(拒否)を追加。検証出力: `.harness/runs/20260914-121315/verify-C2-01fix-{1,2}.txt`(build+vet clean / 対象テスト 全 PASS・FAIL 0)。
+
+- C2-02(`casino.Store` の預かり 4 メソッド)= 3331a8d。`UserAccount` に `Escrow` / `EscrowGame` / `EscrowOpenedAt`(`omitempty`)、`OpenGame` / `AddToEscrow` / `SettleGame` / `RefundStaleEscrows` をそれぞれ `Update` 1 回で。総資産は `totalAssetsLocked` に寄せ、`TopAssets` と `ViewAccount` の両方が `Escrow` を含める。検証出力: `.harness/runs/20260914-121315/verify-C2-02-{1,2,3,4}.txt`(build+vet clean / 対象テスト 73 PASS・FAIL 0 / casino ok / `go test ./...` 8 パッケージ ok)。
+
 ## In progress
 - (なし)
 
 ## Next
-- **次は C2-02**(`internal/casino/session.go` の `SessionManager`)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-04)。
+- **次は C2-03**(`internal/casino/cards.go` + `highlow.go` の純粋ロジック)。C2-01 で置いた `RegisterComponent` はまだ登録者ゼロ — 最初の利用者はハイ&ロー(C2-06)。C2-05 の `SessionManager` はまだ無い。
 - **C-2 開始(2026-09-14)**: 仕様 `Docs/superpowers/specs/2026-09-14-casino-c2-design.md`、タスク C2-01〜C2-08(`TASKS.md`)。ブランチ `feat/casino-c2`。順に消化する。
 - **C-1 は完了**(2026-09-14: R-001〜R-004 着地、Astra 2 周目 PASS、`main` へ ff マージ)。次は稼働(トークンと実行場所はユーザー判断)か C-2(ボタン基盤+ハイ&ロー+ブラックジャック、未設計 → M1 から)。
 - `TASKS.md` の未完は無し(R-001〜R-004 すべて done)。次は R-003 修正差分の評価者 2 周目(前回指摘への対応差分だけを見る)。
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **預かりの規律(C2-02 で決めた)**: 保存則は `Chips + Escrow`。預け入れ(`OpenGame` / `AddToEscrow`)は同一口座の 2 フィールド間の移動なので合計を動かさず、合計が動くのは `SettleGame` に渡した `payout` のときだけ。だから預け入れは `creditChipsLocked` を通さない(通貨を作らないので上限判定の対象外)。`payout` は**預かりの返還を含む総額** — 呼び出し側でベットを足さない。二重決着は二重に守る: セッションを map から消す(C2-05)+ `SettleGame` の `ErrNoGameInProgress`。`AddToEscrow` も `Escrow == 0` を拒む(仕様は残高不足しか書いていないが、進行中でないゲームへの追加は返す先が無い)。
+- **総資産に預かりを含める(C2-02)**: `totalAssetsLocked(account, rate)` 1 箇所に寄せた。`TopAssets` と `ViewAccount` の両方がこれを使う — 含めないとゲーム中だけランキングと `/balance` から掛け金が消えて、決着で復活する。
+- **`RefundStaleEscrows` は年齢を見ない**: 盤面はメモリなので、起動時に残っている預かりは定義上「二度と決着しない盤面」。`now` 引数は `OpenGame` との対称性のために取るだけで判定には使わない。手編集で `Chips + Escrow > MaxChips` になっているファイルは `MaxChips` まで返して預かりを消す(中断すると全ギルドの口座が永久に「進行中」で固まる方が悪い)。
 - **ボタン基盤の規律(C2-01 で決めた)**: `custom_id` は `BuildCustomID/ParseCustomID` 以外で組み立てない。`ParseCustomID` は 100 文字超・要素数 4 以外(過不足とも)・名前空間違い・空要素をすべて `ok=false` にする。`DispatchComponent` は `i.MessageComponentData()` ではなく `i.Data` のカンマ ok 型アサーションを使う(前者は component 以外の Interaction で panic する)。未知のボタンに無言で返さない — 無応答は押した人に「この操作は失敗しました」と出る。
 - **所有者検査の形**: `requireSessionOwner(i, ownerID)` は不一致の文言を返すだけ(`requireGuildContext` / `requireAdministrator` と同じ流儀)。ephemeral で送るのは呼び出し側。押した人の ID は既存の `resolveUserID(i)`(guild は `Member.User`、DM は `User`)。どちらかが空文字なら不一致扱い(`"" == ""` で他人に盤面を渡さない)。
+- **`custom_id` の長さは文字数(C2-01 の指摘)**: Discord の 100 上限は文字数なので、長さ判定は `utf8.RuneCountInString`。境界テストは ASCII だけだと素通りする — 多バイトの行を必ず入れる。
 - **ボタンのテストの取り方**: 応答の中身は、204 を返して直近のリクエストボディを保持する `capturingTransport`(`components_test.go`)で実際に送った JSON を読む。ビルダ関数を単体で見るより配線ごと確かめられる。
 - **2 周目で残った non-blocking(残課題)**: 掲示送信成功〜`MarkAnnounced` 保存の間の障害で再掲示 / 送信中 cancel の停止期限なし / 時計巻き戻り時の掲示見出しと履歴末尾のずれ(表示のみ)/ 実配備での書き込み確認と Docker ビルドは未検証(この PC に Docker 無し)。
 - **応答の規律(R-003 修正で決めた)**: `internal/commands` のハンドラは `s.InteractionRespond` を直接呼ばず `respond()` を通す。`cmd/bot` が戻り値をログへ出すので、直呼びはトークンをログへ戻す。`respond_test.go` の `TestNoDirectInteractionRespond` がソース走査で禁じている(`casino_shared.go` だけ除外 — そこが実装)。
