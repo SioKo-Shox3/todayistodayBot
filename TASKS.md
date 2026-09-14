@@ -208,7 +208,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。抽選は「今日のレートが無ければ生成」と同じトランザクションで行い、掲示チャンネルの有無に依存しない(§3 取りこぼし防止)。`randSource` は `Store` の既存の `rng` を使う。
 
 ## C3-04: `/lottery buy|status` コマンド(§4・§5)
-- status: todo
+- status: done
 - done-when: `internal/commands/lottery.go`: `/lottery buy <枚数>`(ギルド専用宣言 + 実行時ガード、`EnsureCasinoAccess` → `BuyLotteryTickets`)と `/lottery status`(`LotteryStatus`)。表示は公開。文言は §3・§5。`lottery_test.go`: `Handle()` から切り出した純粋関数(引数の検証、購入結果の文言、status の文言)、上限超過と残高不足の文言。`/help` の一覧に `/lottery` を足す(あれば)。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestLottery|TestHelp" -count=1`

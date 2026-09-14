@@ -40,7 +40,7 @@ func TestFormatHelpText_Empty(t *testing.T) {
 // two button games are on it by having registered themselves — this pins that
 // the self-registration holds, because a game that forgets Register() would
 // disappear from /help without any other test noticing.
-func TestFormatHelpText_ListsTheButtonGames(t *testing.T) {
+func TestFormatHelpText_ListsTheCasinoGames(t *testing.T) {
 	defs := make([]*discordgo.ApplicationCommand, 0, len(All()))
 	for _, cmd := range All() {
 		defs = append(defs, cmd.Definition())
@@ -48,7 +48,10 @@ func TestFormatHelpText_ListsTheButtonGames(t *testing.T) {
 
 	got := formatHelpText(defs)
 
-	for _, name := range []string{"highlow", "blackjack"} {
+	// The registry is the only list there is (絶対規則 2: commands self-register),
+	// so /help drops a game the moment its init() stops running — nothing else
+	// would notice.
+	for _, name := range []string{"highlow", "blackjack", "lottery"} {
 		if !strings.Contains(got, "`/"+name+"` - ") {
 			t.Errorf("/help does not list /%s:\n%s", name, got)
 		}
