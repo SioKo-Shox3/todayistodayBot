@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"strings"
@@ -206,6 +207,7 @@ type interactionResponder interface {
 	InteractionRespond(i *discordgo.Interaction, resp *discordgo.InteractionResponse, options ...discordgo.RequestOption) error
 	InteractionResponse(i *discordgo.Interaction, options ...discordgo.RequestOption) (*discordgo.Message, error)
 	ChannelMessageSend(channelID, content string, options ...discordgo.RequestOption) (*discordgo.Message, error)
+	FollowupMessageCreate(i *discordgo.Interaction, wait bool, data *discordgo.WebhookParams, options ...discordgo.RequestOption) (*discordgo.Message, error)
 }
 
 // respondVia is respond() for a handler that holds the interface rather than
@@ -251,6 +253,26 @@ const casinoActionSettle = "settle"
 // casinoSettleFailedMessage is what the board says while the chips have not
 // landed. The 🔁 button under it is the retry.
 const casinoSettleFailedMessage = "❌ 精算に失敗しました。もう一度お試しください。"
+
+// casinoRedrawnMessage answers the press that spent itself repairing a stale
+// board (casino.Session.NeedsRedraw). The press took no game action, and the
+// picture it was aimed at is gone, so the player is told to choose again
+// rather than left wondering why their button did nothing.
+const casinoRedrawnMessage = "🔄 盤面を更新しました。もう一度選んでください"
+
+// notifyRedrawn tells the presser, privately, that their press only refreshed
+// the board. It is a FOLLOWUP because the interaction's single response was
+// just spent on the redraw itself, and the redraw is the half that matters: a
+// lost notice costs an explanation, a lost redraw costs the board, so this one
+// is logged and never turns the press into a failure.
+func notifyRedrawn(r interactionResponder, i *discordgo.InteractionCreate) {
+	if _, err := r.FollowupMessageCreate(i.Interaction, false, &discordgo.WebhookParams{
+		Content: casinoRedrawnMessage,
+		Flags:   discordgo.MessageFlagsEphemeral,
+	}); err != nil {
+		slog.Error("discord: FollowupMessageCreate failed for a casino board redraw", "error", redactInteractionError(err))
+	}
+}
 
 // boardLocks is the process-wide registry of per-board locks. The zero value
 // is usable, so a command can hold one as a plain field.

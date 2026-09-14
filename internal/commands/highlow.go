@@ -455,6 +455,14 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
 
+	// The board's last edit never reached Discord, so the message shows the
+	// PREVIOUS card while the game holds the next one. A guess made against
+	// that picture would be decided by odds the player never saw: repair the
+	// picture and take no move.
+	if session.NeedsRedraw {
+		return c.redrawStaleBoard(r, i, sessionID, session.UserID)
+	}
+
 	var (
 		board    highLowBoard
 		step     casino.StepResult
@@ -493,13 +501,20 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 	}
 
 	if !finished {
-		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
+		if err := respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
 			Data: &discordgo.InteractionResponseData{
 				Embeds:     []*discordgo.MessageEmbed{highLowBoardEmbed(board, session.UserID)},
 				Components: highLowButtons(sessionID, board, false),
 			},
-		})
+		}); err != nil {
+			// The card turned over but the message did not: the board in the
+			// channel is now a card behind the game. Flag it so the next
+			// press repairs the picture instead of guessing on a dead one.
+			c.sessions.SetNeedsRedraw(sessionID, true)
+			return err
+		}
+		return nil
 	}
 
 	// The board is gone from the manager, so what it owes now lives here.
@@ -516,6 +531,40 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 	}
 	lock.pending = pending
 	return c.settle(r, i, sessionID, lock, pending)
+}
+
+// redrawStaleBoard repaints a board whose last edit was lost and answers the
+// presser privately. It takes NO game action: the press paid for the repair,
+// and the player chooses again from a picture that is true.
+//
+// The flag comes down only after the redraw has landed — a second lost edit
+// leaves the board exactly as stale as it was, and the press after it must
+// get the same treatment. The caller holds both the board lock and a Hold.
+func (c *HighLowCommand) redrawStaleBoard(r interactionResponder, i *discordgo.InteractionCreate, sessionID, userID string) error {
+	var board highLowBoard
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+		game, isHighLow := live.State.(*casino.HighLowGame)
+		if !isHighLow {
+			return true, errHighLowBadState
+		}
+		board = snapshotHighLow(game)
+		return false, nil
+	}); err != nil {
+		return respondVia(r, i.Interaction, ephemeralResponse(translateHighLowPressError(err)))
+	}
+
+	if err := respondVia(r, i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{highLowBoardEmbed(board, userID)},
+			Components: highLowButtons(sessionID, board, false),
+		},
+	}); err != nil {
+		return err
+	}
+	c.sessions.SetNeedsRedraw(sessionID, false)
+	notifyRedrawn(r, i)
+	return nil
 }
 
 // highLowPending is a finished board's unpaid settlement: everything needed

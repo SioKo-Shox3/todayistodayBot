@@ -503,6 +503,15 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
 
+	// The hand's last edit never reached Discord, so the message shows the
+	// PREVIOUS cards while the game holds the drawn one. A stand or a ⏫ aimed
+	// at that picture would be decided on a total the player never saw — and
+	// ⏫ would stake a second bet on it — so this comes BEFORE stakeDouble:
+	// repair the picture and take no move.
+	if session.NeedsRedraw {
+		return c.redrawStaleHand(r, i, sessionID, session)
+	}
+
 	// ⏫ stakes chips, and the stake is PERSISTED BEFORE the hand applies it
 	// (C2-04 の順序). Reversed, a stale ⏫ would take the extra bet and then be
 	// refused by the hand, leaving chips in escrow nothing accounts for.
@@ -550,13 +559,20 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 	}
 
 	if !finished {
-		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
+		if err := respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
 			Data: &discordgo.InteractionResponseData{
 				Embeds:     []*discordgo.MessageEmbed{blackjackBoardEmbed(board, session.UserID)},
 				Components: blackjackButtons(sessionID, board, c.affordsDouble(board, session.GuildID, session.UserID, time.Now()), false),
 			},
-		})
+		}); err != nil {
+			// The card was drawn but the message did not change: the hand in
+			// the channel is now a card behind the game. Flag it so the next
+			// press repairs the picture instead of standing on a dead total.
+			c.sessions.SetNeedsRedraw(sessionID, true)
+			return err
+		}
+		return nil
 	}
 
 	// The hand is gone from the manager, so what it owes now lives here.
@@ -601,6 +617,40 @@ func (c *BlackjackCommand) DisabledComponents(sessionID string, state any) []dis
 		return nil
 	}
 	return blackjackButtons(sessionID, snapshotBlackjack(game), false, true)
+}
+
+// redrawStaleHand repaints a hand whose last edit was lost and answers the
+// presser privately. It takes NO game action and stakes NO chips: the press
+// paid for the repair, and the player decides again on a total that is true.
+//
+// The flag comes down only after the redraw has landed — a second lost edit
+// leaves the hand exactly as stale as it was, and the press after it must get
+// the same treatment. The caller holds both the board lock and a Hold.
+func (c *BlackjackCommand) redrawStaleHand(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, session casino.Session) error {
+	var board blackjackBoard
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+		game, isBlackjack := live.State.(*casino.BlackjackGame)
+		if !isBlackjack {
+			return true, errBlackjackBadState
+		}
+		board = snapshotBlackjack(game)
+		return false, nil
+	}); err != nil {
+		return respondVia(r, i.Interaction, ephemeralResponse(translateBlackjackPressError(err)))
+	}
+
+	if err := respondVia(r, i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{blackjackBoardEmbed(board, session.UserID)},
+			Components: blackjackButtons(sessionID, board, c.affordsDouble(board, session.GuildID, session.UserID, time.Now()), false),
+		},
+	}); err != nil {
+		return err
+	}
+	c.sessions.SetNeedsRedraw(sessionID, false)
+	notifyRedrawn(r, i)
+	return nil
 }
 
 // blackjackPending is a finished hand's unpaid settlement: everything needed

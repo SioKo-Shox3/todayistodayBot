@@ -74,6 +74,7 @@ func (c *HighLowCommand) press(t *testing.T, r *fakeHighLowResponder, sessionID,
 type fakeHighLowResponder struct {
 	responses  []*discordgo.InteractionResponse
 	sends      []string
+	followups  []*discordgo.WebhookParams
 	message    *discordgo.Message
 	respondErr error
 	lookupErr  error
@@ -101,6 +102,11 @@ func (f *fakeHighLowResponder) InteractionResponse(_ *discordgo.Interaction, _ .
 func (f *fakeHighLowResponder) ChannelMessageSend(_ string, content string, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
 	f.sends = append(f.sends, content)
 	return &discordgo.Message{ID: "m2"}, nil
+}
+
+func (f *fakeHighLowResponder) FollowupMessageCreate(_ *discordgo.Interaction, _ bool, data *discordgo.WebhookParams, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	f.followups = append(f.followups, data)
+	return &discordgo.Message{ID: "m3"}, nil
 }
 
 func (f *fakeHighLowResponder) last(t *testing.T) *discordgo.InteractionResponse {
@@ -971,5 +977,101 @@ func TestHighLowStakesBeforeTheBoardAndRefundsWhenTheBoardCannotOpen(t *testing.
 	}
 	if got := highLowChipsOf(t, bank); got != before {
 		t.Errorf("chips after the refusal: got %d, want %d", got, before)
+	}
+}
+
+func TestHighLowRedrawsInsteadOfGuessingAfterALostEdit(t *testing.T) {
+	highLowRequireDeal(t, highLowCard2Spade, highLowCardAClub, highLowCardKClub)
+
+	c := newHighLowCommandForTest(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+
+	// The guess lands on the board but its edit never reaches Discord: the
+	// message still shows 2♠ while the game holds A♣.
+	r.respondErr = errors.New("the edit never reached Discord")
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, highLowActionHigh), "u1"), sessionID, highLowActionHigh); err == nil {
+		t.Fatal("a failed edit was reported as a successful press")
+	}
+	session, live := c.sessions.Get(sessionID)
+	if !live {
+		t.Fatal("a failed edit closed the board")
+	}
+	if !session.NeedsRedraw {
+		t.Fatal("the board is not marked for redraw, so the next press would guess against a card the player cannot see")
+	}
+
+	// The next press repairs the picture and turns NO card over.
+	r.respondErr = nil
+	resp := c.press(t, r, sessionID, highLowActionLow)
+	if resp.Type != discordgo.InteractionResponseUpdateMessage {
+		t.Fatalf("the redraw responded with type %v, want an edit", resp.Type)
+	}
+	body := highLowBodyOf(t, resp)
+	for _, want := range []string{"現在のカード: **" + highLowCardAClub.String() + "**", "連勝: 1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the redraw does not show the CURRENT board (missing %q)\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "配当") {
+		t.Errorf("the redraw settled the board instead of repairing it\n%s", body)
+	}
+	if len(r.followups) != 1 {
+		t.Fatalf("the redraw sent %d private notices, want 1", len(r.followups))
+	}
+	if r.followups[0].Content != casinoRedrawnMessage {
+		t.Errorf("the notice says %q, want %q", r.followups[0].Content, casinoRedrawnMessage)
+	}
+	if r.followups[0].Flags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Error("the redraw notice was public, not ephemeral")
+	}
+	if session, _ := c.sessions.Get(sessionID); session.NeedsRedraw {
+		t.Fatal("the flag survived a redraw that landed, so every later press would only redraw")
+	}
+
+	// And the press AFTER it plays a card, from the picture the player saw.
+	resp = c.press(t, r, sessionID, highLowActionLow) // A♣ → K♣: win
+	body = highLowBodyOf(t, resp)
+	for _, want := range []string{"現在のカード: **" + highLowCardKClub.String() + "**", "連勝: 2"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the press after the redraw did not play its guess (missing %q)\n%s", want, body)
+		}
+	}
+	if len(r.followups) != 1 {
+		t.Errorf("a normal press sent %d private notices, want none beyond the redraw's", len(r.followups)-1)
+	}
+}
+
+func TestHighLowKeepsTheRedrawFlagWhenTheRedrawItselfFails(t *testing.T) {
+	highLowRequireDeal(t, highLowCard2Spade, highLowCardAClub)
+
+	c := newHighLowCommandForTest(t)
+	r := &fakeHighLowResponder{}
+	sessionID := startHighLow(t, c, r, 100)
+
+	r.respondErr = errors.New("the edit never reached Discord")
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, highLowActionHigh), "u1"), sessionID, highLowActionHigh); err == nil {
+		t.Fatal("a failed edit was reported as a successful press")
+	}
+
+	// The repair fails too, so the message in the channel is still stale.
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, highLowActionLow), "u1"), sessionID, highLowActionLow); err == nil {
+		t.Fatal("a failed redraw was reported as a successful press")
+	}
+	session, live := c.sessions.Get(sessionID)
+	if !live {
+		t.Fatal("a failed redraw closed the board")
+	}
+	if !session.NeedsRedraw {
+		t.Error("the flag came down on a redraw that never landed: the next press would guess against the stale card")
+	}
+	if len(r.followups) != 0 {
+		t.Errorf("a redraw that failed still told the player it had updated the board (%d notices)", len(r.followups))
+	}
+
+	// The card is still A♣: neither press turned one over.
+	r.respondErr = nil
+	if body := highLowBodyOf(t, c.press(t, r, sessionID, highLowActionLow)); !strings.Contains(body, "連勝: 1") {
+		t.Errorf("the board moved on while its picture was stale\n%s", body)
 	}
 }

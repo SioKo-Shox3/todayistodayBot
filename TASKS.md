@@ -143,7 +143,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 精算の再試行は「同じ payout を二度払わない」こと — `SettleGame` は `Escrow == 0` なら `ErrNoGameInProgress` を返すので、成功後の二重呼び出しはそこで止まる(その場合も `Remove` する)。
 
 ## C2-11: 盤面更新の通信失敗後、古い表示のまま操作を受け付けない(所見 2、P1)
-- status: todo
+- status: done
 - done-when: H&L で盤面を進めた後のメッセージ編集が失敗すると、表示は前のカードのまま内部は次のカードになり、次の押下が表示と違う判定で決着する。直し方(親の決定): セッションに `NeedsRedraw bool` を持ち、編集失敗時に立てる。次の押下では**手を進めずに**現在の盤面でメッセージを再描画し、押した人に ephemeral で「🔄 盤面を更新しました。もう一度選んでください」を返してフラグを下ろす(再描画も失敗したら立てたまま)。BJ も同じ経路にする。`highlow_test.go` / `blackjack_test.go`: 編集失敗 → 次の押下は判定せず再描画だけ(fake responder で記録)→ その次の押下で判定される。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestHighLow|TestBlackjack" -count=1`

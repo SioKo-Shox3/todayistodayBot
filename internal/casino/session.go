@@ -78,6 +78,14 @@ type Session struct {
 	PendingPayout  int64
 	PayoutResolved bool
 
+	// NeedsRedraw marks a board whose last message edit never reached
+	// Discord: the hand moved on, the picture in the channel did not. The
+	// next press must NOT play against that picture — the player would be
+	// choosing from odds, or a total, that no longer exist — so the command
+	// layer redraws the board instead of taking the move and lowers the flag
+	// only once the redraw has landed.
+	NeedsRedraw bool
+
 	// busy counts the operations currently running on this board (Hold /
 	// Release). Guarded by the manager's mutex like every other mutable
 	// field, and deliberately unexported: it is the manager's bookkeeping,
@@ -305,6 +313,24 @@ func (m *SessionManager) Touch(id string, now time.Time) {
 
 	if session, ok := m.sessions[id]; ok && !session.Expired {
 		session.LastActionAt = now
+	}
+}
+
+// SetNeedsRedraw raises or lowers the stale-picture flag of a live board.
+// It is a manager method rather than a write inside WithSession because both
+// of its callers sit on the OTHER side of a Discord call: the flag goes up
+// when an edit has already failed, and comes down only when the redraw that
+// replaced it has already succeeded. Unknown and expired boards are ignored
+// — an expired board's message is the sweeper's to rewrite.
+//
+// It does not touch LastActionAt: raising the flag is the bot's bookkeeping,
+// not the player's activity, and must not keep an abandoned board alive.
+func (m *SessionManager) SetNeedsRedraw(id string, needed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if session, ok := m.sessions[id]; ok && !session.Expired {
+		session.NeedsRedraw = needed
 	}
 }
 

@@ -648,3 +648,55 @@ func TestSessionHoldCountsEveryOperation(t *testing.T) {
 		t.Fatalf("Sweep returned %d board(s) after the last Release, want 1", len(expired))
 	}
 }
+
+func TestSessionSetNeedsRedrawMarksOnlyALiveBoard(t *testing.T) {
+	start := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	clock := newFixedClock(start)
+	m := NewSessionManager(clock.Now, 3*time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if session, _ := m.Get(opened.ID); session.NeedsRedraw {
+		t.Fatal("a board is born needing a redraw")
+	}
+
+	m.SetNeedsRedraw(opened.ID, true)
+	session, live := m.Get(opened.ID)
+	if !live {
+		t.Fatal("marking a board for redraw closed it")
+	}
+	if !session.NeedsRedraw {
+		t.Error("the flag did not reach the board")
+	}
+
+	// Raising the flag is the bot's bookkeeping, not the player's activity:
+	// a board nobody is playing must still expire on schedule.
+	clock.advance(3 * time.Minute)
+	if swept := m.Sweep(clock.Now()); len(swept) != 1 {
+		t.Fatalf("Sweep of a flagged, idle board: got %d sessions, want 1", len(swept))
+	}
+
+	// An expired board belongs to the sweeper, which replaces the whole
+	// message; an unknown one is gone. Neither takes the flag.
+	m.SetNeedsRedraw(opened.ID, false)
+	if !m.sessions[opened.ID].NeedsRedraw {
+		t.Error("an expired board took a flag change from the command layer")
+	}
+	m.SetNeedsRedraw("no-such-session", true) // a no-op, not a panic
+}
+
+func TestSessionSetNeedsRedrawLowersTheFlag(t *testing.T) {
+	m := NewSessionManager(time.Now, 3*time.Minute)
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	m.SetNeedsRedraw(opened.ID, true)
+	m.SetNeedsRedraw(opened.ID, false)
+	if session, _ := m.Get(opened.ID); session.NeedsRedraw {
+		t.Error("the flag stayed up after the redraw landed, so every later press would only redraw")
+	}
+}

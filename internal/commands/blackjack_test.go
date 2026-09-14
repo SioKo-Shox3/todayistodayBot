@@ -860,3 +860,130 @@ func TestBlackjackDoubleIsNotSweptBetweenTheStakeAndTheHand(t *testing.T) {
 		t.Errorf("chips: got %d, want %d (1000 - ダブルで200 + 配当%d)", view.Account.Chips, wantChips, want.Settle())
 	}
 }
+
+func TestBlackjackRedrawsInsteadOfPlayingAfterALostEdit(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a hand that survives one hit", func(g *casino.BlackjackGame) bool {
+		if g.State() != casino.BlackjackPlaying {
+			return false
+		}
+		if _, err := g.Hit(); err != nil {
+			return false
+		}
+		return g.State() == casino.BlackjackPlaying
+	})
+	c, bank := newBlackjackCommandForTest(t, seed)
+	r := &fakeCasinoResponder{}
+	sessionID := startBlackjack(t, c, r, 100)
+
+	// The hit lands on the hand but its edit never reaches Discord: the
+	// message still shows two cards while the game holds three.
+	r.respondErr = errors.New("the edit never reached Discord")
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, blackjackActionHit), "u1"), sessionID, blackjackActionHit); err == nil {
+		t.Fatal("a failed edit was reported as a successful press")
+	}
+	session, live := c.sessions.Get(sessionID)
+	if !live {
+		t.Fatal("a failed edit closed the hand")
+	}
+	if !session.NeedsRedraw {
+		t.Fatal("the hand is not marked for redraw, so the next press would decide on a total the player cannot see")
+	}
+
+	// The next press repairs the picture and stands on NOTHING.
+	r.respondErr = nil
+	resp := c.press(t, r, sessionID, blackjackActionStand)
+	if resp.Type != discordgo.InteractionResponseUpdateMessage {
+		t.Fatalf("the redraw responded with type %v, want an edit", resp.Type)
+	}
+	probe := blackjackProbe(100, seed)
+	if _, err := probe.Hit(); err != nil {
+		t.Fatalf("probe hit: %v", err)
+	}
+	if body := blackjackBodyOf(t, resp); !strings.Contains(body, blackjackHand(probe.Player())) {
+		t.Errorf("the redraw does not show the CURRENT hand (%s):\n%s", blackjackHand(probe.Player()), body)
+	}
+	if bank.settles != 0 {
+		t.Errorf("the redraw settled the hand %d times, want 0 — it takes no game action", bank.settles)
+	}
+	if _, live := c.sessions.Get(sessionID); !live {
+		t.Fatal("the redraw closed the hand")
+	}
+	if len(r.followups) != 1 || r.followups[0].Content != casinoRedrawnMessage {
+		t.Fatalf("the redraw's private notices are %v, want one %q", r.followups, casinoRedrawnMessage)
+	}
+	if r.followups[0].Flags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Error("the redraw notice was public, not ephemeral")
+	}
+	if session, _ := c.sessions.Get(sessionID); session.NeedsRedraw {
+		t.Fatal("the flag survived a redraw that landed, so every later press would only redraw")
+	}
+
+	// And the press AFTER it stands, on the total the player saw.
+	resp = c.press(t, r, sessionID, blackjackActionStand)
+	if body := blackjackBodyOf(t, resp); !strings.Contains(body, "配当") {
+		t.Errorf("the press after the redraw did not decide the hand:\n%s", body)
+	}
+	if bank.settles != 1 {
+		t.Errorf("SettleGame was called %d times, want 1", bank.settles)
+	}
+	if _, live := c.sessions.Get(sessionID); live {
+		t.Error("a hand that stood is still addressable")
+	}
+}
+
+// A ⏫ stakes a second bet, so the stale-picture check has to come BEFORE the
+// stake: a player who cannot see their own hand must never be charged for it,
+// however many presses the repair takes.
+func TestBlackjackRedrawOutranksADoublesStake(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a hand that survives one hit", func(g *casino.BlackjackGame) bool {
+		if g.State() != casino.BlackjackPlaying {
+			return false
+		}
+		if _, err := g.Hit(); err != nil {
+			return false
+		}
+		return g.State() == casino.BlackjackPlaying
+	})
+	c, bank := newBlackjackCommandForTest(t, seed)
+	r := &fakeCasinoResponder{}
+	sessionID := startBlackjack(t, c, r, 100)
+
+	r.respondErr = errors.New("the edit never reached Discord")
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, blackjackActionHit), "u1"), sessionID, blackjackActionHit); err == nil {
+		t.Fatal("a failed edit was reported as a successful press")
+	}
+
+	// The repair fails too, so the message in the channel is still stale.
+	if err := c.handleComponent(r, highLowButtonInteraction(BuildCustomID(c.Prefix(), sessionID, blackjackActionDouble), "u1"), sessionID, blackjackActionDouble); err == nil {
+		t.Fatal("a failed redraw was reported as a successful press")
+	}
+	session, live := c.sessions.Get(sessionID)
+	if !live {
+		t.Fatal("a failed redraw closed the hand")
+	}
+	if !session.NeedsRedraw {
+		t.Error("the flag came down on a redraw that never landed: the next press would decide on the stale total")
+	}
+	if len(r.followups) != 0 {
+		t.Errorf("a redraw that failed still told the player it had updated the hand (%d notices)", len(r.followups))
+	}
+	if got := highLowEscrowOf(t, bank); got != 100 {
+		t.Errorf("escrow after two ⏫-pressed repairs: got %d, want the original stake (100)", got)
+	}
+
+	// The repair that lands is still a repair: no chips, no decision.
+	r.respondErr = nil
+	resp := c.press(t, r, sessionID, blackjackActionDouble)
+	if got := highLowEscrowOf(t, bank); got != 100 {
+		t.Errorf("escrow after the redraw: got %d, want the original stake (100)", got)
+	}
+	if bank.settles != 0 {
+		t.Errorf("the redraw settled the hand %d times, want 0", bank.settles)
+	}
+	if body := blackjackBodyOf(t, resp); strings.Contains(body, "配当") {
+		t.Errorf("the redraw decided the hand instead of repairing it:\n%s", body)
+	}
+	if _, live := c.sessions.Get(sessionID); !live {
+		t.Error("the redraw closed the hand")
+	}
+}
