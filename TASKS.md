@@ -336,7 +336,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(資金の保存則)。これで「口座に触る経路はすべて `ensureAccountLocked` を通る」が閉じる — 他にも直接 map を引いている箇所があれば同じ扱いにし、見つけた場所を進捗に書く。
 
 ## C3-17: 実装自身が作った繰り越しを上限で消さない(2 周目 blocking 2)
-- status: todo
+- status: done
 - done-when: `.harness/reviews/2026-09-15-astra-casino-c3a-round2.md` の blocking 2 を直す。`drawLotteryLocked` の当選者不在の経路は賞金全額を `Carryover` に入れるため `MaxChips` を超えうるが、`normalizeLotteryLocked` が次の読み取りでそれを `MaxChips` へ切り詰めるので**実装自身が作った通貨が消える**(再現: `Sales=100`・`Carryover=MaxChips`・券なし・プール 5,000 で `LotteryStatus` を 2 回呼ぶと 90 チップ消失)。親の決定(2026-09-15): **繰り越しに入り切らない分はジャックポットのプールへ送る**(他の全ての余りと同じ行き先。`seedJackpotLocked` の後に `creditJackpotCappedLocked`)。繰り越しを書く箇所で `MaxChips` を超える分を先に切り出してプールへ回し、`Carryover <= MaxChips` を**書き込み時点で**保証する(正規化は破損ファイル対策として残す)。併せて 2 周目の non-blocking(`seedJackpotLocked` が巨大な正の `JackpotAccum` を補正せず、積立の加算があふれうる)も直す — `JackpotAccum` を `[0, 100)` へ丸める。設計書 §8 の契約文を「通貨が消えるのは**プールの上限**で入り切らないときだけ。口座・繰り越しの上限で溢れた分はプールへ送る」に直す。回帰テスト: 上の再現手順で 2 回目の照会でも通貨が消えない(繰り越し + プール + 口座の合計が不変)/ `JackpotAccum = math.MaxInt64` のファイルを読んで積立を通してもプールが負にならない / 通常範囲の既存の期待値が 1 つも変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

@@ -4,6 +4,12 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-17(実装自身が作った繰り越しを上限で消さない = 2 周目 blocking 2 + non-blocking 1)= このコミット。
+  **(1) 繰り越しの上限**: `drawLotteryLocked` の当選者不在の経路が賞金全額を `Carryover` に入れていたので、`Carryover` が `MaxChips` に座った状態で売上があると `prize = MaxChips + 90` が**上限を超えたまま永続化**され、次の読み取りの `normalizeLotteryLocked` がそれを `MaxChips` へ切り詰めて 90 チップが消えた(入力は全部正常範囲 — 手編集ファイルの修復ではなく、**実装が作った値を実装の正規化点が消す**形)。親の決定どおり**入り切らない分はプールへ送る**(ハウス分と同じ行き先): `overflow, prize = prize-MaxChips, MaxChips` を切り出して `creditJackpotCappedLocked(economy, house+overflow)` に合流させ、`Carryover <= MaxChips` を**書き込み時点で**保証した。正規化点のクランプは残す — ただし役割が変わったので、`normalizeLotteryLocked` のコメントに**「上限側の切り詰めが直すのはファイルが持ち込んだ値だけ。ここに自分の書いた値が届いたらそれは writer のバグ」**と書いた。
+  **(2) `JackpotAccum` の正規化**(2 周目の non-blocking): `seedJackpotLocked` は負値しか直していなかったので、手編集の `math.MaxInt64` が `JackpotAccum += bet*2` を**負へ折り返し**、以後の積立が何回かプールに 1 チップも入らない。`[0, jackpotAccumScale)` へ丸めるようにした(0 代入ではなく `%=` — 端数は壊れていないので残す)。併せて `accrueJackpotLocked` の順序を変え、**加算する前に**端数を切り出すようにした(`creditJackpotCappedLocked` が内部で `seedJackpotLocked` を呼ぶので、後から `%=` すると結果が入れ子の正規化に依存する)。
+  **効き目の確認**: mutation 2 本で、それぞれ**新テスト 1 件だけ**が落ちる — `mutation-C3-17-no-carryover-split.txt`(`Carryover = 1000000000090` が永続化される)/ `mutation-C3-17-no-accum-clamp.txt`(プールが 5,000 のまま = 積立が消える)。既存テストの期待値は 1 つも変えていない。
+  **設計書 §8** の契約文を直した: 通貨が消えるのは**プールの上限**だけ。口座・繰り越しの上限で溢れた分はプールへ送る。**切り詰めてよいのは壊れたファイルが持ち込んだ値だけ**。
+  証拠: `.harness/runs/20260915-025434/verify-C3-17-1..3.txt`(build・vet 診断なし / casino ok / 全 8 パッケージ ok)。
 - C3-16(正規化点を通らずに口座を触る経路を塞ぐ)= コミット `64f28e4`。`NEXT_FINDINGS.md` を見出しだけに戻した(反復 2 の節を削除)。
   **(1) `RefundStaleEscrows`**: 口座を `economy.Users` から直接引いて `moveFromEscrowLocked` に渡していたので、C3-14 で置いた正規化点を通らなかった。`moveFromEscrowLocked` は `Chips += Escrow` なので、手編集の `Chips = Escrow = math.MaxInt64` で**和が折り返して `Chips = -2` が保存される** — 次の読み取りがそれを 0 に丸め、「チップを絶対に消さない」が契約の唯一の操作が全部消す。ループを `for userID, account := range` にして、nil と `Escrow <= 0` を弾いたあと **(既に非 nil でも)** `ensureAccountLocked` を通してから足す。
   **(2) 掃いて見つけたもう 1 か所 = `topAssetsLocked`**(`store.go` 558 付近)。ここも `economy.Users` を直接回すので、手編集の `MaxInt64` 口座で `Chips + Escrow + Coins*rate` が折り返し、**その口座が首位ではなく最下位に並ぶ**(エラーも panic も出ない)。ここは `ensureAccountLocked` ではなく **`normalizeAccountLocked` を使った** — 既にある項目を丸めるのと口座を**作る**のは別で、作ると「順位を第三者が見た」だけで未プレイの人に 1,000 チップの初回ボーナスが湧く(nil を repair せず skip しているのと同じ理由)。
@@ -118,6 +124,8 @@
 - (なし)
 
 ## Next
+- **`TASKS.md` の未完は C3-18(2 周目 blocking 1: 旧形式の未掲示結果が待ち行列へ移行されない)1 件**。`NEXT_FINDINGS.md` は見出しだけ。C3-17 と C3-18 を閉じたら 2 周目の blocking は全部落ちるので、次の区切りで評価者(Astra)の**2 周目の確認**へ回す(レビューは 1 差分 2 周までなので、これが最後)。
+- **「正規化点は切り詰めてよい/よくない」の線引きが今回の一般則**: 正規化点のクランプは**ファイルが持ち込んだ値の修復**であって、実装が作った値の後始末ではない。上限を超えうる値を**作る側**(抽選の繰り越し、上限に座った当選者への支払い)が、書き込みの時点で超過分の行き先(= プール)を決める。新しい永続フィールドを足すときは、正規化点を通すことに加えて「そのフィールドの writer は上限を超える値を作りうるか」を確かめる — 作りうるなら行き先を writer 側に書く。
 - **`TASKS.md` に未完のタスクは無い**(C3-16 が最後の 1 件)。先へ進むには M1 へ戻って項目を足す。`NEXT_FINDINGS.md` も見出しだけで、残課題は無い。次の区切りは**評価者(Astra)を通すところ** — C3-14 / C3-15 / C3-16 は 3 件とも危険地帯(資金の保存則)なので、段階が探索期でも評価は必須。
 - **口座の正規化はこれで閉じた。** `internal/casino/store.go` で `economy.Users` を直接引くのは `ensureAccountLocked` だけ。新しい読み取り経路を足すときは、そこを通すか(書き込み経路)`normalizeAccountLocked` を呼ぶか(口座を作りたくない表示経路)のどちらかにする。どちらも通さない経路を足すと、C3-13 / C3-14 / C3-16 で閉じた穴がその経路から開き直す。
 - **次は C3-16(正規化点を通らずに口座を触る経路 `RefundStaleEscrows` を塞ぐ)**。`TASKS.md` の未完はこれ 1 件。入力は反復 1 の評価者の指摘で、`NEXT_FINDINGS.md` からは消してある(C3-16 が同じ内容を持っている)。

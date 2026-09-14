@@ -3980,3 +3980,111 @@ func TestLotteryDraw_UnannouncedQueueKeepsOnlyTheLatestSeven(t *testing.T) {
 		}
 	}
 }
+
+// TestLotteryDraw_CarryoverOverTheCapGoesToThePoolNotTheFloor is the C3-17
+// regression, and it is a leak of a different shape from the hand-edited
+// files above: every number going IN is in range, so no clamp is repairing
+// anything. A pot sitting at the MaxChips ceiling with sales on top produces
+// a prize ABOVE the ceiling, the no-winner path used to store that prize in
+// Carryover whole, and normalizeLotteryLocked then truncated it at the very
+// next read — the implementation creating a number and its own normalisation
+// point deleting it, one call apart. The draw now decides where the excess
+// goes at the moment it writes: down the same road as the house cut, into
+// the pool. 設計書 C-3a §8 — the cap on the POOL is the only place a chip
+// leaves the system; an account's or the carryover's ceiling redirects, it
+// does not destroy.
+func TestLotteryDraw_CarryoverOverTheCapGoesToThePoolNotTheFloor(t *testing.T) {
+	st, path := newTempStore(t)
+	// No roll is scripted: nobody holds a ticket, so PickLotteryWinner
+	// returns before it asks for one. A draw that named somebody here would
+	// fail the test loudly instead of quietly.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1_000})
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, guildID).Lottery
+		lottery.DrawDate = jstDate(fixedNow) // today is settled; tomorrow draws
+		lottery.Sales = 100
+		lottery.Carryover = MaxChips // AT the ceiling, not over it
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the pot: %v", err)
+	}
+	seedJackpot(t, st, guildID, 5_000, 0)
+
+	// prize = floor(100*90/100) + 1e12 = MaxChips+90, house = 10. The 90 that
+	// Carryover has no room for joins the cut in the pool: 5000 + 10 + 90.
+	const wantPool = int64(5_100)
+	if _, err := st.LotteryStatus(guildID, userID, daysAfter(1)); err != nil {
+		t.Fatalf("LotteryStatus (first read, runs the draw): %v", err)
+	}
+	drawn := readGuild(t, path, guildID)
+	if drawn.Lottery.LastDraw != nil {
+		t.Fatalf("LastDraw = %+v, want nil — nobody entered, so no result may be recorded", drawn.Lottery.LastDraw)
+	}
+	if drawn.Lottery.Carryover != MaxChips {
+		t.Fatalf("Carryover = %d, want MaxChips %d — the draw must persist a carryover already inside its ceiling",
+			drawn.Lottery.Carryover, MaxChips)
+	}
+	if drawn.Jackpot != wantPool {
+		t.Fatalf("pool = %d, want %d (5000 + the 10 house cut + the 90 the carryover had no room for)", drawn.Jackpot, wantPool)
+	}
+	// Conservation across the draw: the pot held Sales 100 + Carryover
+	// MaxChips, and all of it is still somewhere.
+	if got := drawn.Lottery.Carryover + drawn.Jackpot - 5_000; got != MaxChips+100 {
+		t.Fatalf("carryover + pool gained = %d, want %d (sales + carryover) — the draw destroyed chips", got, MaxChips+100)
+	}
+
+	// The second read is where the loss used to happen: the draw does not run
+	// again (the day is stamped), so normalizeLotteryLocked is the only thing
+	// that touches the pot — and it must find nothing to repair.
+	if _, err := st.LotteryStatus(guildID, userID, daysAfter(1)); err != nil {
+		t.Fatalf("LotteryStatus (second read): %v", err)
+	}
+	after := readGuild(t, path, guildID)
+	if after.Lottery.Carryover != drawn.Lottery.Carryover || after.Jackpot != drawn.Jackpot {
+		t.Fatalf("second read moved the money: carryover %d -> %d, pool %d -> %d — a clamp may only repair what the FILE brought in, never a value this package wrote",
+			drawn.Lottery.Carryover, after.Lottery.Carryover, drawn.Jackpot, after.Jackpot)
+	}
+	if got := totalChips(after); got != 1_000 {
+		t.Fatalf("player chips = %d, want 1000 untouched — no ticket was bought and no prize was paid", got)
+	}
+}
+
+// TestSpin_HandEditedJackpotAccumCannotWrapTheAccrual covers the carry that
+// seedJackpotLocked used to leave alone. JackpotAccum is in [0, 100) after
+// every real accrual, so anything larger is a hand edit — and math.MaxInt64
+// wrapped `JackpotAccum += bet*percent` NEGATIVE, after which the division
+// fed the pool nothing and the negative carry persisted for the next spin to
+// inherit. Normalising it at the same read point as the pool keeps the
+// accrual on numbers the range analysis in types.go actually covers.
+func TestSpin_HandEditedJackpotAccumCannotWrapTheAccrual(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID, userID = "guild1", "u1"
+	seedAccount(t, st, guildID, userID, UserAccount{Chips: 50_000})
+	seedJackpot(t, st, guildID, 5_000, math.MaxInt64)
+	st.rng = &scriptedIntn{t: t, intns: losingReels(t)}
+
+	result, err := st.Spin(guildID, userID, 1_000)
+	if err != nil {
+		t.Fatalf("Spin returned error: %v", err)
+	}
+	// MaxInt64 normalises to MaxInt64%100 = 7 sub-chip units; the 1000-chip
+	// bet adds 2000 of them, so 20 whole chips reach the pool and 7 stay.
+	const wantPool, wantAccum = int64(5_020), int64(7)
+	if result.JackpotPool != wantPool {
+		t.Fatalf("reported pool = %d, want %d — the 2%% accrual must land even on a corrupt carry", result.JackpotPool, wantPool)
+	}
+	economy := readGuild(t, path, guildID)
+	if economy.Jackpot != wantPool {
+		t.Fatalf("persisted pool = %d, want %d", economy.Jackpot, wantPool)
+	}
+	if economy.Jackpot < JackpotSeed || economy.Jackpot > MaxJackpot {
+		t.Fatalf("pool = %d, outside [%d, %d] — a wrapped accrual is money the next 7️⃣7️⃣7️⃣ hands to a player",
+			economy.Jackpot, JackpotSeed, MaxJackpot)
+	}
+	if economy.JackpotAccum != wantAccum {
+		t.Fatalf("JackpotAccum = %d, want %d — the carry must be normalised into [0, %d) at the read point, not carried forward wrapped",
+			economy.JackpotAccum, wantAccum, jackpotAccumScale)
+	}
+}

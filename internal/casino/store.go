@@ -787,11 +787,18 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 // the very next credit wrap. Clamping on the way in means the arithmetic
 // below never sees such a value at all.
 //
-// The carry is normalised at the same time: a NEGATIVE JackpotAccum (again,
-// only reachable by hand edit) would make accrueJackpotLocked's division
-// hand back a negative contribution and SHRINK the pool, since Go's / and %
-// both truncate towards zero. A carry at or above the scale needs no repair —
-// the next accrual converts it. Caller must already hold the Store's lock.
+// The carry is normalised at the same time, into [0, jackpotAccumScale) —
+// the range accrueJackpotLocked leaves behind and the only range a
+// legitimate sequence ever persists. A NEGATIVE JackpotAccum (again, only
+// reachable by hand edit) would make accrueJackpotLocked's division hand
+// back a negative contribution and SHRINK the pool, since Go's / and % both
+// truncate towards zero. One at or above the scale is the mirror case: a
+// file holding math.MaxInt64 wraps `JackpotAccum += bet*percent` to a
+// negative carry, and the accrual that follows then feeds the pool nothing
+// for as many spins as it takes to climb back — the same overflow the pool's
+// own clamp above rules out, one field over. Both are repaired here so the
+// arithmetic downstream never sees them. Caller must already hold the
+// Store's lock.
 func seedJackpotLocked(economy *GuildEconomy) {
 	if economy.Jackpot < JackpotSeed {
 		economy.Jackpot = JackpotSeed
@@ -801,6 +808,11 @@ func seedJackpotLocked(economy *GuildEconomy) {
 	}
 	if economy.JackpotAccum < 0 {
 		economy.JackpotAccum = 0
+	} else if economy.JackpotAccum >= jackpotAccumScale {
+		// Modulo rather than 0: the sub-chip part of a corrupt carry is
+		// harmless and keeping it makes this a repair of the one thing that
+		// is actually out of range.
+		economy.JackpotAccum %= jackpotAccumScale
 	}
 }
 
@@ -846,11 +858,17 @@ func creditJackpotCappedLocked(economy *GuildEconomy, amount int64) int64 {
 func accrueJackpotLocked(economy *GuildEconomy, bet int64) {
 	seedJackpotLocked(economy)
 	economy.JackpotAccum += bet * JackpotContributionPercent
+	// Whole chips are taken out of the carry BEFORE the credit, not after:
+	// creditJackpotCappedLocked seeds on the way in, and the seed now
+	// normalises the carry too, so leaving the subtraction until afterwards
+	// would make this line's result depend on what that nested seed did to
+	// the field in between.
+	whole := economy.JackpotAccum / jackpotAccumScale
+	economy.JackpotAccum %= jackpotAccumScale
 	// The carry is spent either way: at the cap the whole chips it converted
 	// to are dropped rather than held back, so a full pool does not silently
 	// bank an accrual that the next 7️⃣7️⃣7️⃣ reset would release all at once.
-	creditJackpotCappedLocked(economy, economy.JackpotAccum/jackpotAccumScale)
-	economy.JackpotAccum %= jackpotAccumScale
+	creditJackpotCappedLocked(economy, whole)
 }
 
 // Spin atomically deducts bet chips, accrues the jackpot pool, resolves the
@@ -1193,10 +1211,16 @@ func creditChipsCappedLocked(account *UserAccount, amount int64) int64 {
 // Sales and Carryover are pinned to [0, MaxChips]. Negative is the case
 // that corrupts arithmetic (Go's / truncates toward zero, so a negative
 // sales hands back a house cut that SHRINKS the pool); MaxChips is the same
-// ceiling every account balance obeys, so a legitimately-grown pot never
-// reaches it — only a hand edit does, and truncating there is the same
-// "the cap is the only leak" contract creditJackpotCappedLocked already
-// carries.
+// ceiling every account balance obeys.
+//
+// The ceiling half repairs the FILE and nothing else. A value above MaxChips
+// can only be a hand edit or a partial write, because drawLotteryLocked —
+// the sole writer of Carryover, and the only path that can produce a number
+// that large — splits the excess off and sends it to the jackpot pool before
+// it persists anything. That division of labour is the rule 設計書 C-3a §8
+// states: a truncation may delete a number the file brought in, never one
+// this package computed. Reaching this clamp with our own number would be a
+// bug in the writer, not a repair here.
 //
 // Tickets entries are pinned to [1, LotteryMaxTicketsPerDraw], the range
 // BuyLotteryTickets already enforces: a non-positive holding bought nothing
@@ -1280,7 +1304,23 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 		// 設計書 C-3a §3 puts the cut in the pool unconditionally, and C3-07
 		// settled the rule it follows from: chips leave circulation only where
 		// a cap refuses them.
-		creditJackpotCappedLocked(economy, house)
+		//
+		// What will not FIT in the carryover takes that road too. Carryover
+		// obeys the same MaxChips ceiling an account does, and the prize is
+		// this pot's share ON TOP of the carryover already there, so a pot
+		// near the ceiling produces a prize above it. Splitting the excess off
+		// here, at the write, is what keeps normalizeLotteryLocked's clamp
+		// honest: that clamp exists to repair a hand-edited file, and letting
+		// it meet a number the draw itself produced would turn it into a
+		// deletion of chips this package created. The invariant it restores is
+		// therefore established at the point of writing — Carryover is never
+		// persisted above MaxChips — and the clamp stays as the defence
+		// against the file, not against us.
+		overflow := int64(0)
+		if prize > MaxChips {
+			overflow, prize = prize-MaxChips, MaxChips
+		}
+		creditJackpotCappedLocked(economy, house+overflow)
 		lottery.Carryover = prize
 		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 		return
