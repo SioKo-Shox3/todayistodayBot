@@ -135,8 +135,27 @@ type UserAccount struct {
 	LastDailyDate  string `json:"last_daily_date"`
 	StreakDays     int    `json:"streak_days"`
 	Escrow         int64  `json:"escrow,omitempty"`           // chips staked on the in-flight game (bet + any double)
-	EscrowGame     string `json:"escrow_game,omitempty"`      // "highlow" | "blackjack"
+	EscrowGame     string `json:"escrow_game,omitempty"`      // "highlow" | "blackjack" | "duel"
 	EscrowOpenedAt string `json:"escrow_opened_at,omitempty"` // RFC3339 in JST
+	// SeasonNet is the running 純利 for the month in progress: the sum of
+	// (what the account actually RECEIVED − what it staked) over game
+	// settlements only (設計書 C-3b §3). It is what the monthly season ranks
+	// on, and it is deliberately NOT currency — no balance is derived from
+	// it and zeroing it at a season boundary destroys nothing. Handouts
+	// (daily bonus, exchange, mint, welcome bonus, the season's own prize)
+	// are excluded on purpose, so the ranking measures playing rather than
+	// being given chips.
+	//
+	// "Actually received" rather than "owed" is the rule that keeps the
+	// board honest against the cap: a winner already sitting at MaxChips
+	// takes only the chips that fit, and counting the full payout would
+	// show a rank the player's balance never earned.
+	//
+	// It is signed (a losing player is negative) and omitempty, so an
+	// account that has not played since the season opened — and every
+	// account in a pre-C-3b data/casino.json — serialises exactly as it did
+	// before this field existed.
+	SeasonNet int64 `json:"season_net,omitempty"`
 }
 
 // MaxChips / MaxCoins bound every account balance. They are NOT arbitrary:

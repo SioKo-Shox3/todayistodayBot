@@ -369,7 +369,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 **資金に触るタスクは §2 の契約を先に読む**(duel はゼロサム、賞与は意図的な新規発行、`SeasonNet` は通貨ではない)。
 
 ## C3B-01: duel の純粋ロジックと預かり(§4.5・§2)
-- status: todo
+- status: done
 - done-when: `internal/casino/duel.go`: `DuelState{ChallengerID, OpponentID, Bet, Stage}`(`Stage` は待機/決着)、`FlipDuel(rng randSource) (challengerWins bool)`(コイントス。既存の `randSource` を使う)、`DuelPayout(bet int64, challengerWins bool) (challengerPayout, opponentPayout int64)`(勝者 `2*bet`・敗者 0)。`store.go` に `AcceptDuel(guild, challengerID, opponentID string, bet int64, challengerWins bool) (DuelSettlement, error)`: **1 回の `Update`** の中で、受け手から `bet` を預かり(残高不足・進行中ありは既存のセンチネルで拒否。挑戦者の預かりには触らない)、両者の `Escrow` を 0 にして勝者へ `2*bet` を入れ、両者の `SeasonNet` を更新(受け取った額 − 賭けた額)。`DeclineDuel(guild, challengerID) error`(挑戦者へ `bet` を返す = `SettleGame(payout = bet)` 相当、受け手は触らない)。`duel_test.go` / `store_test.go`: コイントスの決定性、精算額、**2 人の合計が不変**(ゼロサム)、受諾失敗で挑戦者の預かりが減らない、辞退で全額戻る、上限に座った勝者は入る分だけ入り `SeasonNet` も入った額で数える、並行受諾で二重精算が起きない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

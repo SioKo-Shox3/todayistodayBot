@@ -1093,6 +1093,191 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 	return result, nil
 }
 
+// addSeasonNetLocked adds delta to the account's running 純利, saturating at
+// ±MaxChips. Caller must already hold the Store's lock.
+//
+// It clamps the CURRENT value before adding, not just the result, because
+// the current value comes off disk unbounded: a hand-edited season_net near
+// math.MaxInt64 would wrap the addition itself, and a wrapped 純利 puts the
+// worst player at the top of the season board. Clamping both ends means the
+// widest intermediate here is MaxChips + 2*MaxChips = 3e12, 3e6x below
+// math.MaxInt64.
+//
+// Saturating rather than refusing is right because SeasonNet is not
+// currency (types.go): losing precision at ±1e12 costs a rank ordering
+// nobody can reach by playing, while refusing would abort a settlement that
+// has already moved real chips.
+func addSeasonNetLocked(account *UserAccount, delta int64) {
+	net := account.SeasonNet
+	if net > MaxChips {
+		net = MaxChips
+	} else if net < -MaxChips {
+		net = -MaxChips
+	}
+	net += delta
+	if net > MaxChips {
+		net = MaxChips
+	} else if net < -MaxChips {
+		net = -MaxChips
+	}
+	account.SeasonNet = net
+}
+
+// DuelSettlement is what AcceptDuel left behind — everything
+// internal/commands/duel.go needs to render the result without a second
+// store round-trip, in the "persist first, display second" order C-2
+// established.
+//
+// The two payout fields are what was ACTUALLY CREDITED, which can be less
+// than DuelPayout returned when the winner was already at MaxChips. Render
+// these, never a recomputed 2 × bet, or the message will claim chips the
+// balance beside it does not show.
+type DuelSettlement struct {
+	ChallengerWins   bool
+	WinnerID         string
+	ChallengerPayout int64 // credited to the challenger (0 on a loss)
+	OpponentPayout   int64 // credited to the opponent (0 on a loss)
+	ChallengerChips  int64 // the challenger's balance after the settlement
+	OpponentChips    int64 // the opponent's balance after the settlement
+}
+
+// AcceptDuel stakes the opponent and settles the whole duel in ONE Update
+// (設計書 C-3b §4.5). challengerWins comes from FlipDuel, drawn by the
+// caller — the toss is injected rather than performed here so the settlement
+// is deterministic under test and so the store keeps no randomness of its
+// own beyond the daily-rate generator.
+//
+// One transaction is a requirement, not a convenience. Staking the opponent
+// and paying the winner through two separate Updates would leave a window in
+// which the opponent's chips are in escrow with no board that can release
+// them: a crash there strands the stake until the next startup refund, and a
+// concurrent second acceptance slips between the two halves and pays the pot
+// twice. Everything below runs under the single writer's lock, so the duel
+// either happens completely or not at all.
+//
+// Refusals and who they protect:
+//   - ErrDuelSelf — both sides are the same account (see errors.go).
+//   - ErrInvalidAmount — a bet outside [1, MaxChips]. The command layer's
+//     10..1,000 option bounds are a UX nicety, not a guarantee.
+//   - ErrNoGameInProgress — the challenger is not holding a duel stake. This
+//     is the double-settlement guard, and it is the reason the FIRST thing
+//     an acceptance does is zero that escrow: two buttons pressed in the same
+//     instant resolve on two goroutines, and the second one finds an escrow
+//     of 0 and pays nothing. EscrowGame is checked alongside the amount so a
+//     stale duel button cannot settle a blackjack hand the challenger opened
+//     afterwards.
+//   - ErrDuelStakeMismatch — the challenger's stake is not this bet, so the
+//     transfer would not be zero-sum (see errors.go).
+//   - ErrGameInProgress / *ErrInsufficientChips — the OPPONENT cannot cover
+//     the bet or is mid-game. 設計書 §4.5 is explicit that this does NOT
+//     refund the challenger: nothing at all is persisted, so the challenge
+//     stays live and the opponent can try again, decline, or let it expire.
+//
+// The settlement itself is zero-sum by construction: 2 × bet is taken out of
+// the two escrows and 2 × bet is credited to the winner. The one exception
+// is a winner already at MaxChips, who takes only what fits — the same
+// truncation every other payout in this package makes, and the reason
+// SeasonNet is fed the credited amount rather than the owed one (§2).
+func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (DuelSettlement, error) {
+	var result DuelSettlement
+	err := s.Update(func(d *Data) error {
+		if challengerID == opponentID {
+			return ErrDuelSelf
+		}
+		if bet < 1 || bet > MaxChips {
+			return ErrInvalidAmount
+		}
+		economy := ensureGuildLocked(d, guildID)
+		challenger := ensureAccountLocked(economy, challengerID)
+		opponent := ensureAccountLocked(economy, opponentID)
+
+		if challenger.Escrow == 0 || challenger.EscrowGame != string(GameDuel) {
+			return ErrNoGameInProgress
+		}
+		if challenger.Escrow != bet {
+			return ErrDuelStakeMismatch
+		}
+		if opponent.Escrow > 0 {
+			return ErrGameInProgress
+		}
+		// Stake the opponent through the same checked move every other game
+		// uses, so an opponent who cannot cover the bet is refused with the
+		// balance-carrying *ErrInsufficientChips and nothing is persisted.
+		// The escrow is released again three lines down; it exists for the
+		// width of this closure so that the debit is never written in a form
+		// that could outlive a failure below it.
+		if err := moveToEscrowLocked(opponent, bet); err != nil {
+			return err
+		}
+		opponent.EscrowGame = string(GameDuel)
+
+		challengerPayout, opponentPayout := DuelPayout(bet, challengerWins)
+		clearEscrowLocked(challenger)
+		clearEscrowLocked(opponent)
+		// Both escrows are zero before either credit, so each account's
+		// headroom (MaxChips - Escrow - Chips) is measured against chips the
+		// account actually still holds rather than against its own spent
+		// stake.
+		challengerCredited := creditChipsCappedLocked(challenger, challengerPayout)
+		opponentCredited := creditChipsCappedLocked(opponent, opponentPayout)
+		addSeasonNetLocked(challenger, challengerCredited-bet)
+		addSeasonNetLocked(opponent, opponentCredited-bet)
+
+		winnerID := opponentID
+		if challengerWins {
+			winnerID = challengerID
+		}
+		result = DuelSettlement{
+			ChallengerWins:   challengerWins,
+			WinnerID:         winnerID,
+			ChallengerPayout: challengerCredited,
+			OpponentPayout:   opponentCredited,
+			ChallengerChips:  challenger.Chips,
+			OpponentChips:    opponent.Chips,
+		}
+		return nil
+	})
+	if err != nil {
+		return DuelSettlement{}, err
+	}
+	return result, nil
+}
+
+// DeclineDuel returns the challenger's stake and closes the challenge — the
+// 🚫 button and the 3-minute sweeper both land here (設計書 §4.5). The
+// opponent never staked anything on a challenge that was not accepted, so
+// nothing of theirs is touched and no account of theirs is opened.
+//
+// 設計書 §4.5 words this as SettleGame(payout = bet); the refund is written
+// as moveFromEscrowLocked instead, which is the same outcome by a route that
+// cannot fail. A credit is capped at MaxChips, so a challenger whose balance
+// was hand-edited over the cap would have the excess DESTROYED by taking
+// their own stake back — and a refusal (ErrChipCapExceeded) would strand the
+// stake in escrow forever, locking the account out of every game. The move
+// is the exact inverse of the stake, so the sum Chips + Escrow lands exactly
+// where it started. That is the same reasoning, for the same reason, as
+// RefundStaleEscrows below.
+//
+// SeasonNet is untouched: a declined challenge is not a game result, and §3
+// counts only 勝敗.
+//
+// Returns ErrNoGameInProgress when the challenger holds no duel stake, which
+// is both halves of the double-refund guard: a 🚫 pressed twice, and — the
+// case that actually moves chips — a stale duel button pressed after the
+// challenger has opened some other game, which without the EscrowGame check
+// would refund that game's stake out from under its own board.
+func (s *Store) DeclineDuel(guildID, challengerID string) error {
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, challengerID)
+		if account.Escrow == 0 || account.EscrowGame != string(GameDuel) {
+			return ErrNoGameInProgress
+		}
+		moveFromEscrowLocked(account)
+		return nil
+	})
+}
+
 // RefundStaleEscrows returns every chip still held in escrow, in every
 // guild, to the account that staked it, and reports how many accounts were
 // refunded. cmd/bot calls it ONCE at startup (設計書 §3).

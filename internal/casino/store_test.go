@@ -4096,3 +4096,367 @@ func TestSpin_HandEditedJackpotAccumCannotWrapTheAccrual(t *testing.T) {
 			economy.JackpotAccum, wantAccum, jackpotAccumScale)
 	}
 }
+
+// --- duel (設計書 C-3b §4.5) ------------------------------------------------
+
+// duelOpponent is the second seat at the table; the challenger reuses the
+// escrow tests' escrowUser/escrowGuild so both families exercise the same
+// account shape.
+const duelOpponent = "user2"
+
+// openDuelChallenge puts bet chips of the challenger's into escrow under the
+// duel's game name — the state a pending challenge leaves behind.
+func openDuelChallenge(t *testing.T, st *Store, bet int64) {
+	t.Helper()
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), bet, fixedNow); err != nil {
+		t.Fatalf("OpenGame(duel) returned error: %v", err)
+	}
+}
+
+func assertSeasonNet(t *testing.T, path, guildID, userID string, want int64) {
+	t.Helper()
+	if got := readAccount(t, path, guildID, userID).SeasonNet; got != want {
+		t.Fatalf("%s SeasonNet = %d, want %d", userID, got, want)
+	}
+}
+
+// The duel's whole contract is that it is a transfer, not a game against the
+// house: 設計書 §2 forbids a cut here. So assert the SUM of the two accounts,
+// not just each payout — a house rake, a lost stake and a double credit all
+// show up as a change in the total, whichever side the coin landed on.
+func TestAcceptDuel_MovesThePotToTheWinnerAndKeepsTheTwoAccountsSummedUnchanged(t *testing.T) {
+	tests := []struct {
+		name                             string
+		challengerWins                   bool
+		wantChallengerChips              int64
+		wantOpponentChips                int64
+		wantChallengerNet, wantOpponnNet int64
+	}{
+		{
+			name: "the challenger calls it right", challengerWins: true,
+			wantChallengerChips: 1200, wantOpponentChips: 800,
+			wantChallengerNet: 200, wantOpponnNet: -200,
+		},
+		{
+			name: "the opponent calls it right", challengerWins: false,
+			wantChallengerChips: 800, wantOpponentChips: 1200,
+			wantChallengerNet: -200, wantOpponnNet: 200,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccounts(t, st, escrowGuild, map[string]UserAccount{
+				escrowUser:   {Chips: 1000},
+				duelOpponent: {Chips: 1000},
+			})
+			openDuelChallenge(t, st, 200)
+
+			got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, tc.challengerWins)
+			if err != nil {
+				t.Fatalf("AcceptDuel returned error: %v", err)
+			}
+
+			wantWinner := duelOpponent
+			wantChallengerPayout, wantOpponentPayout := int64(0), int64(400)
+			if tc.challengerWins {
+				wantWinner, wantChallengerPayout, wantOpponentPayout = escrowUser, 400, 0
+			}
+			want := DuelSettlement{
+				ChallengerWins:   tc.challengerWins,
+				WinnerID:         wantWinner,
+				ChallengerPayout: wantChallengerPayout,
+				OpponentPayout:   wantOpponentPayout,
+				ChallengerChips:  tc.wantChallengerChips,
+				OpponentChips:    tc.wantOpponentChips,
+			}
+			if got != want {
+				t.Fatalf("settlement = %+v, want %+v", got, want)
+			}
+
+			// Both escrows released and both game names cleared: a duel that
+			// left either side staked would lock that player out of every
+			// other game with no board able to settle them.
+			assertHoldings(t, path, escrowGuild, escrowUser, tc.wantChallengerChips, 0, "")
+			assertHoldings(t, path, escrowGuild, duelOpponent, tc.wantOpponentChips, 0, "")
+
+			// Zero-sum, stated over the persisted file rather than over the
+			// struct the call returned.
+			challenger := readAccount(t, path, escrowGuild, escrowUser)
+			opponent := readAccount(t, path, escrowGuild, duelOpponent)
+			total := challenger.Chips + challenger.Escrow + opponent.Chips + opponent.Escrow
+			if total != 2000 {
+				t.Fatalf("the two accounts hold %d chips between them, want the 2000 they started with — a duel is zero-sum (設計書 §2)", total)
+			}
+
+			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantChallengerNet)
+			assertSeasonNet(t, path, escrowGuild, duelOpponent, tc.wantOpponnNet)
+			// SeasonNet is a ranking figure, not currency: the two sides of a
+			// duel cancel exactly, so a season's totals cannot drift.
+			if challenger.SeasonNet+opponent.SeasonNet != 0 {
+				t.Fatalf("SeasonNet sums to %d, want 0", challenger.SeasonNet+opponent.SeasonNet)
+			}
+		})
+	}
+}
+
+// 設計書 §2: a winner already at the cap takes only the chips that fit, and
+// SeasonNet counts what actually landed — not what was owed. Counting the
+// owed amount would print a rank the balance beside it never earned.
+func TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, escrowGuild, map[string]UserAccount{
+		// 100 chips of headroom, with a 200-chip stake about to come out of
+		// it: after staking, the account can take back 300 of the 400 pot.
+		escrowUser:   {Chips: MaxChips - 100},
+		duelOpponent: {Chips: 1000},
+	})
+	openDuelChallenge(t, st, 200)
+
+	got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+	if err != nil {
+		t.Fatalf("AcceptDuel returned error: %v", err)
+	}
+	if got.ChallengerPayout != 300 {
+		t.Fatalf("ChallengerPayout = %d, want the 300 that fit under MaxChips (not the 400 owed)", got.ChallengerPayout)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips, 0, "")
+	assertHoldings(t, path, escrowGuild, duelOpponent, 800, 0, "")
+
+	// Received 300 against a 200 stake: +100, not the +200 an uncapped win
+	// would have paid.
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 100)
+	assertSeasonNet(t, path, escrowGuild, duelOpponent, -200)
+}
+
+// Every refusal must leave the challenge exactly as it found it. 設計書 §4.5
+// is explicit that a failed acceptance does NOT refund the challenger: the
+// board stays live so the opponent can find the chips, decline, or let it
+// expire.
+func TestAcceptDuel_RefusalsLeaveTheChallengersStakeExactlyWhereItWas(t *testing.T) {
+	tests := []struct {
+		name string
+		// setUp runs after the challenger's 200-chip duel stake is in place.
+		setUp     func(t *testing.T, st *Store)
+		opponent  string
+		bet       int64
+		wantErr   error
+		wantIsErr func(error) bool
+	}{
+		{
+			name: "the opponent cannot cover the bet",
+			setUp: func(t *testing.T, st *Store) {
+				seedAccounts(t, st, escrowGuild, map[string]UserAccount{duelOpponent: {Chips: 50}})
+			},
+			opponent: duelOpponent, bet: 200,
+			wantIsErr: func(err error) bool {
+				var insufficient *ErrInsufficientChips
+				return errors.As(err, &insufficient) && insufficient.Balance == 50
+			},
+		},
+		{
+			name: "the opponent is already mid-game",
+			setUp: func(t *testing.T, st *Store) {
+				seedAccounts(t, st, escrowGuild, map[string]UserAccount{duelOpponent: {Chips: 1000}})
+				if err := st.OpenGame(escrowGuild, duelOpponent, "blackjack", 100, fixedNow); err != nil {
+					t.Fatalf("seeding the opponent's blackjack hand: %v", err)
+				}
+			},
+			opponent: duelOpponent, bet: 200, wantErr: ErrGameInProgress,
+		},
+		{
+			// Both seats resolve to the SAME *UserAccount, so the settlement
+			// would stake one bet and pay out two.
+			name: "both seats are the same user", opponent: escrowUser, bet: 200, wantErr: ErrDuelSelf,
+		},
+		{name: "a bet of zero", opponent: duelOpponent, bet: 0, wantErr: ErrInvalidAmount},
+		{name: "a bet above the cap", opponent: duelOpponent, bet: MaxChips + 1, wantErr: ErrInvalidAmount},
+		{
+			// 300 would leave the table for the 350 that was staked.
+			name:     "the bet is not what the challenger staked",
+			opponent: duelOpponent, bet: 150, wantErr: ErrDuelStakeMismatch,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+			openDuelChallenge(t, st, 200)
+			if tc.setUp != nil {
+				tc.setUp(t, st)
+			}
+
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, tc.opponent, tc.bet, true)
+			if tc.wantIsErr != nil {
+				if !tc.wantIsErr(err) {
+					t.Fatalf("AcceptDuel error = %v, which is not the expected refusal", err)
+				}
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("AcceptDuel error = %v, want %v", err, tc.wantErr)
+			}
+
+			// The challenge survives, untouched, in every case.
+			assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, string(GameDuel))
+			assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+		})
+	}
+}
+
+// The store-level half of the double-settlement guard: the challenger must be
+// holding a DUEL stake of this size. Anything else is a button from a board
+// that is already spent.
+func TestAcceptDuel_RefusesWhenTheChallengerHoldsNoDuelStake(t *testing.T) {
+	tests := []struct {
+		name  string
+		setUp func(t *testing.T, st *Store)
+	}{
+		{name: "no game at all", setUp: func(t *testing.T, st *Store) {}},
+		{
+			// Without the EscrowGame check this would settle the blackjack
+			// hand's stake against a duel nobody is playing.
+			name: "some other game's stake",
+			setUp: func(t *testing.T, st *Store) {
+				if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 200, fixedNow); err != nil {
+					t.Fatalf("seeding the blackjack hand: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			seedAccounts(t, st, escrowGuild, map[string]UserAccount{
+				escrowUser:   {Chips: 1000},
+				duelOpponent: {Chips: 1000},
+			})
+			tc.setUp(t, st)
+
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+			if !errors.Is(err, ErrNoGameInProgress) {
+				t.Fatalf("AcceptDuel error = %v, want ErrNoGameInProgress", err)
+			}
+			// A refused acceptance must not have staked the opponent.
+			assertHoldings(t, path, escrowGuild, duelOpponent, 1000, 0, "")
+		})
+	}
+}
+
+func TestDeclineDuel_ReturnsEveryChipAndNeverTouchesTheOpponent(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+	openDuelChallenge(t, st, 200)
+
+	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+		t.Fatalf("DeclineDuel returned error: %v", err)
+	}
+
+	assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
+	// A declined challenge is not a game result (設計書 §3), so it must not
+	// move the season ranking.
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+	// The opponent staked nothing, so they must not even have an account
+	// opened for them — an auto-created account carries a welcome bonus,
+	// which would mint 1,000 chips for never pressing a button.
+	if account := readGuild(t, path, escrowGuild).Users[duelOpponent]; account != nil {
+		t.Fatalf("declining opened an account for the opponent: %+v", *account)
+	}
+}
+
+// A hand-edited balance over the cap keeps every chip through a decline. That
+// is why the refund is a move rather than a credit: a capped credit would
+// destroy the excess, and a refused one would strand the stake forever.
+func TestDeclineDuel_HandEditedOverTheCapKeepsEveryChip(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{
+		Chips:          MaxChips,
+		Escrow:         500,
+		EscrowGame:     string(GameDuel),
+		EscrowOpenedAt: fixedNow.In(jst).Format(time.RFC3339),
+	})
+
+	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+		t.Fatalf("DeclineDuel returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips+500, 0, "")
+}
+
+func TestDeclineDuel_RefusesASecondRefundAndAnotherGamesStake(t *testing.T) {
+	t.Run("a second decline", func(t *testing.T) {
+		st, path := newTempStore(t)
+		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+		openDuelChallenge(t, st, 200)
+		if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+			t.Fatalf("first DeclineDuel returned error: %v", err)
+		}
+
+		// Refunding again would mint 200 chips out of nothing.
+		if err := st.DeclineDuel(escrowGuild, escrowUser); !errors.Is(err, ErrNoGameInProgress) {
+			t.Fatalf("second DeclineDuel error = %v, want ErrNoGameInProgress", err)
+		}
+		assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
+	})
+
+	t.Run("a stale duel button after another game opened", func(t *testing.T) {
+		st, path := newTempStore(t)
+		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 200, fixedNow); err != nil {
+			t.Fatalf("OpenGame(blackjack) returned error: %v", err)
+		}
+
+		if err := st.DeclineDuel(escrowGuild, escrowUser); !errors.Is(err, ErrNoGameInProgress) {
+			t.Fatalf("DeclineDuel error = %v, want ErrNoGameInProgress", err)
+		}
+		// The blackjack stake survives for its own board to settle.
+		assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, "blackjack")
+	})
+}
+
+func TestAcceptDuel_ConcurrentAcceptancesSettleExactlyOnce(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, escrowGuild, map[string]UserAccount{
+		escrowUser:   {Chips: 1000},
+		duelOpponent: {Chips: 1000},
+	})
+	openDuelChallenge(t, st, 200)
+
+	// 50 goroutines race to accept the SAME challenge — a button double-tap,
+	// or the sweeper arriving while the opponent presses ⚔️. Exactly one may
+	// get through: a second settlement pays another 400-chip pot against a
+	// 200-chip stake that is no longer there.
+	const goroutines = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	otherErrs := []error{}
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, ErrNoGameInProgress):
+			default:
+				otherErrs = append(otherErrs, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(otherErrs) > 0 {
+		t.Fatalf("unexpected errors from concurrent AcceptDuel: %v", otherErrs)
+	}
+	if succeeded != 1 {
+		t.Fatalf("%d of %d concurrent AcceptDuel calls succeeded, want exactly 1", succeeded, goroutines)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1200, 0, "")
+	assertHoldings(t, path, escrowGuild, duelOpponent, 800, 0, "")
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 200)
+	assertSeasonNet(t, path, escrowGuild, duelOpponent, -200)
+}

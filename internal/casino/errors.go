@@ -29,6 +29,22 @@ var (
 	// inside the Update closure, so a refusal persists nothing.
 	ErrGameInProgress   = errors.New("casino: a game is already in progress")
 	ErrNoGameInProgress = errors.New("casino: no game in progress")
+	// ErrDuelSelf refuses a duel whose two sides are the same user. The
+	// command layer rejects this first with its own 「❌ 自分自身とは対戦
+	// できません」 (設計書 §4.5), so this is defense in depth — but of the
+	// arithmetic, not of the wording. ensureAccountLocked would hand back
+	// the SAME *UserAccount for both sides, and the settlement would then
+	// stake one bet, pay out two, and mint 2 × bet chips out of nothing.
+	ErrDuelSelf = errors.New("casino: cannot duel yourself")
+	// ErrDuelStakeMismatch means the challenger's escrow is not the bet the
+	// acceptance is settling. The duel is a zero-sum transfer only while the
+	// two stakes are equal: the pot paid to the winner is 2 × bet, so a
+	// challenger holding anything else in escrow makes the settlement create
+	// or destroy the difference. It can only be reached by a hand-edited
+	// file or a caller that lost track of its own board, and in both cases
+	// refusing (which persists nothing, leaving the escrow intact) is the
+	// only answer that cannot move chips.
+	ErrDuelStakeMismatch = errors.New("casino: challenger's escrow does not match the duel bet")
 )
 
 // ErrInsufficientChips carries the current balance so the command layer can
