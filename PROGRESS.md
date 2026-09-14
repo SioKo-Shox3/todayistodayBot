@@ -66,11 +66,18 @@
 - C2-07(`/blackjack` コマンド・ボタン・表示)= d5d30a5。`internal/commands/blackjack.go`: `/blackjack <bet>` は /highlow と同じガードと同じ順序、ナチュラルは配布時に精算して祝いを出す(応答は `ChannelMessageWithSource`、押下は `UpdateMessage`)。ボタンは 🃏 ヒット / ✋ スタンド / ⏫ ダブル、ダブルは「最初の判断」かつ「残高が 2 枚目の掛け金を賄える」ときだけ有効。ダブルは `CanDouble` → `AddToEscrow` → `Double` の順。検証出力: `.harness/runs/20260914-121315/verify-C2-07-{1,2,3}.txt`(build+vet clean / TestBlackjack 23 PASS / commands 全体 ok)。
 - C2-07 の評価者指摘(反復 7 の `NEEDS_WORK`)= 284c633。開始応答が失敗したときの `Close` → 返金が盤面ロックを取っていなかったため、⏫ ダブルの `AddToEscrow` と盤面適用の隙間に割り込むと追加ベットが返らなかった。`closeUndeliveredHand` が押下と同じ per-board ロックを取ってから閉じる — ダブルは必ず手を終わらせるので、押下が先に済めば `Close` は false を返して二重に払わない。回帰テストはチャネルでその順序を固定する(`stakeWatchingBank` が `AddToEscrow` の直後で止める)。ロックを外した木で 5/5 落ちることを確認済み: `.harness/runs/20260914-154156/finding-7-3-mutation.txt`。検証出力: 同ディレクトリの `finding-7-{1,2}.txt`(build+vet clean / `go test ./...` 8 パッケージ ok)。
 - C2-08(起動時の返金・Sweep goroutine・help・文書)= f3cdb69。`cmd/bot/main.go` は接続後に `casino.Default().RefundStaleEscrows(time.Now())` を呼んで件数をログし、掃除人 goroutine を 9 時掲示と同じ ctx で起動して、掲示と同じ理由でセッションを閉じる前に終了を待つ。本体は `internal/commands/casino_sessions.go`: 30 秒ごとに `Sweep` → `AutoResolve` → `SettleGame` → メッセージを「⌛ 時間切れ — 自動決着」に編集(チップが先、表示が後。編集失敗はログのみ)。`/help` は登録レジストリを読むので 2 本は自動で載る — `help_test.go` がそれを固定した。README にカジノ節を追加。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、正本への追記案を `blocked/C2-08.md` に置いた(**人が MyWorkflow 側へ写して再展開する**)。検証出力: `.harness/runs/20260914-154156/verify-C2-08-{1,2,3}.txt`(build+vet clean / `go test ./...` 8 パッケージ ok / `go build -o bin/todayistodaybot ./cmd/bot` exit=0)。
+- C3-08(掲示できなかった回の当選を取りこぼさない)= 6662270。`collectDailyAnnouncements` が job に載せる `LotteryDraw` の条件を `last.Date == today` から **`last.Date > economy.LastAnnounced`**(= まだ掲示していない回)へ変えた。9 時に Bot が落ちて翌朝復旧すると、起動時のロールオーバーが前日付の抽選を精算するため、今日の日付と一致せず**どの巡回でも二度と拾われない**当選者が出ていた。日付は両方 `"YYYY-MM-DD"` なので辞書順 = 時系列順、`LastAnnounced` の零値 `""` は全ての実日付より前に並ぶ(一度も掲示していないギルドの古い当選は 1 回だけ出て、送信成功で退役する)。重複掲示は `MarkAnnounced` が**送信成功時だけ**書くことで防がれる — 送信に失敗した回は次の巡回でまた対象になる。
+  文言も合わせた: `lotteryAnnounceLines` の見出しは `LastDraw.Date` から作る「🏆 7/10 の当選: …」で、日付の無い当選者なしは「🏆 前回の当選: 該当者なし — 賞金は繰り越し」。新しい `lotteryDrawDateLabel` は parse に失敗した日付を**そのまま**出す(手編集のファイルに embed で嘘の日付を言わせない)。
+  `TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot` は前提が「今日の日付と違う」から「もう掲示済み」へ変わるので `..._OmitsAnAlreadyAnnouncedDrawAndCarriesTheOpenPot` へ書き換えた(`LastAnnounced = 2026-07-02` を置き、7/1 の当選が出ないことを固定)。新規は `..._CarriesADrawTheOutageNeverAnnounced` — 7/9 まで掲示済み・7/10 の当選が残った状態で 7/11 に集めると 7/10 の当選が job に入り、`MarkAnnounced(7/11)` のあと 7/12 に集めると入らない。`st.rng = &lotteryRand{t: t, float: 0.5}`(rolls 空)にしてあるので、想定外の抽選が走ると `Intn` で落ちる。
+  検証出力: `.harness/runs/20260914-222248/verify-C3-08-{1,2,3,4}.txt`(build+vet exit=0 / casino 17 件 PASS / commands 15 件 PASS / `go test ./...` 8 パッケージ ok、いずれも exit=0)、`mutation-C3-08.txt`(条件を `last.Date == today` へ戻すと新テストが `job.LotteryDraw = <nil>` で落ちる)。
 
 ## In progress
 - (なし)
 
 ## Next
+- **次は C3-09**(`TASKS.md` の未完の先頭。「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す)。そのあと C3-10(💎💎💎 の説明)と、C3-08 が切り出した C3-11(設計書の掲示文言)。
+- **`NEXT_FINDINGS.md` の C3-07 所見 1・2・3 は未処理**(プールへの加算の桁あふれ / 当選者がいない回でハウス分が消える / `creditChipsCappedLocked` の headroom)。所見 2 は「通貨は消えない」に直接反するので、C3-09 より先に拾う価値がある。所見 1 は**設計判断が要る**(飽和加算で済ませるか、不正値の検査を 1 か所へ集約するか)ので、決められなければ `blocked/` へ落として親へ。
+- **掲示の `LotteryDraw` は「今日精算した回」ではなく「まだ掲示していない回」**(C3-08)。ここへ新しいフィルタ(日数の上限など)を足すと、また取りこぼしの経路ができる。古い当選が延々と出ないことを保証しているのは `LastAnnounced` の更新であって日付の一致ではない。
 - **`Carryover` は当選者がいなかった回だけの仕組みになった**(C3-07)。`internal/commands/casino_announce.go` の「該当者なし — 賞金は繰り越し」はこの経路にだけ出るので文言は正しいまま。今後「賞金の一部が次回へ」という UI を足さないこと — 当選者がいた回に繰り越しは発生しない。
 - **C3-07 は危険地帯なので Astra を 1 周かけた**(`codex exec -m gpt-6-astra -s read-only`、対象はこの差分のみ)。判定は `NEXT_FINDINGS.md` を見る — `NEEDS_WORK` があれば次の反復が C3-08 より先に処理する。
 - **次は C3-08**(`TASKS.md` の未完の先頭。C-3a 区切りレビューの blocking 2 件目)。
@@ -111,6 +118,7 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **設計書 `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61/69 行目の「昨日の当選」は C3-08 で実装とずれた** — `paths:` の外なので触らず C3-11 として切った。README には該当の文言は無い。
 - **`codex exec` は stdin を閉じないと無限に待つ**(2026-09-14, C3-07 の評価者で 22 分溶かした)。プロンプトを引数で渡しても
   `Reading additional input from stdin...` と出て**標準入力を読み続ける** — このハーネスの非対話シェルでは EOF が来ないので、
   CPU 0 % のまま生き続ける(「考えている」ように見えるが止まっている)。必ず `< /dev/null` を付け、出力は
