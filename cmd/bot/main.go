@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -20,6 +21,44 @@ func findCommandByName(cmds []commands.Command, name string) commands.Command {
 		if c.Definition().Name == name {
 			return c
 		}
+	}
+	return nil
+}
+
+// startupSteps is the boot order 設計書 §3 requires. The refund comes FIRST,
+// before a single interaction can reach the process: boards live only in
+// memory, so every escrow still on disk at boot belongs to a board that died
+// with the previous process — but that is only true until this process starts
+// taking bets. Opening the gateway or registering the commands first leaves a
+// window in which a fresh /blackjack stakes its chips and has them refunded
+// out from under it, after which settling that hand answers ErrNoGameInProgress
+// (反復 1 の指摘 1).
+//
+// The three steps are fields rather than straight-line code so a test can
+// assert the ORDER — the property that broke — without a Discord connection.
+type startupSteps struct {
+	refundStaleEscrows func() (int, error)
+	openSession        func() error
+	registerCommands   func() error
+}
+
+// run performs the steps in order and stops at the first failure. A refund
+// that did not happen must not be followed by an open gateway: the bot would
+// then accept games while stale escrow still blocks those very accounts
+// ("進行中のゲームがあります")。Startup failures are fatal for the caller, the
+// same as a missing token.
+func (s startupSteps) run() error {
+	refunded, err := s.refundStaleEscrows()
+	if err != nil {
+		return fmt.Errorf("refunding stale escrows: %w", err)
+	}
+	slog.Info("casino: refunded stale escrows", "accounts", refunded)
+
+	if err := s.openSession(); err != nil {
+		return fmt.Errorf("opening the discord session: %w", err)
+	}
+	if err := s.registerCommands(); err != nil {
+		return fmt.Errorf("registering application commands: %w", err)
 	}
 	return nil
 }
@@ -73,31 +112,27 @@ func main() {
 
 	session.Identify.Intents = discordgo.IntentsNone
 
-	if err := session.Open(); err != nil {
-		slog.Error("failed to open discord session", "error", err)
+	if err := (startupSteps{
+		refundStaleEscrows: func() (int, error) { return casino.Default().RefundStaleEscrows(time.Now()) },
+		openSession:        session.Open,
+		registerCommands: func() error {
+			for _, cmd := range all {
+				if _, err := session.ApplicationCommandCreate(session.State.User.ID, "", cmd.Definition()); err != nil {
+					return fmt.Errorf("%s: %w", cmd.Definition().Name, err)
+				}
+			}
+			return nil
+		},
+	}).run(); err != nil {
+		slog.Error("failed to start the bot", "error", err)
 		os.Exit(1)
 	}
 	defer session.Close()
-
-	for _, cmd := range all {
-		if _, err := session.ApplicationCommandCreate(session.State.User.ID, "", cmd.Definition()); err != nil {
-			slog.Error("failed to register application command", "name", cmd.Definition().Name, "error", err)
-			os.Exit(1)
-		}
-	}
 
 	slog.Info("bot is running", "registered_commands", len(all))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// フェーズC-2: 盤面はメモリにしか無いので、起動時に残っている預かりは
-	// 「プロセスと一緒に消えた盤面」と同義(設計書 §3)。件数だけログに残す。
-	if refunded, err := casino.Default().RefundStaleEscrows(time.Now()); err != nil {
-		slog.Error("casino: refunding stale escrows failed", "error", err)
-	} else {
-		slog.Info("casino: refunded stale escrows", "accounts", refunded)
-	}
 
 	// フェーズC-1: 毎朝9:00 JSTのレート掲示スケジューラ(起動直後に1回パスを走らせる)
 	waitScheduler := commands.StartCasinoAnnounceScheduler(ctx, session)
