@@ -105,3 +105,22 @@ C3-07 で「当選者がいた回の繰り越し」は無くなったのに、�
 - `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
 - `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced" -count=1`
 - `go test ./internal/commands/... -run "TestAnnounce|TestBuildAnnouncement" -count=1`
+
+## 反復 3 — 評価者(codex)の判定: NEEDS_WORK
+
+対象: C3-09 「次回抽選」を呼び出し時刻ではなく確定済みの抽選日から出す(所見 3)
+
+**[P2] 未抽選状態の購入・statusテストが不足しています。** `done-when` が指定する `DrawDate == ""` のケースが、[store_test.go:3258](C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/store_test.go:3258) の表にありません。当日抽選済み・前日抽選済みの2例だけです。空文字は補助関数の単体テストでのみ検証されています。
+
+最小修正は、購入・statusそれぞれを未抽選の独立したStoreから呼び、`now = 2026-09-14 08:59:59 JST` で `NextDrawAt == nextRunAt(now)`（同日09:00）を確認するテストの追加です。
+
+実装はロールオーバー後の `DrawDate` を両方で使用し、指定された「遅い方」の算出になっています。`nextRunAt` は変更されておらず、実装差分も対象パス内です。
+
+証拠ファイル `verify-C3-09-{1,2,3}.txt` と `recheck-C3-09-3-{1,2,3}.txt` を開き、全件 `exit=0`、全8パッケージ `ok` を確認しました。mutationの保存出力では旧呼び出しに戻すと追加テストが失敗しています。
+
+再検証できなかったコマンド（いずれも作業ディレクトリ作成時の `Access is denied`。合格には算入していません）:
+
+- `go build ./... && go vet ./...`：build開始前に停止、vet未到達。
+- `go test ./internal/casino/... -run "TestLottery|TestNextRunAt|TestNextLotteryDraw|TestBuyLottery" -count=1`
+
+`go test ./... -count=1` は再実行せず、保存出力のみ確認しました。
