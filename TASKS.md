@@ -121,7 +121,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: `main.go` の変更は C2-01 の分岐と合わせて 3 点(§12)。README は公開物 — 過程を書かない。
 
 ## C2-09: README のコマンド一覧に C-1 のカジノ 7 コマンドを足す
-- status: todo
+- status: done
 - done-when: `README.md` の「カジノ」節に `/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` を、各コマンドの `Definition()` の説明・オプションと矛盾しない形で足す(C2-08 で `/highlow` `/blackjack` だけが載っている状態を解消する)。文書のみで実装は変えない。
 - verify: `go build ./... && go vet ./...`
 - paths: README.md
