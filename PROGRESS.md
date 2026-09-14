@@ -14,13 +14,15 @@
 - R-004(配備先で `data/` に書けない)= 3d829b4。unit に `ReadWritePaths=/opt/todayistodaybot/data`、Dockerfile に `WORKDIR /app` + `botuser` 所有の `/app/data` + `VOLUME`、README に「データ保存先（配備時）」節。検証出力: `.harness/runs/20260914-105906/verify-R-004-{1,2,3}.txt`。
 
 ## In progress
-- (いま手を付けているタスク id と、どこまで進んだか)
+- (なし)
 
 ## Next
+- **C-1 は完了**(2026-09-14: R-001〜R-004 着地、Astra 2 周目 PASS、`main` へ ff マージ)。次は稼働(トークンと実行場所はユーザー判断)か C-2(ボタン基盤+ハイ&ロー+ブラックジャック、未設計 → M1 から)。
 - `TASKS.md` の未完は無し(R-001〜R-004 すべて done)。次は R-003 修正差分の評価者 2 周目(前回指摘への対応差分だけを見る)。
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **2 周目で残った non-blocking(残課題)**: 掲示送信成功〜`MarkAnnounced` 保存の間の障害で再掲示 / 送信中 cancel の停止期限なし / 時計巻き戻り時の掲示見出しと履歴末尾のずれ(表示のみ)/ 実配備での書き込み確認と Docker ビルドは未検証(この PC に Docker 無し)。
 - **応答の規律(R-003 修正で決めた)**: `internal/commands` のハンドラは `s.InteractionRespond` を直接呼ばず `respond()` を通す。`cmd/bot` が戻り値をログへ出すので、直呼びはトークンをログへ戻す。`respond_test.go` の `TestNoDirectInteractionRespond` がソース走査で禁じている(`casino_shared.go` だけ除外 — そこが実装)。
 - **配備の前提(R-004)**: 保存先は作業ディレクトリ相対の `data/` 固定(上書きする環境変数は無い)。systemd は `/opt/todayistodaybot/data` を**人が先に作って chown する**必要がある(unit は作らない。`StateDirectory=` にするならコード側に保存先の環境変数が要る — C-2 の判断)。`systemd-analyze verify` はこの PC では `ExecStart` のバイナリが無いので必ず `exit=1` になる。構文だけ見るときは `ExecStart` を `/bin/true` に差し替えた写しを検証する。
 - **`docker build` は未実行**(この PC に Docker が無い)。Dockerfile の変更は目視のみ — 稼働前に一度ビルドすること。
