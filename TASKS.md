@@ -274,7 +274,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - paths: README.md, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: README は公開物 — 過程を書かない。
 
-## C3-11: 設計書の掲示文言を「昨日の当選」から実際の抽選日へ合わせる
+## C3-11b: 設計書の掲示文言を「昨日の当選」から実際の抽選日へ合わせる
 - status: done
 - done-when: C3-08 で 9 時掲示の見出しが `LastDraw.Date` 由来の「M/D の当選」(当選者なしは「前回の当選」)に変わったので、`Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61 行目・69 行目の「昨日の当選」の記述を実装に合わせて直す。掲示対象が「今日精算した回」ではなく「まだ掲示していない回」になったことも 1 行で書く。コードは触らない。
 - verify: `go build ./... && go vet ./...`
