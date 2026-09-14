@@ -240,12 +240,54 @@ const welcomeBonusChips = 1000
 
 // ensureAccountLocked returns economy's account for userID, auto-creating
 // it with the 1,000-chip welcome bonus if this is userID's first casino
-// interaction in this guild. Caller must already hold the Store's lock.
+// interaction in this guild, and normalising the balances it hands back.
+// Caller must already hold the Store's lock.
 func ensureAccountLocked(economy *GuildEconomy, userID string) *UserAccount {
 	if economy.Users[userID] == nil {
 		economy.Users[userID] = &UserAccount{Chips: welcomeBonusChips}
 	}
-	return economy.Users[userID]
+	account := economy.Users[userID]
+	normalizeAccountLocked(account)
+	return account
+}
+
+// normalizeAccountLocked is the account's normalisation point, the third of
+// the same kind in this package: seedJackpotLocked does it for the pool and
+// normalizeLotteryLocked for the lottery pot. After it returns, Chips and
+// Escrow are in [0, MaxChips] and Coins is in [0, MaxCoins], so every sum
+// and difference the balance arithmetic computes is inside the range
+// types.go sized it for — whatever was on disk.
+//
+// It buys the headroom subtractions in particular. creditChipsCappedLocked
+// computes MaxChips - Escrow - Chips, which on a hand-edited
+// Chips = Escrow = math.MaxInt64 file wraps to a large POSITIVE number: the
+// credit is then let through and lands the account on a NEGATIVE balance.
+// The fix belongs here rather than in the subtraction, because bolting a
+// guard onto each individual sum fixes the one expression it names and
+// leaves the next one (totalAssetsLocked, the escrow moves) still wrong —
+// the same argument normalizeLotteryLocked's comment makes at length.
+//
+// Clamping the MAGNITUDE means a hand-edited balance above the cap loses
+// what does not fit, at the first write path that reads it. That is the
+// deliberate trade: a number outside the cap is outside every invariant
+// this package maintains, and reading it as-is corrupts accounts that were
+// never edited (the pool, the ranking) rather than just the edited one.
+func normalizeAccountLocked(account *UserAccount) {
+	if account.Chips < 0 {
+		account.Chips = 0
+	} else if account.Chips > MaxChips {
+		account.Chips = MaxChips
+	}
+	if account.Escrow < 0 {
+		account.Escrow = 0
+	} else if account.Escrow > MaxChips {
+		account.Escrow = MaxChips
+	}
+	if account.Coins < 0 {
+		account.Coins = 0
+	} else if account.Coins > MaxCoins {
+		account.Coins = MaxCoins
+	}
 }
 
 // creditChipsLocked adds delta to account.Chips, refusing to push the
@@ -1207,6 +1249,16 @@ func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 	sold, buyers, _ := lotterySummaryLocked(lottery)
 	winner := PickLotteryWinner(lottery.Tickets, rng)
 	if winner == "" {
+		// The prize rolls forward, but the house's cut takes the SAME road it
+		// takes on a draw that named somebody — into the pool. Leaving it out
+		// destroyed it: on the normal quiet day sales are 0 and so is the cut,
+		// but a pot holding sales with no ticket holders (a hand-edited file,
+		// or a partial write between the debit and Tickets) rolls only
+		// floor(sales*90/100) forward and drops the remainder on the floor.
+		// 設計書 C-3a §3 puts the cut in the pool unconditionally, and C3-07
+		// settled the rule it follows from: chips leave circulation only where
+		// a cap refuses them.
+		creditJackpotCappedLocked(economy, house)
 		lottery.Carryover = prize
 		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 		return

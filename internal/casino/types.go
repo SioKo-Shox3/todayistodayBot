@@ -159,6 +159,17 @@ type UserAccount struct {
 // is — even one that has already wrapped somewhere upstream. The overflow
 // is not merely unlikely here, it is unreachable.
 //
+// Account balances are held in range by the same device: normalizeAccountLocked
+// pins Chips and Escrow into [0, MaxChips] and Coins into [0, MaxCoins] at
+// ensureAccountLocked, the one read point every write path passes through.
+// The caps alone are not enough for that — they are enforced by the credit
+// paths, which is exactly what a hand-edited file bypasses. With the clamp,
+// the headroom subtractions (MaxChips - Escrow - Chips in
+// creditChipsCappedLocked, MaxChips - Escrow in creditChipsLocked) are
+// evaluated on operands no larger than 1e12, so the widest intermediate is
+// -2e12 and cannot wrap; without it, Chips = Escrow = math.MaxInt64 makes
+// the first of those wrap POSITIVE and a credit lands on a negative balance.
+//
 // The daily lottery's pot is bounded by the same value through the same
 // device: normalizeLotteryLocked pins Sales and Carryover into [0, MaxChips]
 // at the one read point every caller passes through, so the widest

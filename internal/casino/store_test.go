@@ -3225,6 +3225,142 @@ func TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult(t *testin
 	}
 }
 
+// TestLotteryDraw_NoWinnerConservesEveryChipOfTheSales is the conservation
+// law stated for the branch that names nobody: whatever the pot held,
+//
+//	Δ(all chips) + Δ(jackpot pool) + Δ(carryover) = the sales the draw consumed.
+//
+// The branch used to keep only the prize (Carryover = prize) and drop the
+// house's cut, which is invisible on a normal quiet day — no buyers means no
+// sales means no cut — and costs real chips on a pot that holds sales with
+// no ticket holders. Only a hand edit or a write that landed between the
+// chip debit and Tickets produces that pot, which is why it is seeded
+// directly here rather than bought.
+func TestLotteryDraw_NoWinnerConservesEveryChipOfTheSales(t *testing.T) {
+	st, path := newTempStore(t)
+	// No rolls: a draw with no ticket holders must not reach the rng at all.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 1000})
+	seedJackpot(t, st, guildID, JackpotSeed, 0)
+	const sales = int64(100)
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, guildID).Lottery
+		lottery.Sales, lottery.Carryover, lottery.Tickets = sales, 0, nil
+		lottery.DrawDate = jstDate(fixedNow)
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the ticket-less pot: %v", err)
+	}
+	before := readGuild(t, path, guildID)
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate on the draw day: %v", err)
+	}
+
+	after := readGuild(t, path, guildID)
+	chips := totalChips(after) - totalChips(before)
+	pool := after.Jackpot - before.Jackpot
+	carry := after.Lottery.Carryover - before.Lottery.Carryover
+	if chips+pool+carry != sales {
+		t.Fatalf("chips %+d + pool %+d + carryover %+d = %d, want %d (the sales the draw consumed): the draw is not conserving chips",
+			chips, pool, carry, chips+pool+carry, sales)
+	}
+	// And the split itself: 90% forward, the 10% cut into the pool.
+	if chips != 0 {
+		t.Fatalf("accounts moved by %+d, want 0 — a draw with no winner pays nobody", chips)
+	}
+	if pool != 10 {
+		t.Fatalf("the jackpot pool gained %d, want 10 (= sales - floor(sales*90/100)): the house's cut is not reaching the pool",
+			pool)
+	}
+	if after.Lottery.Carryover != 90 {
+		t.Fatalf("Carryover = %d, want 90 (= floor(sales*90/100), the whole prize)", after.Lottery.Carryover)
+	}
+	if after.Lottery.Sales != 0 || after.Lottery.DrawDate != jstDate(daysAfter(1)) {
+		t.Fatalf("the pot was not reopened on the settled day: Sales %d, DrawDate %q (want 0 and %q)",
+			after.Lottery.Sales, after.Lottery.DrawDate, jstDate(daysAfter(1)))
+	}
+	if after.Lottery.LastDraw != nil || len(after.Lottery.Unannounced) != 0 {
+		t.Fatalf("LastDraw = %+v / Unannounced = %+v, want both empty — a draw that named nobody is not a result",
+			after.Lottery.LastDraw, after.Lottery.Unannounced)
+	}
+}
+
+// TestEnsureAccount_NormalisesHandEditedBalances pins the account's
+// normalisation point. The property is the same one seedJackpotLocked and
+// normalizeLotteryLocked establish for the pool and the pot: after the one
+// read point every write path goes through, the balances are inside the
+// range types.go sized the arithmetic for, whatever was on disk. The table
+// therefore holds values no legitimate sequence can produce.
+func TestEnsureAccount_NormalisesHandEditedBalances(t *testing.T) {
+	cases := []struct {
+		name     string
+		in, want UserAccount
+	}{
+		{"in range is left alone", UserAccount{Chips: 800, Escrow: 200, Coins: 5}, UserAccount{Chips: 800, Escrow: 200, Coins: 5}},
+		{"exactly at the caps is left alone", UserAccount{Chips: MaxChips, Escrow: MaxChips, Coins: MaxCoins}, UserAccount{Chips: MaxChips, Escrow: MaxChips, Coins: MaxCoins}},
+		{"MaxInt64 balances come back to the caps", UserAccount{Chips: math.MaxInt64, Escrow: math.MaxInt64, Coins: math.MaxInt64}, UserAccount{Chips: MaxChips, Escrow: MaxChips, Coins: MaxCoins}},
+		{"negative balances come back to zero", UserAccount{Chips: -1, Escrow: math.MinInt64, Coins: -7}, UserAccount{}},
+		{"one field over does not disturb the others", UserAccount{Chips: MaxChips + 1, Escrow: 200, Coins: 5}, UserAccount{Chips: MaxChips, Escrow: 200, Coins: 5}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, path := newTempStore(t)
+			const guildID, userID = "guild1", "u1"
+			// seedAccounts writes the struct straight into the map, so the
+			// out-of-range value actually reaches the file.
+			seedAccounts(t, st, guildID, map[string]UserAccount{userID: tc.in})
+
+			if _, err := st.ViewAccount(guildID, userID, fixedNow); err != nil {
+				t.Fatalf("ViewAccount: %v", err)
+			}
+
+			got := readAccount(t, path, guildID, userID)
+			if got.Chips != tc.want.Chips || got.Escrow != tc.want.Escrow || got.Coins != tc.want.Coins {
+				t.Fatalf("after one read: Chips %d / Escrow %d / Coins %d, want %d / %d / %d",
+					got.Chips, got.Escrow, got.Coins, tc.want.Chips, tc.want.Escrow, tc.want.Coins)
+			}
+		})
+	}
+}
+
+// TestCreditChipsCapped_HandEditedMaxInt64DoesNotWrapTheHeadroom is the
+// overflow regression the normalisation exists for. creditChipsCappedLocked
+// computes MaxChips - Escrow - Chips; on Chips = Escrow = math.MaxInt64 that
+// subtraction wraps to a large POSITIVE headroom, the credit is let through,
+// and the account lands on a NEGATIVE balance — chips created out of a cap
+// that was supposed to refuse them. Reading through ensureAccountLocked
+// first is what makes the expression's operands small enough to be safe, so
+// the fix is pinned here rather than at the subtraction.
+func TestCreditChipsCapped_HandEditedMaxInt64DoesNotWrapTheHeadroom(t *testing.T) {
+	st, path := newTempStore(t)
+	const guildID, userID = "guild1", "u1"
+	seedAccounts(t, st, guildID, map[string]UserAccount{
+		userID: {Chips: math.MaxInt64, Escrow: math.MaxInt64, Coins: math.MaxInt64},
+	})
+
+	var credited int64
+	if err := st.Update(func(d *Data) error {
+		account := ensureAccountLocked(ensureGuildLocked(d, guildID), userID)
+		credited = creditChipsCappedLocked(account, 1000)
+		return nil
+	}); err != nil {
+		t.Fatalf("crediting the hand-edited account: %v", err)
+	}
+
+	if credited != 0 {
+		t.Fatalf("credited %d chips to an account already at the cap, want 0", credited)
+	}
+	got := readAccount(t, path, guildID, userID)
+	if got.Chips < 0 || got.Escrow < 0 {
+		t.Fatalf("balances went negative: Chips %d / Escrow %d — the headroom subtraction wrapped", got.Chips, got.Escrow)
+	}
+	if got.Chips != MaxChips || got.Escrow != MaxChips {
+		t.Fatalf("balances = Chips %d / Escrow %d, want both %d (the cap)", got.Chips, got.Escrow, MaxChips)
+	}
+}
+
 // TestLotteryDraw_RunsAtMostOncePerDay is the double-payout regression. Every
 // command goes through the rollover, so the guard has to hold across repeated
 // touches of any kind — and across a clock that moves BACKWARDS, which is why

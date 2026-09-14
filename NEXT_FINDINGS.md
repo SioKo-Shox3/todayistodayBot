@@ -7,18 +7,9 @@
 
 所見 1(プールへの加算に桁あふれ検査が無い)は **C3-11 で閉じた** — `MaxJackpot`(= `MaxChips` = 1e12)を敷き、
 プールへの加算を `creditJackpotCappedLocked` 1 か所に集め、`seedJackpotLocked` を正規化点にした。
-**残っているのは所見 2・3・4 で、いずれもまだタスクになっていない。**
-
-### 2. [P2, 差分外] 当選者がいない回でハウス分が消える(`internal/casino/store.go` 1085)
-
-`winner == ""` の経路は `lottery.Carryover = prize` だけを残し、`house` をどこにも入れていない。
-売上 100・券なしなら 90 だけが繰り越り、**ハウス分 10 が消える**(プールにも入らない)。
-C-1 の「丸め損は常にハウス側」と C3-07 で決めた「通貨は消えない」の両方に反する。C3-07 と同じ結論
-(`Jackpot += house`)で直せるはずだが、`paths:` の外なので別タスクに切ること。
-
-### 3. [P2, 差分外] `creditChipsCappedLocked` の `headroom` があふれる
-
-`MaxChips - account.Escrow - account.Chips` は `Chips = Escrow = MaxInt64` のハンド編集であふれる。上の 1 と同じ系統。
+所見 2(当選者がいない回のハウス分)と所見 3(`creditChipsCappedLocked` の `headroom`)は **C3-14 で閉じた** —
+前者は `winner == ""` の経路も `creditJackpotCappedLocked` を通し、後者は `ensureAccountLocked` を口座の正規化点にした。
+**残っているのは所見 4 だけで、C3-15 になっている。**
 
 ### 4. [P3] 旧挙動を書いたコメントが残っている(`internal/commands/casino_announce.go` 108 付近)
 
