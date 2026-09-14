@@ -296,7 +296,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced|TestLottery|TestStore" -count=1`
 - verify: `go test ./... -count=1`
-- paths: internal/casino/types.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- paths: internal/casino/types.go, internal/casino/announce.go, internal/casino/announce_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/commands/casino_announce.go, internal/commands/casino_announce_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: 既存 JSON(`unannounced` 無し)はそのまま読める(`omitempty` + nil スライス)。設計書 §3 の掲示の節に「掲示待ちは並べて持ち、送信成功で消す(最大 7 件)」を書く。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
 
 ## C3-13: 永続化された数値を読み取り点で正規化し、算術の桁あふれを一箇所で断つ(C3-11 の差し戻し)
