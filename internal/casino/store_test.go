@@ -5429,3 +5429,56 @@ func TestStore_SeasonStatus_NormalisesHandEditedNets(t *testing.T) {
 		t.Errorf("Ranks[0] = %+v, want the edited account clamped to %d", view.Ranks[0], MaxChips)
 	}
 }
+
+// Two reads that straddle midnight can arrive in the reverse order of the
+// instants they carry (each reads its clock before taking the lock), and the
+// month is persisted while the days left are computed. The late arrival is
+// shown the season the earlier one opened, so it must be shown THAT month's
+// remaining days — not 「8月・残り1日」, a month that has just begun reported
+// as ending tonight.
+func TestStore_SeasonStatus_LateArrivalCountsTheMonthItIsShown(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccounts(t, st, seasonGuild, map[string]UserAccount{
+		"player": {Chips: 1_000, SeasonNet: 500},
+	})
+
+	if _, err := st.SeasonStatus(seasonGuild, "player", time.Date(2026, 8, 1, 0, 0, 0, 0, jst)); err != nil {
+		t.Fatalf("SeasonStatus (opening August) returned error: %v", err)
+	}
+	view, err := st.SeasonStatus(seasonGuild, "player", time.Date(2026, 7, 31, 23, 59, 59, 0, jst))
+	if err != nil {
+		t.Fatalf("SeasonStatus returned error: %v", err)
+	}
+
+	if view.Month != "2026-08" {
+		t.Fatalf("Month = %q, want %q — the rollover is forward only", view.Month, "2026-08")
+	}
+	if view.DaysLeft != 31 {
+		t.Errorf("DaysLeft = %d, want 31 (August in full), not July's last day counted against August", view.DaysLeft)
+	}
+}
+
+// The ordinary case is unchanged: a reader inside the month it is shown gets
+// that day's own count, and a season_month no one can parse falls back to the
+// caller's instant rather than to a guessed length.
+func TestSeasonDaysLeftIn_InsideTheMonthAndOnAnUnreadableOne(t *testing.T) {
+	cases := []struct {
+		name  string
+		month string
+		now   time.Time
+		want  int
+	}{
+		{"last day of the month", "2026-07", seasonJuly, 1},
+		{"first day of the month", "2026-08", time.Date(2026, 8, 1, 0, 30, 0, 0, jst), 31},
+		{"february in a leap year", "2028-02", time.Date(2028, 2, 10, 12, 0, 0, 0, jst), 20},
+		{"hand-edited month", "not-a-month", seasonJuly, 1},
+		{"never opened", "", seasonJuly, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := seasonDaysLeftIn(tc.month, tc.now); got != tc.want {
+				t.Fatalf("seasonDaysLeftIn(%q, %s) = %d, want %d", tc.month, tc.now.Format(time.RFC3339), got, tc.want)
+			}
+		})
+	}
+}

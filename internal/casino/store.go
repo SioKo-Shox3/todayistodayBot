@@ -662,6 +662,40 @@ func SeasonDaysLeft(now time.Time) int {
 	return lastOfMonth.Day() - t.Day() + 1
 }
 
+// seasonDaysLeftIn reports the days left in the season labelled `month`
+// ("2006-01") when it is being read at `now` — the number that belongs
+// BESIDE that month, which is not always SeasonDaysLeft(now).
+//
+// The two come apart at a month boundary, because they have different
+// sources. The month a reader is shown is the PERSISTED SeasonMonth, which
+// rolloverSeasonLocked only ever moves forward (a discipline it shares with
+// LastAnnounced), while `now` is the instant its own caller read before
+// taking the lock. Two /season invocations that straddle midnight can
+// therefore reach the store in the reverse order of the instants they
+// carry: the first opens 2026-08, and the second, holding 23:59:59 on
+// 07-31, is handed the 8月 table and would count July's last day against
+// it — 「8月・残り1日」, a month that has just begun reported as ending
+// tonight.
+//
+// A lagging `now` is pulled up to the first midnight of `month`, so the
+// answer is the one that month's own reader would get. It cannot lag the
+// other way: the rollover runs inside this same Update, so SeasonMonth is
+// never behind now's month by the time this is asked.
+//
+// An unparseable month (a hand-edited season_month) falls back to `now`
+// rather than guessing a length — the same rule lotteryDrawDateLabel
+// follows for a date it cannot read.
+func seasonDaysLeftIn(month string, now time.Time) int {
+	start, err := time.ParseInLocation("2006-01", month, jst)
+	if err != nil {
+		return SeasonDaysLeft(now)
+	}
+	if now.In(jst).Before(start) {
+		return SeasonDaysLeft(start)
+	}
+	return SeasonDaysLeft(now)
+}
+
 // SeasonStatus returns guildID's season as userID sees it, opening the
 // account (welcome bonus) and running the daily rollover first — the same
 // entry every other read path uses. Going through the rollover is what stops
@@ -696,7 +730,9 @@ func (s *Store) SeasonStatus(guildID, userID string, now time.Time) (SeasonView,
 			Ranks:    ranked,
 			Self:     SeasonRank{UserID: userID, Net: account.SeasonNet},
 			Players:  len(ranked),
-			DaysLeft: SeasonDaysLeft(now),
+			// Counted against the month being SHOWN, not against `now`:
+			// see seasonDaysLeftIn for why the two can disagree.
+			DaysLeft: seasonDaysLeftIn(economy.SeasonMonth, now),
 		}
 		for i, rank := range ranked {
 			if rank.UserID == userID {
