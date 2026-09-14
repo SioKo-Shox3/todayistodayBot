@@ -4,6 +4,12 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3-15(未抽選の「次回抽選」テストを足し、旧挙動のコメントを消す)= コミット `95a6347`。`NEXT_FINDINGS.md` を見出しだけに戻した(C3-09 の差し戻し・所見 4・C3-12 の paths 違反の 3 節を削除)。
+  **(1) 未抽選のケース**: `TestBuyLotteryTickets_ReportsTheDrawTheTicketsAreActuallyIn` の表に「the guild has never drawn」を足した。**既存 2 ケースは購入の中で抽選が走らない** — どちらも `DrawDate` が `lotteryDrawDate(08:59:59)` 以上で `drawLotteryLocked` が即 return する。`DrawDate == ""` だけが `"" < "2026-09-13"` でロールオーバーを実際に走らせる経路で、そこが表に無かった。売上も券も 0 なので `PickLotteryWinner` は `rng` を読まずに `""` を返し(`total <= 0` の早期 return)、rolls 空の `lotteryRand` のままで足りる。
+  **効き目の確認**: 当選者なしの経路の `DrawDate` スタンプを抽選日(9/13)から暦日(9/14)へ変えると、**新ケースだけが** `NextDrawAt = 2026-09-15 09:00` で落ち、既存 2 ケースは通る(`mutation-C3-15-never-drawn.txt`)。9 時間のずれ(`lotteryDrawDate` の `Hour() < 9` 補正)を踏み抜く唯一のケースになっている。
+  **表に `now` の列を足した**のは、追加ケースだけ別の日付の時計(2026-09-14 08:59:59)が要るため。既存 2 行は `now: justBeforeNine` を明示しただけで、`lastDrawDate` も `want` も不変。
+  **(2) 旧挙動のコメント**: C3-07 で「上限で入り切らなかった賞金はプールへ」に変わったのに、3 か所が「the pot rolls forward」のままだった — `casino_announce.go` の `lotteryAnnounceCelebration` の doc(134 行)、`casino_announce_test.go` の 324・475 行。**`casino_announce.go` 85 行と `..._test.go` 287 行は直していない** — こちらは「購入者 0 の日」の話で、当選者がいない回の繰り越しは今も本当。
+  検証出力: `.harness/runs/20260915-022052/verify-C3-15-{1,2,3}.txt`(build+vet exit=0 / casino 対象テスト ok / `go test ./...` 8 パッケージ ok、いずれも exit=0)、`verify-C3-15-4-subtests.txt`(3 サブテスト PASS)、`mutation-C3-15-never-drawn.txt`。
 - C3-14(当選者がいない回のハウス分をプールへ送り、口座の空き計算のあふれを正規化で断つ)= コミット `6b2f696`。`NEXT_FINDINGS.md`「C3-07 の区切り評価」の所見 2・3 を閉じた(節から削除済み。残りは所見 4 = C3-15 のみ)。
   **(1) 当選者がいない回のハウス分**: `drawLotteryLocked` の `winner == ""` の経路は `lottery.Carryover = prize` だけを残していた。**通常の閑散日は売上 0 なのでハウス分も 0 で、この穴は見えない** — 券が 1 枚も無いのに売上が載っているポット(手編集、またはチップの引き落としと `Tickets` の間に落ちた部分書き込み)でだけ、繰り越しに乗らない `sales - floor(sales*90/100)` が消える。当選者がいた回とまったく同じ `creditJackpotCappedLocked(economy, house)` を通すようにした(この関数が内部で `seedJackpotLocked` を先に呼ぶので、順序の注意は C3-11 のときと同じく関数の中で閉じている)。
   **(2) `creditChipsCappedLocked` の `headroom`**: `MaxChips - account.Escrow - account.Chips` は `Chips = Escrow = math.MaxInt64` の手編集で**正の大きな値へ回り込む** — 入金が通り、口座が負に落ちる(mutation で `credited 1000` を再現済み)。C3-13 と同じ規律で、引き算ではなく**読み取り点**を直した: `normalizeAccountLocked(account *UserAccount)` を `store.go` に足し、`ensureAccountLocked` が返す直前に必ず通す。`Chips` / `Escrow` → `[0, MaxChips]`、`Coins` → `[0, MaxCoins]`。`headroom` の式も `creditChipsLocked` も**1 文字も変えていない** — 正規化後の演算数が 1e12 以下になることで安全になる。
@@ -105,6 +111,9 @@
 - (なし)
 
 ## Next
+- **次は C3-16(正規化点を通らずに口座を触る経路 `RefundStaleEscrows` を塞ぐ)**。`TASKS.md` の未完はこれ 1 件。入力は反復 1 の評価者の指摘で、`NEXT_FINDINGS.md` からは消してある(C3-16 が同じ内容を持っている)。
+- **`NEXT_FINDINGS.md` は空(見出しだけ)になった。** 残っていた 3 節はすべて処理済み — C3-09 の差し戻しと所見 4 は今回閉じ、C3-12 の paths 違反は親が「処理不要」と判断済み。次の評価で `NEEDS_WORK` が出たらここへ書く。
+- **タスクの `paths:` が実在しないファイルを指していた**(`internal/casino/announce_test.go`。実際は `internal/commands/casino_announce_test.go`)。C3-12 のときと同じく**コードではなく記録の方を実態へ直した** — `TASKS.md` の `paths:` を書き換え、理由を `notes:` に残した。`paths:` はタスクを書いた時点の推測なので、実装中に実在しないと分かったら直すのが正しい(狭すぎる `paths:` を守って done-when を落とす方が高くつく)。
 - **次は C3-15(未抽選の「次回抽選」テストを足し、旧挙動のコメントを消す)**。`TASKS.md` の未完はこれ 1 件で、入力は `NEXT_FINDINGS.md` に残った所見 4 と、C3-09 の反復 3(`DrawDate == ""` のケースが購入・status の表に無い)。
 - **`NEXT_FINDINGS.md` から今回消したのは所見 2・3 の 2 節だけ。** `## C3-07 の区切り評価` の所見 4、C3-09 の反復 3、C3-12 の反復 3(親が「処理不要・消してよい」と判断済み)は残してある。
 - **正規化点は 3 つになった** — プールの `seedJackpotLocked`、宝くじの `normalizeLotteryLocked`(どちらも `ensureTodayRateIndexLocked` の先頭)、口座の `normalizeAccountLocked`(`ensureAccountLocked` の中)。新しい永続フィールドを足すときは、この 3 つのどれかを通る読み取り経路になっているかを確かめる。通らない経路を足すと、閉じた穴がその経路から開き直す。
@@ -170,6 +179,7 @@
 - Astra の C-1 レビュー(`.harness/reviews/2026-09-14-astra-casino-c1-round1.md`)の所見を R 系タスクにして消化 → 2 周目 PASS → `main` へ ff マージ(ユーザー承認済み 2026-09-14)→ 片付け。稼働(トークン・実行場所)は後日、ユーザー判断。
 
 ## Notes
+- **表駆動テストのケースは「実装のどの分岐に入るか」で選ぶ(C3-15)**: `DrawDate` の表に 2 ケースあっても、どちらも `drawLotteryLocked` の早期 return に落ちるなら**ロールオーバーは 1 度も走っていない**。未抽選(`""`)だけが抽選を走らせ、走ったあとの `DrawDate` を読む経路を通る — 「入力の見た目が違う」ではなく「通る経路が違う」がケースを足す理由。効き目は当選者なしの経路のスタンプを暦日へ変える mutation で確かめた(新ケースだけが落ちる)。
 - **設計書 `Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61/69 行目の「昨日の当選」は C3-08 で実装とずれた** — `paths:` の外なので触らず C3-11 として切った。README には該当の文言は無い。
 - **`codex exec` は stdin を閉じないと無限に待つ**(2026-09-14, C3-07 の評価者で 22 分溶かした)。プロンプトを引数で渡しても
   `Reading additional input from stdin...` と出て**標準入力を読み続ける** — このハーネスの非対話シェルでは EOF が来ないので、
