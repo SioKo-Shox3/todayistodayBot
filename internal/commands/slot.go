@@ -42,7 +42,8 @@ const slotRevealPlaceholder = "❔"
 
 // buildSlotRevealStages returns the 4 progressive message bodies for the
 // "リールを1個ずつ止める" animation (設計書): stage 0 = all ❔, stages
-// 1-3 reveal one more reel each; stage 3 also appends the payout line.
+// 1-3 reveal one more reel each; stage 3 also appends the payout line and
+// the jackpot line.
 func buildSlotRevealStages(result casino.SpinResult) []string {
 	reelText := func(revealed int) string {
 		cells := make([]string, 3)
@@ -59,7 +60,7 @@ func buildSlotRevealStages(result casino.SpinResult) []string {
 	for revealed := 0; revealed <= 3; revealed++ {
 		line := fmt.Sprintf("🎰 %s", reelText(revealed))
 		if revealed == 3 {
-			line += "\n" + slotResultLine(result)
+			line += "\n" + slotResultLine(result) + "\n" + slotJackpotLine(result)
 		}
 		stages[revealed] = line
 	}
@@ -71,6 +72,33 @@ func slotResultLine(result casino.SpinResult) string {
 		return fmt.Sprintf("🎉 %d枚 獲得!(ベット%d枚)", result.Payout, result.Bet)
 	}
 	return fmt.Sprintf("😢 ハズレ(ベット%d枚)", result.Bet)
+}
+
+// slotJackpotLine renders the pool line every spin result carries (設計書
+// C-3a §2). The two forms are mutually exclusive on purpose: when the pool
+// fires, result.JackpotPool is already back at JackpotSeed, and printing
+// "+12345 獲得 / プール 1000" in one breath reads as if the fresh seed were
+// part of the prize. JackpotWon > 0 is the fire condition rather than the
+// reels — the pool is only ever paid out on 7️⃣7️⃣7️⃣ and is never 0 when it
+// fires (it is seeded to JackpotSeed), so the two agree by construction,
+// while this one stays true if 設計書 §2 ever adds another trigger.
+func slotJackpotLine(result casino.SpinResult) string {
+	if result.JackpotWon > 0 {
+		return fmt.Sprintf("🎰 JACKPOT!! +%d チップ", result.JackpotWon)
+	}
+	return fmt.Sprintf("🎰 ジャックポット: %d チップ", result.JackpotPool)
+}
+
+// slotCelebrationMessage renders the SEPARATE public message a 💎💎💎 or
+// 7️⃣7️⃣7️⃣ spin posts (設計書). Only the 7️⃣7️⃣7️⃣ form carries the pool,
+// because only it won the pool — 💎💎💎 pays the table and leaves the
+// pool untouched (設計書 C-3a §2).
+func slotCelebrationMessage(userID string, result casino.SpinResult) string {
+	reels := fmt.Sprintf("%s%s%s", result.Reels[0], result.Reels[1], result.Reels[2])
+	if result.JackpotWon > 0 {
+		return fmt.Sprintf("🎉🎉🎉 <@%s> が %s で大当たり!! 🎰 ジャックポット %d チップ 獲得!! 🎉🎉🎉", userID, reels, result.JackpotWon)
+	}
+	return fmt.Sprintf("🎉🎉🎉 <@%s> が %s で大当たり!! 🎉🎉🎉", userID, reels)
 }
 
 func translateSlotError(err error) string {
@@ -133,7 +161,7 @@ func (c *SlotCommand) runReveal(responder slotResponder, interaction *discordgo.
 	}
 
 	if result.IsJackpot {
-		celebration := fmt.Sprintf("🎉🎉🎉 <@%s> が %s%s%s で大当たり!! 🎉🎉🎉", userID, result.Reels[0], result.Reels[1], result.Reels[2])
+		celebration := slotCelebrationMessage(userID, result)
 		if _, err := responder.ChannelMessageSend(channelID, celebration); err != nil {
 			slog.Error("discord: ChannelMessageSend failed for jackpot celebration", "error", redactInteractionError(err))
 		}

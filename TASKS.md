@@ -190,7 +190,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(資金の保存則)。`JackpotSeed` / `JackpotContributionPercent` は `internal/casino` の定数。`slot.go` の `IsJackpot` は 💎💎💎 / 7️⃣7️⃣7️⃣ の祝い判定のまま。
 
 ## C3-02: `/slot` の結果と 7️⃣7️⃣7️⃣ の祝い・9 時掲示にジャックポットを出す(§2 表示)
-- status: todo
+- status: done
 - done-when: `internal/commands/slot.go` の結果メッセージに「🎰 ジャックポット: N チップ」(発火時は「🎰 JACKPOT!! +N チップ」)の 1 行を足し、7️⃣7️⃣7️⃣ の公開の祝いにプール額(獲得額)を入れる。`internal/casino/announce.go` の `AnnouncementJob` に `JackpotPool int64` を足し(ロールオーバーで種を入れた後の値)、`internal/commands/casino_announce.go` の embed に「🎰 ジャックポット」フィールドを足す。`slot_test.go` / `casino_announce_test.go`(commands 側): 文言の純粋関数テスト(発火あり/なし、掲示のフィールド)。`announce_test.go`(casino 側): `AnnouncementJob.JackpotPool` が入る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -run "TestSlot|TestAnnounce|TestBuildAnnouncement" -count=1`

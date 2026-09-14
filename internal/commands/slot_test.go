@@ -76,9 +76,10 @@ func TestSlotCommand_Definition_BetRange10To1000(t *testing.T) {
 
 func TestBuildSlotRevealStages_PlaceholdersRevealProgressively(t *testing.T) {
 	result := casino.SpinResult{
-		Reels:  [3]casino.SlotSymbol{casino.SymbolCherry, casino.SymbolLemon, casino.SymbolGrape},
-		Bet:    10,
-		Payout: 0,
+		Reels:       [3]casino.SlotSymbol{casino.SymbolCherry, casino.SymbolLemon, casino.SymbolGrape},
+		Bet:         10,
+		Payout:      0,
+		JackpotPool: 1200,
 	}
 	stages := buildSlotRevealStages(result)
 	if len(stages) != 4 {
@@ -88,7 +89,7 @@ func TestBuildSlotRevealStages_PlaceholdersRevealProgressively(t *testing.T) {
 		"🎰 ❔ ❔ ❔",
 		"🎰 🍒 ❔ ❔",
 		"🎰 🍒 🍋 ❔",
-		"🎰 🍒 🍋 🍇\n😢 ハズレ(ベット10枚)",
+		"🎰 🍒 🍋 🍇\n😢 ハズレ(ベット10枚)\n🎰 ジャックポット: 1200 チップ",
 	}
 	for i := range want {
 		if stages[i] != want[i] {
@@ -99,16 +100,17 @@ func TestBuildSlotRevealStages_PlaceholdersRevealProgressively(t *testing.T) {
 
 func TestBuildSlotRevealStages_WinShowsPayoutLine(t *testing.T) {
 	result := casino.SpinResult{
-		Reels:     [3]casino.SlotSymbol{casino.SymbolDiamond, casino.SymbolDiamond, casino.SymbolDiamond},
-		Bet:       100,
-		Payout:    5000,
-		IsJackpot: true,
+		Reels:       [3]casino.SlotSymbol{casino.SymbolDiamond, casino.SymbolDiamond, casino.SymbolDiamond},
+		Bet:         100,
+		Payout:      5000,
+		IsJackpot:   true,
+		JackpotPool: 1200,
 	}
 	stages := buildSlotRevealStages(result)
 	if len(stages) != 4 {
 		t.Fatalf("expected 4 stages, got %d", len(stages))
 	}
-	want := "🎰 💎 💎 💎\n🎉 5000枚 獲得!(ベット100枚)"
+	want := "🎰 💎 💎 💎\n🎉 5000枚 獲得!(ベット100枚)\n🎰 ジャックポット: 1200 チップ"
 	if stages[3] != want {
 		t.Fatalf("final stage:\n got: %q\nwant: %q", stages[3], want)
 	}
@@ -116,15 +118,16 @@ func TestBuildSlotRevealStages_WinShowsPayoutLine(t *testing.T) {
 
 func TestBuildSlotRevealStages_LossShowsHazureLine(t *testing.T) {
 	result := casino.SpinResult{
-		Reels:  [3]casino.SlotSymbol{casino.SymbolBell, casino.SymbolSeven, casino.SymbolLemon},
-		Bet:    50,
-		Payout: 0,
+		Reels:       [3]casino.SlotSymbol{casino.SymbolBell, casino.SymbolSeven, casino.SymbolLemon},
+		Bet:         50,
+		Payout:      0,
+		JackpotPool: 1200,
 	}
 	stages := buildSlotRevealStages(result)
 	if len(stages) != 4 {
 		t.Fatalf("expected 4 stages, got %d", len(stages))
 	}
-	if got := stages[3]; got != "🎰 🔔 7️⃣ 🍋\n😢 ハズレ(ベット50枚)" {
+	if got := stages[3]; got != "🎰 🔔 7️⃣ 🍋\n😢 ハズレ(ベット50枚)\n🎰 ジャックポット: 1200 チップ" {
 		t.Fatalf("final stage: %q", got)
 	}
 }
@@ -146,9 +149,10 @@ func TestRunReveal_SendsInitialResponseThenThreeEdits(t *testing.T) {
 	responder := &fakeSlotResponder{}
 	slept := 0
 	result := casino.SpinResult{
-		Reels:  [3]casino.SlotSymbol{casino.SymbolCherry, casino.SymbolLemon, casino.SymbolGrape},
-		Bet:    10,
-		Payout: 0,
+		Reels:       [3]casino.SlotSymbol{casino.SymbolCherry, casino.SymbolLemon, casino.SymbolGrape},
+		Bet:         10,
+		Payout:      0,
+		JackpotPool: 1200,
 	}
 	err := cmd.runReveal(responder, &discordgo.Interaction{}, "c1", "u1", result, func(d time.Duration) { slept++ })
 	if err != nil {
@@ -163,7 +167,7 @@ func TestRunReveal_SendsInitialResponseThenThreeEdits(t *testing.T) {
 	if len(responder.edited) != 3 {
 		t.Fatalf("expected exactly 3 InteractionResponseEdit calls, got %d", len(responder.edited))
 	}
-	if responder.edited[2] != "🎰 🍒 🍋 🍇\n😢 ハズレ(ベット10枚)" {
+	if responder.edited[2] != "🎰 🍒 🍋 🍇\n😢 ハズレ(ベット10枚)\n🎰 ジャックポット: 1200 チップ" {
 		t.Fatalf("unexpected final edit: %q", responder.edited[2])
 	}
 	if slept != 3 {
@@ -175,10 +179,12 @@ func TestRunReveal_Jackpot_SendsPublicCelebrationMention(t *testing.T) {
 	cmd := &SlotCommand{}
 	responder := &fakeSlotResponder{}
 	result := casino.SpinResult{
-		Reels:     [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
-		Bet:       100,
-		Payout:    10000,
-		IsJackpot: true,
+		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
+		Bet:         100,
+		Payout:      14321,
+		IsJackpot:   true,
+		JackpotWon:  4321,
+		JackpotPool: casino.JackpotSeed,
 	}
 	if err := cmd.runReveal(responder, &discordgo.Interaction{}, "c1", "u1", result, func(time.Duration) {}); err != nil {
 		t.Fatalf("runReveal returned %v, want nil", err)
@@ -194,6 +200,9 @@ func TestRunReveal_Jackpot_SendsPublicCelebrationMention(t *testing.T) {
 	}
 	if !strings.Contains(responder.sentContents[0], "7️⃣7️⃣7️⃣") {
 		t.Fatalf("celebration must show the winning reels: %q", responder.sentContents[0])
+	}
+	if !strings.Contains(responder.sentContents[0], "4321") {
+		t.Fatalf("celebration must show the jackpot pool won (設計書 C-3a §2): %q", responder.sentContents[0])
 	}
 }
 
@@ -350,5 +359,73 @@ func TestRunReveal_DiscordFailure_DoesNotLogInteractionToken(t *testing.T) {
 				t.Fatalf("the request URL reached the log: %q", out)
 			}
 		})
+	}
+}
+
+// スロットの結果には必ずプールの1行が付く(設計書 C-3a §2)。
+func TestSlotJackpotLine_NotFired_ShowsPoolAfterThisSpin(t *testing.T) {
+	got := slotJackpotLine(casino.SpinResult{Bet: 10, JackpotPool: 1234})
+	if got != "🎰 ジャックポット: 1234 チップ" {
+		t.Fatalf("unexpected jackpot line: %q", got)
+	}
+}
+
+func TestSlotJackpotLine_Fired_ShowsWonAmountNotTheReseededPool(t *testing.T) {
+	// 発火後の JackpotPool は種に戻っているので、その数を出すと
+	// 「種も賞金のうち」と読めてしまう。出すのは獲得額だけ。
+	got := slotJackpotLine(casino.SpinResult{Bet: 100, JackpotWon: 54321, JackpotPool: casino.JackpotSeed})
+	if got != "🎰 JACKPOT!! +54321 チップ" {
+		t.Fatalf("unexpected jackpot line: %q", got)
+	}
+	if strings.Contains(got, "1000") {
+		t.Fatalf("the reseeded pool must not appear on a fired line: %q", got)
+	}
+}
+
+func TestBuildSlotRevealStages_JackpotFireShowsTheWinLine(t *testing.T) {
+	result := casino.SpinResult{
+		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
+		Bet:         100,
+		Payout:      24600,
+		IsJackpot:   true,
+		JackpotWon:  5000,
+		JackpotPool: casino.JackpotSeed,
+	}
+	want := "🎰 7️⃣ 7️⃣ 7️⃣\n🎉 24600枚 獲得!(ベット100枚)\n🎰 JACKPOT!! +5000 チップ"
+	if got := buildSlotRevealStages(result)[3]; got != want {
+		t.Fatalf("final stage:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestSlotCelebrationMessage_JackpotFire_CarriesThePool(t *testing.T) {
+	got := slotCelebrationMessage("u1", casino.SpinResult{
+		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
+		Bet:         100,
+		Payout:      24600,
+		IsJackpot:   true,
+		JackpotWon:  5000,
+		JackpotPool: casino.JackpotSeed,
+	})
+	want := "🎉🎉🎉 <@u1> が 7️⃣7️⃣7️⃣ で大当たり!! 🎰 ジャックポット 5000 チップ 獲得!! 🎉🎉🎉"
+	if got != want {
+		t.Fatalf("celebration:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestSlotCelebrationMessage_Diamonds_CarryNoPool(t *testing.T) {
+	// 💎💎💎 は配当と祝いだけ。プールは動かないので額も出さない。
+	got := slotCelebrationMessage("u1", casino.SpinResult{
+		Reels:       [3]casino.SlotSymbol{casino.SymbolDiamond, casino.SymbolDiamond, casino.SymbolDiamond},
+		Bet:         100,
+		Payout:      5000,
+		IsJackpot:   true,
+		JackpotPool: 7777,
+	})
+	want := "🎉🎉🎉 <@u1> が 💎💎💎 で大当たり!! 🎉🎉🎉"
+	if got != want {
+		t.Fatalf("celebration:\n got: %q\nwant: %q", got, want)
+	}
+	if strings.Contains(got, "7777") {
+		t.Fatalf("a non-firing spin must not advertise the pool as won: %q", got)
 	}
 }

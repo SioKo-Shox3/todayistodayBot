@@ -707,3 +707,46 @@ func TestRunAnnounceScheduler_CancelDuringCallback_ReturnsAfterCallbackCompletes
 		t.Fatalf("LastAnnounced = %q, want %q — the send completed successfully before the cancel took effect", got, announceDay)
 	}
 }
+
+// 掲示は「育つプール」を見せる場所なので、job はロールオーバーが種を入れた
+// 後のプールを運ぶ(設計書 C-3a §2)。一度も回していないギルドで 0 を返すと
+// 実残高(種 1,000)と食い違う。
+func TestCollectDailyAnnouncements_CarriesSeededJackpotPool(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+
+	jobs, err := st.collectDailyAnnouncements(announceAt1000)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if jobs[0].JackpotPool != JackpotSeed {
+		t.Fatalf("job.JackpotPool = %d, want the seed %d", jobs[0].JackpotPool, JackpotSeed)
+	}
+}
+
+func TestCollectDailyAnnouncements_CarriesGrownJackpotPool(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, not a draw"}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	if err := st.Update(func(d *Data) error {
+		ensureGuildLocked(d, "guild1").Jackpot = 45678
+		return nil
+	}); err != nil {
+		t.Fatalf("growing the pool: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(announceAt1000)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if jobs[0].JackpotPool != 45678 {
+		t.Fatalf("job.JackpotPool = %d, want 45678 (the pool must not be reseeded or reset)", jobs[0].JackpotPool)
+	}
+}

@@ -117,8 +117,8 @@ func TestBuildAnnouncementEmbed_IncludesMarketCommentary(t *testing.T) {
 func TestBuildAnnouncementEmbed_EmptyTopAssetsShowsPlaceholder(t *testing.T) {
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	embed := buildAnnouncementEmbed(announceJob(history, nil))
-	if len(embed.Fields) != 1 {
-		t.Fatalf("expected exactly one field, got %d", len(embed.Fields))
+	if len(embed.Fields) != 2 {
+		t.Fatalf("expected the ranking and the jackpot field, got %d", len(embed.Fields))
 	}
 	if embed.Fields[0].Name != "総資産ランキング TOP3" {
 		t.Fatalf("unexpected field name: %q", embed.Fields[0].Name)
@@ -137,8 +137,8 @@ func TestBuildAnnouncementEmbed_TopAssetsRenderedWithMedals(t *testing.T) {
 		{UserID: "u4", TotalAssets: 70},
 	}
 	embed := buildAnnouncementEmbed(announceJob(history, top))
-	if len(embed.Fields) != 1 {
-		t.Fatalf("expected exactly one field, got %d", len(embed.Fields))
+	if len(embed.Fields) != 2 {
+		t.Fatalf("expected the ranking and the jackpot field, got %d", len(embed.Fields))
 	}
 	want := "🥇 <@u1> — 100\n🥈 <@u2> — 90\n🥉 <@u3> — 80\n4. <@u4> — 70"
 	if embed.Fields[0].Value != want {
@@ -203,5 +203,35 @@ func TestStartAnnounceScheduler_WaitBlocksUntilCallbackFinishes(t *testing.T) {
 	}
 	if gotEmbed == nil || gotEmbed.Title != "💱 本日のコインレート" {
 		t.Fatalf("unexpected embed: %+v", gotEmbed)
+	}
+}
+
+// 9 時掲示はプールが育つのを見せる場所(設計書 C-3a §2)。額は job から来る
+// — この関数は純粋なままで、ストアを読み直さない。
+func TestBuildAnnouncementEmbed_ShowsJackpotPool(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.JackpotPool = 12345
+	embed := buildAnnouncementEmbed(job)
+	if len(embed.Fields) != 2 {
+		t.Fatalf("expected the ranking and the jackpot field, got %d", len(embed.Fields))
+	}
+	field := embed.Fields[1]
+	if field.Name != "🎰 ジャックポット" {
+		t.Fatalf("unexpected field name: %q", field.Name)
+	}
+	if field.Value != "12345 チップ" {
+		t.Fatalf("unexpected jackpot value: %q", field.Value)
+	}
+}
+
+func TestBuildAnnouncementEmbed_SeededJackpotPoolIsShownAsIs(t *testing.T) {
+	// 種(1,000)のギルドでも 0 ではなく実額が出ること。
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.JackpotPool = casino.JackpotSeed
+	embed := buildAnnouncementEmbed(job)
+	if got := embed.Fields[1].Value; got != "1000 チップ" {
+		t.Fatalf("unexpected jackpot value: %q", got)
 	}
 }

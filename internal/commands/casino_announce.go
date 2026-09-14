@@ -22,6 +22,11 @@ var announceMedals = []string{"🥇", "🥈", "🥉"}
 //  3. the 相場コメント (marketCommentary)
 //  4. the top-3 total-asset ranking
 //
+// 設計書 C-3a §2 adds a fifth: the slot jackpot pool, so the 9am posting is
+// where the guild watches the pool grow. It comes from the job (collected
+// under the store's lock, after the rollover seeded it), never from a fresh
+// read here — this function stays pure.
+//
 // The 🚀/💥 tag comes from the PERSISTED casino.EventKind via
 // rateChangeLine, not from a day-over-day threshold. A threshold cannot
 // work: the 70/140 clamp turns a genuine +15% surge from 130 into a
@@ -55,6 +60,7 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 		Color:       0xf1c40f,
 		Fields: []*discordgo.MessageEmbedField{
 			{Name: "総資産ランキング TOP3", Value: rankValue, Inline: false},
+			{Name: "🎰 ジャックポット", Value: fmt.Sprintf("%d チップ", job.JackpotPool), Inline: false},
 		},
 	}
 }

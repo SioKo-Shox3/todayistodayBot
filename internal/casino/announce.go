@@ -15,6 +15,11 @@ type AnnouncementJob struct {
 	Today       DailyRate
 	RecentRates []DailyRate // oldest..newest, up to 7 entries (includes Today as the last element)
 	TopAssets   []RankEntry // top 3 (設計書)
+	// JackpotPool is the guild's slot jackpot pool at collection time, AFTER
+	// the daily rollover has seeded it (ensureTodayRateLocked calls
+	// seedJackpotLocked), so a guild that has never spun is shown the real
+	// JackpotSeed rather than a pool of 0.
+	JackpotPool int64
 }
 
 // collectDailyAnnouncements ensures every known guild's rate exists for
@@ -44,7 +49,8 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			jobs = append(jobs, AnnouncementJob{
 				GuildID: guildID, ChannelID: economy.AnnounceChannelID,
 				Today: rate, RecentRates: recent,
-				TopAssets: topAssetsLocked(economy, rate.Rate, 3),
+				TopAssets:   topAssetsLocked(economy, rate.Rate, 3),
+				JackpotPool: economy.Jackpot, // read after ensureTodayRateLocked seeded it
 			})
 		}
 		return nil
