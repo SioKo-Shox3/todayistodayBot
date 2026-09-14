@@ -334,3 +334,21 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/store.go, internal/casino/store_test.go
 - notes: 危険地帯(資金の保存則)。これで「口座に触る経路はすべて `ensureAccountLocked` を通る」が閉じる — 他にも直接 map を引いている箇所があれば同じ扱いにし、見つけた場所を進捗に書く。
+
+## C3-17: 実装自身が作った繰り越しを上限で消さない(2 周目 blocking 2)
+- status: todo
+- done-when: `.harness/reviews/2026-09-15-astra-casino-c3a-round2.md` の blocking 2 を直す。`drawLotteryLocked` の当選者不在の経路は賞金全額を `Carryover` に入れるため `MaxChips` を超えうるが、`normalizeLotteryLocked` が次の読み取りでそれを `MaxChips` へ切り詰めるので**実装自身が作った通貨が消える**(再現: `Sales=100`・`Carryover=MaxChips`・券なし・プール 5,000 で `LotteryStatus` を 2 回呼ぶと 90 チップ消失)。親の決定(2026-09-15): **繰り越しに入り切らない分はジャックポットのプールへ送る**(他の全ての余りと同じ行き先。`seedJackpotLocked` の後に `creditJackpotCappedLocked`)。繰り越しを書く箇所で `MaxChips` を超える分を先に切り出してプールへ回し、`Carryover <= MaxChips` を**書き込み時点で**保証する(正規化は破損ファイル対策として残す)。併せて 2 周目の non-blocking(`seedJackpotLocked` が巨大な正の `JackpotAccum` を補正せず、積立の加算があふれうる)も直す — `JackpotAccum` を `[0, 100)` へ丸める。設計書 §8 の契約文を「通貨が消えるのは**プールの上限**で入り切らないときだけ。口座・繰り越しの上限で溢れた分はプールへ送る」に直す。回帰テスト: 上の再現手順で 2 回目の照会でも通貨が消えない(繰り越し + プール + 口座の合計が不変)/ `JackpotAccum = math.MaxInt64` のファイルを読んで積立を通してもプールが負にならない / 通常範囲の既存の期待値が 1 つも変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/casino/lottery.go, internal/casino/lottery_test.go, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: 危険地帯(資金の保存則)。**切り詰めは「壊れたファイルの値」にだけ許され、実装が作った値には許さない** — この区別を設計書に 1 行で書く。
+
+## C3-18: 旧形式の未掲示結果を待ち行列へ移行する(2 周目 blocking 1)
+- status: todo
+- done-when: 同レビューの blocking 1 を直す。`CollectDailyAnnouncements` は `Unannounced` だけを見るため、**C3-12 より前の形式**で書かれた `data/casino.json`(`unannounced` キーが無く、未掲示の当選が `LastDraw` にだけある)を読むと、その回の掲示と祝いが永久に失われる(再現: `LastAnnounced="2026-09-13"`・`LastDraw.Date="2026-09-14"`・当選者あり・`unannounced` 無しで 14 日 10 時に起動)。読み取り点(`normalizeLotteryLocked`)で移行する: `Unannounced` が空で、`LastDraw` が非 nil・当選者あり・`LastDraw.Date > LastAnnounced` なら、`LastDraw` の写しを待ち行列へ 1 件入れる(`LastAnnounced` はギルド側にあるので、移行には `GuildEconomy` を渡す形にしてよい)。既に待ち行列に同じ日付があれば入れない(二重掲示の防止)。回帰テスト: 旧形式の JSON から掲示を集めると当選が job に入る / 同じ状態で 2 回集めても 1 件のまま / `LastDraw.Date <= LastAnnounced`(掲示済み)なら入らない / 当選者不在の `LastDraw` は入らない / 新形式(`unannounced` あり)の挙動が変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/lottery.go, internal/casino/lottery_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/casino/announce.go, internal/casino/announce_test.go
+- notes: この形式は**このブランチの途中コミットでしか存在しない**(Bot はまだ一度も本番稼働していない)が、古いビルドで生成したファイルを持ち込む可能性はあるので閉じる。移行は読み取り点に置き、抽選で `LastDraw` を上書きする**前**に効くこと。
