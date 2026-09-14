@@ -4,6 +4,14 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-12(精算の配当を口座の上限で切り詰め、精算そのものは必ず成功させる)。証拠 `.harness/runs/20260915-080323/verify-C3B-12-{1,2,3}.txt`(3 本とも exit=0、8 パッケージ ok)。
+  **拒否が壊していたのは入金ではなく取引だった** — `SettleGame` は `ensureSeasonMonthLocked` を**同じ `Update` の中で**先に呼ぶ。月次切り替えは表彰台へ賞与を払い、その賞与が口座を上限まで埋める。そのあとの入金が `creditChipsLocked` で `ErrChipCapExceeded` を返すと、閉じたばかりの月次切り替えごと巻き戻る — つまり**再試行が拒否された状態を自分で作り直す**。預かり(`Escrow`)を抱えた手は永久に閉じない。上限は行き先の性質であって取引を失敗させる条件ではない、というのが §2 の読み。
+  **入金は `creditChipsCappedLocked` に変え、`SeasonNet` は `credited-staked`**(払うはずだった額ではなく入った額。§2 の既存規則)。`SettleResult` は `Payout` を**実際に入った額**にし、払うはずだった額を新しい `Owed` に移した — 表示側(`casinoPayoutLine` / `blackjackResultEmbed` / 連勝の祝い)は全部 `Payout` を読むので、**フィールドの意味を入れ替える形にすると表示が自動的に本当のことを言う**。`Owed` を足したのは差が観測できるようにするため。
+  **預かりを先に解放してから上限を測る**のは意図 — 引き分け(`payout == staked`)は上限に座った口座でも必ず全額入る。自分のチップが二重に数えられて自分の賭け金が消える、という形にはならない。
+  **効き目の確認**: `mutation-C3B-12-strict-credit.txt`(入金を `creditChipsLocked` に戻すと新規 2 件が落ちる)/ `mutation-C3B-12-seasonnet-from-owed.txt`(`SeasonNet` を `payout-staked` に戻すと同じ 2 件が `SeasonNet = 1000, want 500` / `100, want 0` で落ちる)。
+  **既存テストのうち上限の期待値 2 つは契約ごと差し替えた** — `TestSettleGame_PayoutOverTheChipCapPersistsNothing` → `..._KeepsOnlyWhatFits`、`TestSettleGame_RefusalsLeaveSeasonNetUntouched` の後半は上限ではなく負の配当の拒否に置き換えた(拒否の一覧から上限が外れたため)。**通常範囲の期待値は 1 つも変えていない**(`go test ./... -count=1` が 8 パッケージ ok)。
+  **他の精算経路を確認した結果**: `AcceptDuel`・シーズン賞与・宝くじは既に `creditChipsCappedLocked`。`ClaimDaily` と両替は**精算ではない**(進行中のものが無く、拒否しても利用者は元手を保つ)ので厳格なままでよい。残った不揃いは `Store.Spin` ひとつ — §2 が「スロット等の配当と同じ」と名指しする当の経路が唯一拒否する側に残っている。**ジャックポットの溢れをどこへ送るかという別の判断が要る**ので今回の `paths:` の外とし、`TASKS.md` に **C3B-17** として起こした(行き詰まりはしないので P2)。
+  設計書 §2 は冒頭の「湧かない・消えない」に**上限の例外**を足し、「上限は配当を止める理由にしない」を項として明示した(non-blocking 1)。
 - C3B-09(掲示済みの日でも未掲示のシーズン結果だけを再送する)。証拠 `.harness/runs/20260915-064206/verify-C3B-09-{1,2,3,4}.txt`(4 本とも exit=0、8 パッケージ ok)。
   **分けたのは収集の条件であって、送信の形ではない** — `AnnouncementJob.DailyOwed` は「今日の embed はまだか」だけを答える。`collectDailyAnnouncements` は `AnnounceChannelID == ""` だけで切り上げ、そのあと `dailyOwed := today > LastAnnounced` と `len(UnannouncedSeasons) == 0` の**両方**が成り立つときにだけギルドを飛ばす。ギルドを起こす理由が 2 つあり、2 つ目が 1 つ目の印に縛られていなかった、というのが所見 2 の中身。
   **`DailyOwed == false` の巡回が抑えるのは 3 つ**: embed 本体・宝くじの祝い(`LotteryDraws` を収集側で空にする)・`MarkAnnounced`。宝くじを抑えるのは当選者を二度 @メンションしないため、`MarkAnnounced` を抑えるのは、この巡回がしていない掲示を根拠に宝くじの待ち行列を剪定させないため。結果を取り除くのは従来どおり `MarkSeasonAnnounced` だけで、これは送信の直後に月ごとに取る。
@@ -206,7 +214,9 @@
 - (なし)
 
 ## Next
-- **次は C3B-10**(月末に結果送信だけ失敗した場合の再送を回帰テストで押さえる)。実装の不具合は反復 4 の評価で見つかっていない — 足りないのは検証で、C3B-08 の done-when が名指しした「7/31 に結果送信だけ失敗 → 8/1 に 6 月の結果を再送」を、収集関数だけでなく**掲示側**(`startAnnounceScheduler`)から通す必要がある。雛形は `TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass` と、今回足した `TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay`。**7/31 → 8/1 は月替わりを通るので `LastSeason` が 7 月へ移る** — 送られるのは 6 月の結果である、が争点。
+- **次は C3B-13**(預かりに持ち主の印を付け、別の盤面の預かりで精算できないようにする = blocking 2)。`TASKS.md` の未完で最優先。C3B-12 で `SettleGame` の入金側は触ったが、**どの盤面の預かりか**を見ていない点は手つかず — `staked := account.Escrow` は「いま預かっている額」であって「この盤面が預けた額」ではない、が争点の中心。
+- **C3B-17 は新規**(スロットの配当だけが上限で拒否する側に残っている)。C3B-12 の確認で見つけた。P2 — 取引ごと巻き戻るので賭け金は戻り、`SettleGame` のような行き詰まりはしない。
+- **旧: 次は C3B-10**(月末に結果送信だけ失敗した場合の再送を回帰テストで押さえる)。実装の不具合は反復 4 の評価で見つかっていない — 足りないのは検証で、C3B-08 の done-when が名指しした「7/31 に結果送信だけ失敗 → 8/1 に 6 月の結果を再送」を、収集関数だけでなく**掲示側**(`startAnnounceScheduler`)から通す必要がある。雛形は `TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass` と、今回足した `TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay`。**7/31 → 8/1 は月替わりを通るので `LastSeason` が 7 月へ移る** — 送られるのは 6 月の結果である、が争点。
 - **その次は C3B-11**(README と `blocked/C3B-07.md` の文言を実装に合わせる)。コードは変えない。
 - **次は C3B-09**(`TASKS.md` の最後の未完 = 反復 2 の所見 2「同日中の次の巡回では結果を再送できない」)。C3B-08 で待ち行列の形は決まったので、残るのは**収集の条件**だけ — `collectDailyAnnouncements` は `today <= LastAnnounced` でギルドごと飛ばすので、embed が載った日のうちは `UnannouncedSeasons` / `Lottery.Unannounced` に何が残っていても運ばれない。所見の再現手順(embed 成功・結果送信失敗 → 同日 11 時に再起動)は `NEXT_FINDINGS.md` の反復 2 節に残してある。**行番号は C3B-08 の差分でずれている**(`casino_announce.go:272` は今の `return nil` ではない)ので、参照は本文の記述で引くこと。
 - **旧: 次は C3B-08 → C3B-09**(反復 2 の評価者所見を `TASKS.md` へ落とした 2 件)。C-3b の機能実装と文書はこれで閉じたので、残るのは掲示の取りこぼし 2 件だけ。**C3B-08 が先** — 2 件とも `announce.go` の収集条件を触るので、待ち行列の形を決める方(P1)を先に閉じないと C3B-09 の差分が二度手間になる。`NEXT_FINDINGS.md` の該当節は、対応するタスクを閉じるときに消す(いまは残してある — 再現手順が所見の側にしか無い)。
