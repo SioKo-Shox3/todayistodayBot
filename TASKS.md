@@ -249,7 +249,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(資金の保存則)。`blocked/C3-06.md` の「差額は `Carryover = prize − paid` で次回へ送る」という記述も、このタスクで**新しい挙動に書き直す**(正本への反映は親が行う)。
 
 ## C3-08: 掲示できなかった回の当選を、次の掲示で取りこぼさない(所見 2)
-- status: todo
+- status: done
 - done-when: `CollectDailyAnnouncements`(`internal/casino/announce.go` 73 付近)は `LastDraw.Date == today` の回だけを掲示対象にするため、9 時に Bot が落ちていて翌朝 9 時前に復旧すると、起動時に精算された前日付の当選が**一度も掲示されず祝われない**。条件を「**まだ掲示していない回**」= `last.Date > economy.LastAnnounced` に変える(`MarkAnnounced` は送信成功時だけ `LastAnnounced = date` を書くので、掲示に失敗した回は次の巡回で再度対象になる)。`announce_test.go`: 12 日に掲示済み(`LastAnnounced = 12 日`)・13 日付の当選が残っている状態で 14 日の掲示を集めると、13 日付の `LotteryDraw` が job に入る / 掲示成功後(`LastAnnounced = 14 日`)は同じ回が二度入らない / 当日付の当選は従来どおり入る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -run "TestCollectDailyAnnouncements|TestAnnounce|TestMarkAnnounced" -count=1`
@@ -273,3 +273,10 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: README.md, Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
 - notes: README は公開物 — 過程を書かない。
+
+## C3-11: 設計書の掲示文言を「昨日の当選」から実際の抽選日へ合わせる
+- status: todo
+- done-when: C3-08 で 9 時掲示の見出しが `LastDraw.Date` 由来の「M/D の当選」(当選者なしは「前回の当選」)に変わったので、`Docs/superpowers/specs/2026-09-14-casino-c3a-design.md` 61 行目・69 行目の「昨日の当選」の記述を実装に合わせて直す。掲示対象が「今日精算した回」ではなく「まだ掲示していない回」になったことも 1 行で書く。コードは触らない。
+- verify: `go build ./... && go vet ./...`
+- paths: Docs/superpowers/specs/2026-09-14-casino-c3a-design.md
+- notes: C3-08 の `paths:` の外だったので切り出した。README には該当の文言は無い(`grep 昨日の当選` は設計書と PROGRESS.md だけに当たる)。

@@ -88,12 +88,30 @@ func buildAnnouncementEmbed(job casino.AnnouncementJob) *discordgo.MessageEmbed 
 // on every normal morning — the draw just emptied the pot — and only climb
 // above 0 here when the announcement is a late catch-up posted after people
 // have already started buying into the new pot.
+//
+// The heading carries the draw's OWN date, not 「昨日」: the job now delivers
+// every draw that has not been announced yet, so a bot that was down at 09:00
+// posts the missed day's winner the next morning, and calling that 「昨日」
+// would be a lie about which draw the numbers belong to.
 func lotteryAnnounceLines(job casino.AnnouncementJob) string {
-	result := "🏆 昨日の当選: 該当者なし — 賞金は繰り越し"
+	result := "🏆 前回の当選: 該当者なし — 賞金は繰り越し"
 	if d := job.LotteryDraw; d != nil && d.WinnerID != "" {
-		result = fmt.Sprintf("🏆 昨日の当選: <@%s> が %dチップ 獲得(%d枚 / %d人)", d.WinnerID, d.Prize, d.TicketsSold, d.Buyers)
+		result = fmt.Sprintf("🏆 %s の当選: <@%s> が %dチップ 獲得(%d枚 / %d人)",
+			lotteryDrawDateLabel(d.Date), d.WinnerID, d.Prize, d.TicketsSold, d.Buyers)
 	}
 	return fmt.Sprintf("%s\n💰 本日の賞金: %dチップ / 🎫 売れた枚数: %d枚", result, job.LotteryPrize, job.LotteryTickets)
+}
+
+// lotteryDrawDateLabel renders a stored draw date ("2006-01-02") as the M/D
+// the announcement heading shows. A date that fails to parse is printed as
+// stored rather than dropped or replaced with a guess: a hand-edited file must
+// not be able to make the embed claim a day the draw did not happen on.
+func lotteryDrawDateLabel(date string) string {
+	d, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return date
+	}
+	return fmt.Sprintf("%d/%d", int(d.Month()), d.Day())
 }
 
 // lotteryAnnounceCelebration renders the SEPARATE public message a won draw

@@ -788,15 +788,16 @@ func TestCollectDailyAnnouncements_CarriesTheMorningLotteryDraw(t *testing.T) {
 	}
 }
 
-// TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot is the
-// other half: the embed says 「昨日の当選」, so a LastDraw left over from a
-// quiet spell must NOT be repeated under that wording every morning — while
-// the open pot (carryover included) is still reported, because that is what
-// readers can buy into today.
-func TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot(t *testing.T) {
+// TestCollectDailyAnnouncements_OmitsAnAlreadyAnnouncedDrawAndCarriesTheOpenPot
+// is the other half: a LastDraw that a previous morning already posted must
+// NOT be repeated every day until someone buys again — while the open pot
+// (carryover included) is still reported, because that is what readers can buy
+// into today. LastAnnounced is the marker that retires a draw, so a draw dated
+// on or before it is spent.
+func TestCollectDailyAnnouncements_OmitsAnAlreadyAnnouncedDrawAndCarriesTheOpenPot(t *testing.T) {
 	st, _ := newTempStore(t)
 	st.rng = forbiddenRand{t: t, reason: "a guild's first day is the fixed 基準100, and today's draw already ran"}
-	seedAnnounceGuild(t, st, "guild1", "chan1", "")
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-07-02") // the 7/1 draw was posted on 7/2
 	stale := LotteryDraw{Date: "2026-07-01", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
 	if err := st.Update(func(d *Data) error {
 		lottery := &ensureGuildLocked(d, "guild1").Lottery
@@ -820,10 +821,64 @@ func TestCollectDailyAnnouncements_OmitsAStaleDrawAndCarriesTheOpenPot(t *testin
 
 	job := jobs[0]
 	if job.LotteryDraw != nil {
-		t.Fatalf("job.LotteryDraw = %+v, want nil — a draw from %s is not 昨日の当選", job.LotteryDraw, stale.Date)
+		t.Fatalf("job.LotteryDraw = %+v, want nil — the draw from %s was already announced", job.LotteryDraw, stale.Date)
 	}
 	if job.LotteryPrize != 590 || job.LotteryTickets != 2 {
 		t.Fatalf("job.LotteryPrize/LotteryTickets = %d/%d, want 590/2 (floor(100*90/100) + 500 carried over, 2 tickets)",
 			job.LotteryPrize, job.LotteryTickets)
+	}
+}
+
+// TestCollectDailyAnnouncements_CarriesADrawTheOutageNeverAnnounced is 所見 2
+// of the C-3a 区切りレビュー. The bot is down at 09:00 on 7/10, comes back up
+// on 7/11, and the startup pass settles 7/10's draw. A job filtered to "the
+// draw settled TODAY" would drop that winner on the floor — never announced,
+// never celebrated, by any later pass either. The filter is "not announced
+// yet", so 7/10's winner rides out on 7/11's posting, and only a confirmed
+// send (MarkAnnounced) retires them.
+func TestCollectDailyAnnouncements_CarriesADrawTheOutageNeverAnnounced(t *testing.T) {
+	st, _ := newTempStore(t)
+	// Float64 feeds the daily rate. Intn is scripted EMPTY on purpose: the
+	// pot is empty on both mornings, so any actual draw here is a bug in the
+	// setup and must fail loudly rather than quietly overwrite LastDraw.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-07-09") // last posting: 7/9
+	missed := LotteryDraw{Date: announceDay, WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, "guild1").Lottery
+		lottery.DrawDate = announceDay // 7/10's draw ran; its announcement never did
+		lottery.LastDraw = &missed
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the lottery state: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(announceNextDay900)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if jobs[0].LotteryDraw == nil || *jobs[0].LotteryDraw != missed {
+		t.Fatalf("job.LotteryDraw = %+v, want %+v — the draw the outage swallowed must still be announced",
+			jobs[0].LotteryDraw, missed)
+	}
+
+	// The send succeeds, so 7/11 becomes the last announced day. The morning
+	// after must NOT report the same winner a second time.
+	if err := st.MarkAnnounced("guild1", jstDate(announceNextDay900)); err != nil {
+		t.Fatalf("MarkAnnounced: %v", err)
+	}
+	dayAfter := time.Date(2026, 7, 12, 9, 0, 0, 0, jst)
+	jobs, err = st.collectDailyAnnouncements(dayAfter)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs on the following morning, want 1: %+v", len(jobs), jobs)
+	}
+	if jobs[0].LotteryDraw != nil {
+		t.Fatalf("job.LotteryDraw = %+v, want nil — an announced draw must not be announced twice", jobs[0].LotteryDraw)
 	}
 }

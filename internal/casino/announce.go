@@ -20,11 +20,18 @@ type AnnouncementJob struct {
 	// seedJackpotLocked), so a guild that has never spun is shown the real
 	// JackpotSeed rather than a pool of 0.
 	JackpotPool int64
-	// LotteryDraw is the draw THIS morning's rollover just settled, or nil
-	// when nobody had entered it. It is filtered to Today's date rather than
-	// simply being economy.Lottery.LastDraw: the announcement says 「昨日の
-	// 当選」, and a LastDraw from a quiet spell three days ago would put a
-	// stale winner under that wording every morning until someone buys again.
+	// LotteryDraw is the most recent settled draw that has NOT been announced
+	// yet (LastDraw.Date > LastAnnounced), or nil when there is no such draw.
+	//
+	// The filter is "not yet announced" rather than "settled today" on
+	// purpose. A bot that is down at 09:00 and comes back up the next morning
+	// settles the missed day at startup, and a today-only filter would drop
+	// that winner on the floor — they would never be announced or celebrated
+	// at all. Comparing against LastAnnounced still stops a draw from being
+	// repeated: MarkAnnounced writes LastAnnounced only after a confirmed
+	// send, so a draw survives a failed send and is retired by a successful
+	// one. The date is therefore not necessarily yesterday's, which is why
+	// the embed prints LastDraw.Date instead of saying 「昨日」.
 	LotteryDraw *LotteryDraw
 	// LotteryPrize / LotteryTickets describe the draw that is now OPEN (the
 	// one the readers can still buy into), read after the rollover cleared
@@ -70,7 +77,11 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 				LotteryPrize:   prize,
 				LotteryTickets: sold,
 			}
-			if last := economy.Lottery.LastDraw; last != nil && last.Date == today {
+			// last.Date > LastAnnounced == "this draw has not been announced".
+			// Both are "YYYY-MM-DD", so the lexicographic order IS the
+			// chronological one, and the zero value "" (never announced)
+			// correctly sorts before every real date.
+			if last := economy.Lottery.LastDraw; last != nil && last.Date > economy.LastAnnounced {
 				draw := *last // copy: the Data behind the pointer is dropped with this Update
 				job.LotteryDraw = &draw
 			}

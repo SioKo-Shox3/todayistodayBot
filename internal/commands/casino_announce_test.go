@@ -254,15 +254,31 @@ func lotteryField(t *testing.T, embed *discordgo.MessageEmbed) *discordgo.Messag
 	return nil
 }
 
-func TestBuildAnnouncementEmbed_LotteryFieldShowsYesterdaysWinner(t *testing.T) {
+func TestBuildAnnouncementEmbed_LotteryFieldShowsTheWinnerUnderTheDrawsOwnDate(t *testing.T) {
 	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
 	job := announceJob(history, nil)
 	job.LotteryDraw = &casino.LotteryDraw{Date: "2026-07-10", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}
 	// The pot the draw just emptied and reopened reads 0/0 on a normal morning.
 	embed := buildAnnouncementEmbed(job)
-	want := "🏆 昨日の当選: <@u1> が 900チップ 獲得(20枚 / 3人)\n💰 本日の賞金: 0チップ / 🎫 売れた枚数: 0枚"
+	want := "🏆 7/10 の当選: <@u1> が 900チップ 獲得(20枚 / 3人)\n💰 本日の賞金: 0チップ / 🎫 売れた枚数: 0枚"
 	if got := lotteryField(t, embed).Value; got != want {
 		t.Fatalf("unexpected lottery field:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestBuildAnnouncementEmbed_LotteryFieldDatesACaughtUpDraw covers the job a
+// restart produces after the bot missed 09:00: the draw it carries is NOT
+// yesterday's relative to the posting, so the heading must name the day the
+// draw actually settled instead of claiming 「昨日」.
+func TestBuildAnnouncementEmbed_LotteryFieldDatesACaughtUpDraw(t *testing.T) {
+	history := []casino.DailyRate{{Rate: 100, Trend: casino.TrendFlat, Event: casino.EventNone}}
+	job := announceJob(history, nil)
+	job.LotteryDraw = &casino.LotteryDraw{Date: "2026-09-03", WinnerID: "u1", Prize: 900, TicketsSold: 20, Buyers: 3}
+	job.LotteryPrize, job.LotteryTickets = 120, 1
+	embed := buildAnnouncementEmbed(job)
+	want := "🏆 9/3 の当選: <@u1> が 900チップ 獲得(20枚 / 3人)"
+	if got := lotteryField(t, embed).Value; !strings.Contains(got, want) {
+		t.Fatalf("unexpected lottery field:\n got: %q\nwant it to contain: %q", got, want)
 	}
 }
 
@@ -275,7 +291,7 @@ func TestBuildAnnouncementEmbed_LotteryFieldNoWinnerRollsOver(t *testing.T) {
 	job.LotteryDraw = nil
 	job.LotteryPrize, job.LotteryTickets = 500, 0
 	embed := buildAnnouncementEmbed(job)
-	want := "🏆 昨日の当選: 該当者なし — 賞金は繰り越し\n💰 本日の賞金: 500チップ / 🎫 売れた枚数: 0枚"
+	want := "🏆 前回の当選: 該当者なし — 賞金は繰り越し\n💰 本日の賞金: 500チップ / 🎫 売れた枚数: 0枚"
 	if got := lotteryField(t, embed).Value; got != want {
 		t.Fatalf("unexpected lottery field:\n got: %q\nwant: %q", got, want)
 	}
@@ -380,7 +396,7 @@ func TestStartAnnounceScheduler_CelebratesTheLotteryWinnerInASeparateMessage(t *
 	if len(embeds) != 1 {
 		t.Fatalf("got %d embeds, want 1", len(embeds))
 	}
-	if got := lotteryField(t, embeds[0]).Value; !strings.Contains(got, "🏆 昨日の当選: <@u1> が 90チップ 獲得(2枚 / 1人)") {
+	if got := lotteryField(t, embeds[0]).Value; !strings.Contains(got, "🏆 7/10 の当選: <@u1> が 90チップ 獲得(2枚 / 1人)") {
 		t.Fatalf("the embed field does not report the settled draw: %q", got)
 	}
 	if len(texts) != 1 {
