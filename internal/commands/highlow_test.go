@@ -269,6 +269,34 @@ func TestHighLowButtonsDisableImpossibleGuessesAndFinishedBoards(t *testing.T) {
 	}
 }
 
+// 上限で切り詰められた配当と、無効化されたボタンが食い違わないこと。
+// SettleGame は MaxChips に入り切らない分を捨てる(設計書 §2)ので、盤面の
+// ポットは「実際に払われた額」ではなくなりうる。生きているボタンは押せば
+// これだけ取れるという**申し出**なのでポットを名乗ってよいが、決着した盤面に
+// 申し出は残っていない — 金額を名乗るのは本文(配当: N枚)ひとつだけにする。
+// 時間切れの締めの編集(DisabledComponents)は精算結果を一切見ないので、
+// ここで閉じないと塞げない経路がある。
+func TestHighLowCashOutButtonNamesItsAmountOnlyWhileItCanBePressed(t *testing.T) {
+	board := highLowBoard{
+		Bet: 100, Pot: 200,
+		Current: casino.Card{Rank: 7, Suit: casino.SuitDiamond},
+		Odds:    casino.HighLowOdds{Remaining: 51, HighCards: 24, LowCards: 24, HighMultiplier: casino.Multiplier(24, 51), LowMultiplier: casino.Multiplier(24, 51)},
+	}
+
+	live := highLowButtonsOf(t, &discordgo.InteractionResponse{Data: &discordgo.InteractionResponseData{Components: highLowButtons("s1", board, false)}})
+	if live[2].Label != "💰 キャッシュアウト 200枚" {
+		t.Errorf("live cash-out label = %q, want the pot named", live[2].Label)
+	}
+
+	finished := highLowButtonsOf(t, &discordgo.InteractionResponse{Data: &discordgo.InteractionResponseData{Components: highLowButtons("s1", board, true)}})
+	if strings.Contains(finished[2].Label, "200") {
+		t.Errorf("finished cash-out label = %q — it still advertises the pot, which the cap may have kept out of the account", finished[2].Label)
+	}
+	if finished[2].Label != "💰 キャッシュアウト" {
+		t.Errorf("finished cash-out label = %q, want the bare action", finished[2].Label)
+	}
+}
+
 func TestHighLowResultEmbedNamesEveryEnding(t *testing.T) {
 	base := highLowResult{
 		Guessed: true, GuessHigh: true,

@@ -2162,9 +2162,10 @@ func TestSettleGame_PayoutOverTheChipCapKeepsOnlyWhatFits(t *testing.T) {
 // account, so a refusal here rolls back the season switch that caused it and
 // the next attempt rebuilds the same state — the hand could never be settled.
 //
-// July's leader carries a 100-chip hand into August with 300 chips of room.
-// The rollover pays the 1位 bonus first, capped at those 300, leaving 100 of
-// room for a 200-chip payout.
+// July's leader carries a 100-chip hand into August 300 chips short of the
+// cap. The bonus sees only 200 of that as room — the 100 in escrow counts
+// against MaxChips as well (creditChipsCappedLocked) — so the rollover fills
+// the account to MaxChips-100 and the 200-chip payout finds 100 of room.
 func TestSettleGame_AtTheCapAfterTheMonthlyBonusStillClosesTheGame(t *testing.T) {
 	st, path := newTempStore(t)
 	err := st.Update(func(d *Data) error {

@@ -281,6 +281,19 @@ func (c *HighLowCommand) TimedOutEmbed(state any, settled casino.SettleResult) *
 // refusal — and disableAll switches off the whole row for a finished board,
 // which is what stops a second press from reaching a settled hand at all.
 func highLowButtons(sessionID string, board highLowBoard, disableAll bool) []discordgo.MessageComponent {
+	// The cash-out label names its amount only while the button can still be
+	// pressed: live, it is an OFFER — 「押せばこれだけ取れる」 — and the pot is
+	// exactly what pressing it pays. On a finished board there is no offer
+	// left, and the figure would be the pot rather than what the settlement
+	// paid: SettleGame credits only what fits under MaxChips and drops the
+	// rest (設計書 §2), so a frozen 「キャッシュアウト 200枚」 can sit next to
+	// the body's 「配当: 100枚」. The body is the one that counted the chips,
+	// so the button stops competing with it. This covers the sweeper's closing
+	// edit too (DisabledComponents), which never sees the settlement at all.
+	cashOutLabel := "💰 キャッシュアウト"
+	if !disableAll {
+		cashOutLabel = fmt.Sprintf("%s %d枚", cashOutLabel, board.Pot)
+	}
 	return []discordgo.MessageComponent{
 		discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 			discordgo.Button{
@@ -296,7 +309,7 @@ func highLowButtons(sessionID string, board highLowBoard, disableAll bool) []dis
 				Disabled: disableAll || board.Odds.LowMultiplier == 0,
 			},
 			discordgo.Button{
-				Label:    fmt.Sprintf("💰 キャッシュアウト %d枚", board.Pot),
+				Label:    cashOutLabel,
 				Style:    discordgo.SuccessButton,
 				CustomID: BuildCustomID(string(casino.GameHighLow), sessionID, highLowActionCashOut),
 				Disabled: disableAll,
