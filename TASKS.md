@@ -33,11 +33,13 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/commands/... -count=1`
 - paths: internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/slot.go, internal/commands/slot_test.go, internal/commands/*.go, internal/commands/*_test.go
 - notes: Bot 認証トークンではなく Interaction トークン(短命)だが、ログに残す理由は無い。既存の他コマンド(weather/today 等)の同種ログも見つけたら同じヘルパーへ(別コミットで可)。
+  反復 3 の評価者指摘(ハンドラの戻り値が未秘匿・`*url.Error` の原因が素通し)を 3da727f で追加修正。`respond()` 経由に統一し、`*url.Error` は `Op` と原因の型だけにした。検証出力 `verify-R-003fix-{1,2,3}.txt`。
 
 ## R-004: 配備設定で保存先 `data/` に書けるようにする
-- status: todo
+- status: done
 - done-when: non-blocking の運用課題(稼働の前提)。`deploy/systemd/todayistodaybot.service` は `ProtectSystem=strict` で書き込み例外が無く、相対保存先 `/opt/todayistodaybot/data/casino.json` に書けない → `ReadWritePaths=/opt/todayistodaybot/data`(または `StateDirectory=todayistodaybot` と保存先の環境変数)を足す。`deploy/Dockerfile` は非 root ユーザーで `/data` 相当の書き込み先が無い → `VOLUME` と所有者の設定、起動時の作業ディレクトリを明示。`README.md` の配備節に「`data/` の場所と権限」を 1 段落足す。判定: `docker build` はこの PC に Docker が無いので行わない — unit ファイルと Dockerfile の差分を目視し、`systemd-analyze verify` 相当の構文は WSL の `systemd-analyze verify deploy/systemd/todayistodaybot.service`(WSL Ubuntu にある)で確かめる。
 - verify: `wsl -d Ubuntu -- bash -lc "cd /mnt/c/Users/KINGkawamura/Documents/todayistodayBot && systemd-analyze verify deploy/systemd/todayistodaybot.service"`
 - verify: `go build ./... && go vet ./...`
 - paths: deploy/systemd/todayistodaybot.service, deploy/Dockerfile, README.md
 - notes: 保存先のパスを決めているコード(`internal/casino/store.go` の既定パス / `internal/store`)を読んで、環境変数で上書きできるならそれを unit に書く。無ければ相対パス前提のまま `ReadWritePaths` だけにする(コードは触らない)。
+  保存先を変える環境変数は無い(`casino.DefaultPath` = `data/casino.json`、`store.DefaultPath` = `data/chosei-events.json` はどちらも定数)ので、相対パス前提のまま `ReadWritePaths` を足した。検証出力 `verify-R-004-{1,2,3}.txt`。`verify-R-004-1.txt` の `exit=1` は `ExecStart` のバイナリがこの PC に無いためだけで、unit の構文は `verify-R-004-2.txt` が `verify-exit=0` で示す。
