@@ -317,11 +317,10 @@ func (s *Store) SetAnnounceChannel(guildID, channelID string) error {
 // directly instead (see EnsureCasinoAccess/TopAssets/ClaimDaily's
 // neighbours/Exchange*/ViewAccount/RecentRates below).
 func (s *Store) EnsureTodayRate(guildID string, now time.Time) (DailyRate, error) {
-	today := jstDate(now)
 	var result DailyRate
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		result = ensureTodayRateLocked(economy, today, s.rng)
+		result = ensureTodayRateLocked(economy, now, s.rng)
 		return nil
 	})
 	return result, err
@@ -344,8 +343,8 @@ func (s *Store) EnsureTodayRate(guildID string, now time.Time) (DailyRate, error
 // bot while the bad file stays on disk: every restart re-crashes. Repairing it
 // HERE, at the single point every consumer reads today's rate through, protects
 // /exchange, /rank, /rate and the 9am announcement in one place.
-func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) DailyRate {
-	rate, _ := ensureTodayRateIndexLocked(economy, today, rng)
+func ensureTodayRateLocked(economy *GuildEconomy, now time.Time, rng randSource) DailyRate {
+	rate, _ := ensureTodayRateIndexLocked(economy, now, rng)
 	return rate
 }
 
@@ -353,7 +352,11 @@ func ensureTodayRateLocked(economy *GuildEconomy, today string, rng randSource) 
 // returned rate occupies in economy.Rates, for the one caller (RecentRates)
 // that has to show the history AROUND that entry. The index is -1 when no
 // stored entry backs the rate — the synthesised 基準100 fallback below.
-func ensureTodayRateIndexLocked(economy *GuildEconomy, today string, rng randSource) (DailyRate, int) {
+func ensureTodayRateIndexLocked(economy *GuildEconomy, now time.Time, rng randSource) (DailyRate, int) {
+	// The rate rolls over at MIDNIGHT JST and the lottery is drawn at 09:00
+	// JST, so the two need different dates off the same instant — which is
+	// why this takes `now` rather than a pre-formatted "today".
+	today := jstDate(now)
 	// Seed the jackpot pool here as well as in Spin (設計書 C-3a §2) — on
 	// behalf of both this and ensureTodayRateLocked. This is the read path
 	// every display goes through (/balance, /rank, /rate, the 9am
@@ -367,7 +370,7 @@ func ensureTodayRateIndexLocked(economy *GuildEconomy, today string, rng randSou
 	// JST and whether or not the guild has an announcement channel configured.
 	// Hanging it off the scheduler instead would silently skip the draw for a
 	// guild that never set a channel, and lose a day entirely after a restart.
-	drawLotteryLocked(economy, today, rng)
+	drawLotteryLocked(economy, lotteryDrawDate(now), rng)
 	// Drop unusable today records rather than appending after them, so the
 	// history never ends up holding two entries for the same date, and so the
 	// regeneration below starts from the last VALID day instead of from a
@@ -463,10 +466,9 @@ func settledRateIndexLocked(economy *GuildEconomy, date string) (DailyRate, int)
 // Idempotent: repeat calls neither re-grant the bonus nor regenerate the
 // rate. All seven commands call it, /rate and /rank included.
 func (s *Store) EnsureCasinoAccess(guildID, userID string, now time.Time) error {
-	today := jstDate(now)
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		ensureTodayRateLocked(economy, today, s.rng)
+		ensureTodayRateLocked(economy, now, s.rng)
 		ensureAccountLocked(economy, userID)
 		return nil
 	})
@@ -540,11 +542,10 @@ func topAssetsLocked(economy *GuildEconomy, rate int, limit int) []RankEntry {
 // TopAssets returns guildID's top `limit` accounts by total assets, using
 // today's rate (generated first if missing, same transaction).
 func (s *Store) TopAssets(guildID string, now time.Time, limit int) ([]RankEntry, error) {
-	today := jstDate(now)
 	var result []RankEntry
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		rate := ensureTodayRateLocked(economy, today, s.rng)
+		rate := ensureTodayRateLocked(economy, now, s.rng)
 		result = topAssetsLocked(economy, rate.Rate, limit)
 		return nil
 	})
@@ -618,11 +619,10 @@ func (s *Store) ExchangeCoinToChip(guildID, userID string, coins int64, now time
 	if coins < 1 {
 		return ExchangeResult{}, ErrInvalidAmount
 	}
-	today := jstDate(now)
 	var result ExchangeResult
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		rate := ensureTodayRateLocked(economy, today, s.rng)
+		rate := ensureTodayRateLocked(economy, now, s.rng)
 		account := ensureAccountLocked(economy, userID)
 		if account.Coins < coins {
 			return &ErrInsufficientCoins{Balance: account.Coins}
@@ -648,11 +648,10 @@ func (s *Store) ExchangeChipToCoin(guildID, userID string, chips int64, now time
 	if chips < 1 {
 		return ExchangeResult{}, ErrInvalidAmount
 	}
-	today := jstDate(now)
 	var result ExchangeResult
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		rate := ensureTodayRateLocked(economy, today, s.rng)
+		rate := ensureTodayRateLocked(economy, now, s.rng)
 		account := ensureAccountLocked(economy, userID)
 		if account.Chips < chips {
 			return &ErrInsufficientChips{Balance: account.Chips}
@@ -687,11 +686,10 @@ type AccountView struct {
 // first use) and today's rate exists, returning both plus derived total
 // assets.
 func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView, error) {
-	today := jstDate(now)
 	var result AccountView
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		rate := ensureTodayRateLocked(economy, today, s.rng)
+		rate := ensureTodayRateLocked(economy, now, s.rng)
 		account := *ensureAccountLocked(economy, userID)
 		result = AccountView{Account: account, RateUsed: rate.Rate, TotalAssets: totalAssetsLocked(&account, rate.Rate)}
 		return nil
@@ -790,11 +788,10 @@ func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 // up to the most recent `limit` DailyRate entries (oldest..newest, today
 // included as the last element) for guildID.
 func (s *Store) RecentRates(guildID string, now time.Time, limit int) ([]DailyRate, error) {
-	today := jstDate(now)
 	var result []DailyRate
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		rate, idx := ensureTodayRateIndexLocked(economy, today, s.rng)
+		rate, idx := ensureTodayRateIndexLocked(economy, now, s.rng)
 		// /rate reads the LAST element as "today's rate", so the history has
 		// to end at the very entry /exchange charges from — not merely at the
 		// last entry dated `rate.Date`. Cutting by index rather than by date
@@ -1077,9 +1074,9 @@ func lotterySummaryLocked(lottery *Lottery) (sold, buyers int, prize int64) {
 // re-draw a day that has already paid out — the same rule
 // ensureTodayRateIndexLocked applies to the rate history. Caller must already
 // hold the Store's lock, which is also what makes reading rng safe.
-func drawLotteryLocked(economy *GuildEconomy, today string, rng randSource) {
+func drawLotteryLocked(economy *GuildEconomy, drawDate string, rng randSource) {
 	lottery := &economy.Lottery
-	if today == "" || lottery.DrawDate >= today {
+	if drawDate == "" || lottery.DrawDate >= drawDate {
 		return
 	}
 	prize, house := LotteryPrize(lottery.Sales, lottery.Carryover)
@@ -1087,7 +1084,7 @@ func drawLotteryLocked(economy *GuildEconomy, today string, rng randSource) {
 	winner := PickLotteryWinner(lottery.Tickets, rng)
 	if winner == "" {
 		lottery.Carryover = prize
-		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, today
+		lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 		return
 	}
 	paid := creditChipsCappedLocked(ensureAccountLocked(economy, winner), prize)
@@ -1097,13 +1094,13 @@ func drawLotteryLocked(economy *GuildEconomy, today string, rng randSource) {
 	seedJackpotLocked(economy)
 	economy.Jackpot += house
 	lottery.LastDraw = &LotteryDraw{
-		Date: today, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
+		Date: drawDate, WinnerID: winner, Prize: paid, TicketsSold: sold, Buyers: buyers,
 	}
 	// prize-paid is 0 on every normal draw; it is non-zero only when the
 	// winner was at MaxChips, and then the remainder funds the next draw
 	// rather than being destroyed.
 	lottery.Carryover = prize - paid
-	lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, today
+	lottery.Tickets, lottery.Sales, lottery.DrawDate = nil, 0, drawDate
 }
 
 // LotteryPurchase is what a successful /lottery buy left behind: the buyer's
@@ -1134,15 +1131,26 @@ type LotteryPurchase struct {
 // made after 09:00 JST on a day nothing else has touched the guild must join
 // the NEW draw, not be swept into yesterday's pot by the rollover that a
 // later command would trigger.
+//
+// A REFUSED purchase is reported through `refused`, held outside the
+// closure, and the closure still returns nil (危険地帯). Returning the error
+// from inside would abort Update's write and throw away the draw the
+// rollover just settled — while rng, which lives on the Store and not in
+// Data, would keep the position that draw advanced it to. A buyer who cannot
+// afford a ticket could then re-run the command until the discarded draw
+// named them the winner. Nothing of the PURCHASE is written on that path:
+// the refusal checks all run before the first mutation, so the committed
+// write carries the rollover alone.
 func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Time) (LotteryPurchase, error) {
 	if count < 1 {
 		return LotteryPurchase{}, ErrInvalidAmount
 	}
-	today := jstDate(now)
 	var result LotteryPurchase
+	var refused error
 	err := s.Update(func(d *Data) error {
+		result, refused = LotteryPurchase{}, nil
 		economy := ensureGuildLocked(d, guildID)
-		ensureTodayRateLocked(economy, today, s.rng) // rolls the draw over
+		ensureTodayRateLocked(economy, now, s.rng) // rolls the draw over
 		account := ensureAccountLocked(economy, userID)
 		lottery := &economy.Lottery
 		owned := lottery.Tickets[userID] // reading a nil map is legal and yields 0
@@ -1151,11 +1159,13 @@ func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Ti
 			remaining = 0 // hand-edited holding already past the cap
 		}
 		if count > remaining {
-			return &ErrLotteryLimit{Remaining: remaining}
+			refused = &ErrLotteryLimit{Remaining: remaining}
+			return nil // commit the rollover, not the purchase
 		}
 		cost := LotteryTicketPrice * int64(count) // count <= 10, so no overflow
 		if account.Chips < cost {
-			return &ErrInsufficientChips{Balance: account.Chips}
+			refused = &ErrInsufficientChips{Balance: account.Chips}
+			return nil // commit the rollover, not the purchase
 		}
 		account.Chips -= cost
 		if lottery.Tickets == nil {
@@ -1174,6 +1184,9 @@ func (s *Store) BuyLotteryTickets(guildID, userID string, count int, now time.Ti
 	})
 	if err != nil {
 		return LotteryPurchase{}, err
+	}
+	if refused != nil {
+		return LotteryPurchase{}, refused
 	}
 	return result, nil
 }
@@ -1194,11 +1207,10 @@ type LotteryView struct {
 // 09:00 JST performs the draw that the bot may have been down for, and the
 // user sees the result rather than a stale pot.
 func (s *Store) LotteryStatus(guildID, userID string, now time.Time) (LotteryView, error) {
-	today := jstDate(now)
 	var result LotteryView
 	err := s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		ensureTodayRateLocked(economy, today, s.rng) // rolls the draw over
+		ensureTodayRateLocked(economy, now, s.rng) // rolls the draw over
 		lottery := &economy.Lottery
 		sold, buyers, prize := lotterySummaryLocked(lottery)
 		result = LotteryView{

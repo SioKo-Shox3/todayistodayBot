@@ -3,6 +3,7 @@ package casino
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 // lotteryRand scripts the Intn draws the lottery winner is picked with, and
@@ -139,5 +140,37 @@ func TestPickLotteryWinner_NoEligibleTickets(t *testing.T) {
 		if got := PickLotteryWinner(tickets, forbidden); got != "" {
 			t.Fatalf("PickLotteryWinner(%v) = %q, want \"\"", tickets, got)
 		}
+	}
+}
+
+// TestLotteryDrawDate_KeysOffTheMostRecentNineAM pins the boundary the draw
+// is scheduled on (設計書 C-3a §3: 毎日 9:00 JST). Keying it off the calendar
+// date alone settles the pot at midnight, nine hours early — which both
+// draws a ticket bought at noon the day before it was promised, and leaves a
+// ticket bought at 08:00 in a pot that has already been settled, so the
+// 09:00 the confirmation named passes it by.
+func TestLotteryDrawDate_KeysOffTheMostRecentNineAM(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want string
+	}{
+		{"just before 9am belongs to the previous day's draw", time.Date(2026, 7, 11, 8, 59, 59, 0, jst), "2026-07-10"},
+		{"9am sharp is the new draw", time.Date(2026, 7, 11, 9, 0, 0, 0, jst), "2026-07-11"},
+		{"a second past 9am is the new draw", time.Date(2026, 7, 11, 9, 0, 1, 0, jst), "2026-07-11"},
+		{"noon is the new draw", time.Date(2026, 7, 11, 12, 0, 0, 0, jst), "2026-07-11"},
+		{"midnight still belongs to the previous day", time.Date(2026, 7, 11, 0, 0, 0, 0, jst), "2026-07-10"},
+		// Same instants, expressed in UTC: the host may run in any zone, so
+		// the boundary must come from the JST projection and never from the
+		// input's own location. 23:59:59Z on the 10th is 08:59:59 JST on the
+		// 11th; 00:00:00Z on the 11th is 09:00 JST on the 11th.
+		{"a UTC instant before the JST boundary", time.Date(2026, 7, 10, 23, 59, 59, 0, time.UTC), "2026-07-10"},
+		{"a UTC instant at the JST boundary", time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC), "2026-07-11"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lotteryDrawDate(tc.at); got != tc.want {
+				t.Fatalf("lotteryDrawDate(%s) = %q, want %q", tc.at.Format(time.RFC3339), got, tc.want)
+			}
+		})
 	}
 }

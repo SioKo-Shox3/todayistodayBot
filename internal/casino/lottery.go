@@ -1,6 +1,9 @@
 package casino
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 // The daily lottery's constants (設計書 C-3a §3). One ticket is 50 chips, a
 // buyer may hold at most 10 tickets in any one draw, and 90% of the takings
@@ -11,7 +14,26 @@ const (
 	LotteryTicketPrice       int64 = 50 // chips per ticket
 	LotteryMaxTicketsPerDraw int   = 10 // per buyer, per draw (cumulative)
 	LotteryPrizePercent      int64 = 90 // percent of sales paid to the winner
+	LotteryDrawHourJST       int   = 9  // the draw runs at 09:00 JST, with the 9am announcement
 )
+
+// lotteryDrawDate returns the JST calendar date of the most recent draw due
+// at or before t — t's own date from 09:00 JST onwards, the day BEFORE it
+// until then. The lottery is drawn at 09:00 (設計書 C-3a §3), not at
+// midnight, so keying the draw off jstDate alone settles the pot nine hours
+// early: a ticket bought at 12:00 would be drawn the moment anybody touched
+// the guild after 00:00, and a ticket bought at 08:00 would join a pot that
+// had already been drawn and so miss the 09:00 the confirmation promised it.
+// Returning the DATE rather than the instant keeps the stored DrawDate a
+// plain "2006-01-02" whose string order is calendar order, which is what
+// drawLotteryLocked's "never re-draw a settled day" comparison relies on.
+func lotteryDrawDate(t time.Time) string {
+	jt := t.In(jst)
+	if jt.Hour() < LotteryDrawHourJST {
+		jt = jt.AddDate(0, 0, -1)
+	}
+	return jt.Format("2006-01-02")
+}
 
 // LotteryPrize splits `sales` into the winner's prize and the house's cut,
 // and adds `carryover` (the pot rolled forward from draws nobody entered) to

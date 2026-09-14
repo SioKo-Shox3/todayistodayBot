@@ -50,7 +50,7 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 			// would panic on the first field access — which, in a discordgo
 			// handler goroutine, kills the whole process (§3.3).
 			economy := ensureGuildLocked(d, guildID)
-			rate := ensureTodayRateLocked(economy, today, s.rng)
+			rate := ensureTodayRateLocked(economy, now, s.rng)
 			if economy.AnnounceChannelID == "" || economy.LastAnnounced == today {
 				continue
 			}

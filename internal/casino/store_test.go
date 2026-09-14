@@ -3042,3 +3042,180 @@ func TestLotteryStatus_ReportsThePotTheHoldingAndTheNextDraw(t *testing.T) {
 		t.Fatalf("the reopened pot = %+v, want an empty one (Prize/TicketsSold/UserTickets all 0)", drawn)
 	}
 }
+
+// TestLotteryDraw_HoldsThePotUntilNineAM is the schedule of 設計書 C-3a §3:
+// the draw is at 09:00 JST, not at midnight. Both halves of the failure a
+// midnight boundary produces are checked here — a pot settled nine hours
+// early, and a ticket bought in those nine hours landing in a pot that has
+// already been drawn, so the 09:00 its confirmation named passes it by.
+func TestLotteryDraw_HoldsThePotUntilNineAM(t *testing.T) {
+	st, path := newTempStore(t)
+	// One roll only: it belongs to the 09:00 draw. Any earlier draw consumes
+	// it and fails the test right where the bug used to be.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	const guildID, userID = "guild1", "u1"
+	seedLotteryChips(t, st, guildID, map[string]int64{userID: 1000})
+	if _, err := st.BuyLotteryTickets(guildID, userID, 2, fixedNow); err != nil { // day D, 12:00
+		t.Fatalf("BuyLotteryTickets on day D: %v", err)
+	}
+
+	// Day D+1, 08:59:59 — past midnight, before the draw.
+	beforeNine := daysAfter(1).Add(-3*time.Hour - 1*time.Second)
+	if beforeNine.In(jst).Hour() != 8 {
+		t.Fatalf("test setup: beforeNine is %s, want an 08:xx JST instant", beforeNine.In(jst))
+	}
+	status, err := st.LotteryStatus(guildID, userID, beforeNine)
+	if err != nil {
+		t.Fatalf("LotteryStatus before 9am: %v", err)
+	}
+	if status.LastDraw != nil || status.TicketsSold != 2 || status.Prize != 90 {
+		t.Fatalf("the pot was settled before 09:00: LastDraw=%+v TicketsSold=%d Prize=%d, want nil/2/90",
+			status.LastDraw, status.TicketsSold, status.Prize)
+	}
+
+	// A ticket bought in that window must join the very draw the status just
+	// announced, not a pot that is already gone.
+	if _, err := st.BuyLotteryTickets(guildID, userID, 1, beforeNine); err != nil {
+		t.Fatalf("BuyLotteryTickets before 9am: %v", err)
+	}
+	if held := readGuild(t, path, guildID); held.Lottery.Tickets[userID] != 3 || held.Lottery.Sales != 150 {
+		t.Fatalf("the pot before 09:00 holds %v tickets / %d sales, want 3/150 — the 08:00 purchase opened a new pot",
+			held.Lottery.Tickets, held.Lottery.Sales)
+	}
+
+	// 09:00:00 sharp draws it, all three tickets included.
+	atNine := beforeNine.Add(1 * time.Second)
+	if _, err := st.EnsureTodayRate(guildID, atNine); err != nil {
+		t.Fatalf("EnsureTodayRate at 9am: %v", err)
+	}
+	drawn := readGuild(t, path, guildID)
+	const wantPrize = int64(135) // floor(150*90/100)
+	want := LotteryDraw{Date: jstDate(atNine), WinnerID: userID, Prize: wantPrize, TicketsSold: 3, Buyers: 1}
+	if drawn.Lottery.LastDraw == nil || *drawn.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw at 09:00 = %+v, want %+v", drawn.Lottery.LastDraw, want)
+	}
+	if got := drawn.Users[userID].Chips; got != 1000-150+wantPrize {
+		t.Fatalf("buyer's chips = %d, want %d (1000 - 150 + %d)", got, 1000-150+wantPrize, wantPrize)
+	}
+}
+
+// TestBuyLotteryTickets_RefusedPurchaseKeepsTheSettledDraw closes the re-roll
+// the refusal path used to open (危険地帯). The rollover runs inside the
+// purchase's own transaction, so aborting that transaction on a refusal threw
+// the draw away — but rng lives on the Store, not in Data, so it kept the
+// position the discarded draw had advanced it to. Calling again re-drew the
+// same pot from a different roll: a buyer with no chips could retry until the
+// draw named them, which breaks both "at most one draw a day" and the
+// weighting PickLotteryWinner promises.
+func TestBuyLotteryTickets_RefusedPurchaseKeepsTheSettledDraw(t *testing.T) {
+	st, path := newTempStore(t)
+	// Exactly one roll: a second draw — the re-roll under test — fails here.
+	// Roll 1 names u2 (u1 holds [0,1), u2 holds [1,2)).
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{1}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": 50, "u2": 1000})
+	for _, userID := range []string{"u1", "u2"} {
+		if _, err := st.BuyLotteryTickets(guildID, userID, 1, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets(%s): %v", userID, err)
+		}
+	}
+	sold := readGuild(t, path, guildID)
+	if sold.Users["u1"].Chips != 0 {
+		t.Fatalf("test setup: u1 must be broke after buying, got %d chips", sold.Users["u1"].Chips)
+	}
+	u2Before := sold.Users["u2"].Chips
+
+	// The broke buyer is the first to touch the guild after 09:00, so their
+	// refused purchase is what carries the draw.
+	var short *ErrInsufficientChips
+	if _, err := st.BuyLotteryTickets(guildID, "u1", 1, daysAfter(1)); !errors.As(err, &short) {
+		t.Fatalf("BuyLotteryTickets with 0 chips returned %v, want *ErrInsufficientChips", err)
+	}
+
+	drawn := readGuild(t, path, guildID)
+	day1 := jstDate(daysAfter(1))
+	want := LotteryDraw{Date: day1, WinnerID: "u2", Prize: 90, TicketsSold: 2, Buyers: 2}
+	if drawn.Lottery.LastDraw == nil || *drawn.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw after the refused purchase = %+v, want %+v — the refusal threw the draw away",
+			drawn.Lottery.LastDraw, want)
+	}
+	if drawn.Lottery.DrawDate != day1 {
+		t.Fatalf("DrawDate = %q, want %q — an unstamped date lets the next call draw again", drawn.Lottery.DrawDate, day1)
+	}
+	if got := drawn.Users["u2"].Chips - u2Before; got != 90 {
+		t.Fatalf("winner u2 gained %d chips, want 90 — the payout was rolled back with the refusal", got)
+	}
+	if drawn.Users["u1"].Chips != 0 || drawn.Lottery.Sales != 0 || len(drawn.Lottery.Tickets) != 0 {
+		t.Fatalf("the refused purchase was persisted: Chips=%d Sales=%d Tickets=%v, want 0/0/empty",
+			drawn.Users["u1"].Chips, drawn.Lottery.Sales, drawn.Lottery.Tickets)
+	}
+
+	// Retrying is the exploit: the scripted rolls are exhausted, so any
+	// second draw fails inside lotteryRand.Intn.
+	if _, err := st.BuyLotteryTickets(guildID, "u1", 1, daysAfter(1)); !errors.As(err, &short) {
+		t.Fatalf("the retry returned %v, want *ErrInsufficientChips", err)
+	}
+	after := readGuild(t, path, guildID)
+	if *after.Lottery.LastDraw != want || after.Users["u2"].Chips != drawn.Users["u2"].Chips {
+		t.Fatalf("LastDraw became %+v (u2 at %d chips) on the retry — the draw was re-run",
+			after.Lottery.LastDraw, after.Users["u2"].Chips)
+	}
+}
+
+// TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward pins what the
+// draw does when the winner has no room for the whole prize. MaxChips is a
+// hard invariant of this package — every other credit path refuses rather
+// than breach it — but a rollover has nobody to refuse TO: it runs inside
+// whatever command happened to touch the guild first. So the winner is paid
+// as far as the cap allows and the remainder becomes the next draw's
+// carryover, which keeps both the cap and the conservation law (the chips
+// leave no account and are not destroyed) at the cost of the winner's credit
+// falling short of the headline prize on this one boundary.
+func TestLotteryDraw_WinnerAtTheChipCapCarriesTheRemainderForward(t *testing.T) {
+	st, path := newTempStore(t)
+	// Two draws, each named by roll 0: day 1 goes to u1 (sorted first), day 2
+	// is u2's alone.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0, 0}}
+	const guildID = "guild1"
+	seedLotteryChips(t, st, guildID, map[string]int64{"u1": MaxChips, "u2": 1000})
+	for _, userID := range []string{"u1", "u2"} {
+		if _, err := st.BuyLotteryTickets(guildID, userID, 1, fixedNow); err != nil {
+			t.Fatalf("BuyLotteryTickets(%s): %v", userID, err)
+		}
+	}
+	sold := readGuild(t, path, guildID)
+	jackpotBefore := sold.Jackpot
+
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(1)); err != nil {
+		t.Fatalf("EnsureTodayRate on day 1: %v", err)
+	}
+	drawn := readGuild(t, path, guildID)
+	// prize 90, but u1 spent 50 of MaxChips on the ticket, so only 50 fits.
+	want := LotteryDraw{Date: jstDate(daysAfter(1)), WinnerID: "u1", Prize: 50, TicketsSold: 2, Buyers: 2}
+	if drawn.Lottery.LastDraw == nil || *drawn.Lottery.LastDraw != want {
+		t.Fatalf("LastDraw = %+v, want %+v — LastDraw must report what was actually PAID", drawn.Lottery.LastDraw, want)
+	}
+	if got := drawn.Users["u1"].Chips; got != MaxChips {
+		t.Fatalf("capped winner's chips = %d, want MaxChips (%d) — the cap was breached or the payout was skipped", got, MaxChips)
+	}
+	if drawn.Lottery.Carryover != 40 {
+		t.Fatalf("Carryover = %d, want 40 (90 prize - 50 paid) — the unpayable remainder was destroyed", drawn.Lottery.Carryover)
+	}
+	if got := drawn.Jackpot - jackpotBefore; got != 10 {
+		t.Fatalf("the jackpot pool gained %d, want 10 (the house's cut) — the cap must not touch the house's share", got)
+	}
+
+	// The remainder is not lost: it funds the next draw.
+	if _, err := st.BuyLotteryTickets(guildID, "u2", 1, daysAfter(1)); err != nil {
+		t.Fatalf("BuyLotteryTickets on day 1: %v", err)
+	}
+	u2Before := readGuild(t, path, guildID).Users["u2"].Chips
+	if _, err := st.EnsureTodayRate(guildID, daysAfter(2)); err != nil {
+		t.Fatalf("EnsureTodayRate on day 2: %v", err)
+	}
+	next := readGuild(t, path, guildID)
+	const wantNextPrize = int64(85) // floor(50*90/100) + 40 carryover
+	if got := next.Users["u2"].Chips - u2Before; got != wantNextPrize {
+		t.Fatalf("the next winner gained %d chips, want %d (floor(50*90/100) + 40 carried over)", got, wantNextPrize)
+	}
+}
