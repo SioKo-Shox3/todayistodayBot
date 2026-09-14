@@ -3123,8 +3123,9 @@ func TestNormalizeLottery_PullsHandEditedValuesIntoRange(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := tc.in
-			normalizeLotteryLocked(&got)
+			economy := GuildEconomy{Lottery: tc.in}
+			normalizeLotteryLocked(&economy)
+			got := economy.Lottery
 			if got.Sales != tc.want.Sales || got.Carryover != tc.want.Carryover {
 				t.Fatalf("Sales/Carryover = %d/%d, want %d/%d",
 					got.Sales, got.Carryover, tc.want.Sales, tc.want.Carryover)

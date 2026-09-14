@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -1001,5 +1002,219 @@ func TestMarkAnnounced_RetiresThePostedDrawsAndKeepsLaterOnes(t *testing.T) {
 	}
 	if economy.LastAnnounced != "2026-07-11" {
 		t.Fatalf("LastAnnounced = %q, want 2026-07-11", economy.LastAnnounced)
+	}
+}
+
+// The migration tests below all work from the SHAPE a pre-C3-12 build left on
+// disk: an unposted winner in "last_draw" and no "unannounced" key at all.
+// Only this branch has ever written that file (the bot has never run in
+// production), but an operator can still carry one over from an older binary,
+// and collectDailyAnnouncements reads the queue and nothing else — so without
+// the migration that winner is posted by nobody, ever.
+var migrationDay = time.Date(2026, 9, 14, 10, 0, 0, 0, jst) // after 09:00: the 9/14 draw has settled
+
+// oldFormatStore writes `raw` — a casino.json as an older build wrote it —
+// and returns a Store over it. Written as literal JSON on purpose:
+// marshalling today's structs would emit today's keys, which is the one thing
+// the file under test does not have.
+func oldFormatStore(t *testing.T, raw string) (*Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "casino.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("writing the pre-queue casino.json: %v", err)
+	}
+	return New(path), path
+}
+
+// TestCollectDailyAnnouncements_MigratesAPreQueueFilesUnpostedWinner is the
+// C3-18 repro: 9/13 was the last posting, 9/14's draw named a winner, and the
+// file predates the queue. The 9/14 posting must still carry that winner —
+// and the migration must not queue them a second time on the next pass.
+func TestCollectDailyAnnouncements_MigratesAPreQueueFilesUnpostedWinner(t *testing.T) {
+	st, _ := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-13",`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,`+
+		`"last_draw":{"date":"2026-09-14","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	// Float64 feeds the daily rate. Intn is scripted EMPTY: 9/14's draw is
+	// already stamped, so any actual draw here is a bug in the setup.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	want := LotteryDraw{Date: "2026-09-14", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+
+	jobs, err := st.collectDailyAnnouncements(migrationDay)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if len(jobs[0].LotteryDraws) != 1 || jobs[0].LotteryDraws[0] != want {
+		t.Fatalf("job.LotteryDraws = %+v, want exactly [%+v] — a winner the old format left in last_draw must still be posted",
+			jobs[0].LotteryDraws, want)
+	}
+
+	// Nothing was marked (the send has not happened), so the state the second
+	// pass reads is the one the first pass left. It must find the winner
+	// already queued rather than derive them from last_draw a second time.
+	jobs, err = st.collectDailyAnnouncements(migrationDay)
+	if err != nil {
+		t.Fatalf("second collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs on the second pass, want 1: %+v", len(jobs), jobs)
+	}
+	if len(jobs[0].LotteryDraws) != 1 || jobs[0].LotteryDraws[0] != want {
+		t.Fatalf("job.LotteryDraws = %+v on the second pass, want exactly [%+v] — the migration must not queue the same draw twice",
+			jobs[0].LotteryDraws, want)
+	}
+}
+
+// TestCollectDailyAnnouncements_DoesNotMigrateAnAlreadyPostedResult pins the
+// boundary of the "not posted yet" test. last_draw outlives its announcement
+// on purpose (/lottery status keeps showing the last real result), so a
+// migration that ignored LastAnnounced would repost that winner every single
+// morning. Date == LastAnnounced is the exact edge: the 9/14 draw was posted
+// on 9/14.
+func TestCollectDailyAnnouncements_DoesNotMigrateAnAlreadyPostedResult(t *testing.T) {
+	st, path := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-14",`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,`+
+		`"last_draw":{"date":"2026-09-14","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	// The pot is empty, so 9/15's draw names nobody and takes no Intn roll.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+
+	jobs, err := st.collectDailyAnnouncements(time.Date(2026, 9, 15, 10, 0, 0, 0, jst))
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if len(jobs[0].LotteryDraws) != 0 {
+		t.Fatalf("job.LotteryDraws = %+v, want empty — the 9/14 draw was posted on 9/14", jobs[0].LotteryDraws)
+	}
+	if queue := readGuild(t, path, "guild1").Lottery.Unannounced; len(queue) != 0 {
+		t.Fatalf("persisted Unannounced = %+v, want empty — a posted draw must not be put back in the queue", queue)
+	}
+}
+
+// TestCollectDailyAnnouncements_DoesNotMigrateADrawNobodyWon covers the other
+// guard. drawLotteryLocked never writes a winner-less last_draw (a quiet day
+// leaves the previous result standing), so this state can only come from a
+// hand edit or a partial write — and a draw with no winner has no prize to
+// report and nobody to celebrate.
+func TestCollectDailyAnnouncements_DoesNotMigrateADrawNobodyWon(t *testing.T) {
+	st, path := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-13",`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,`+
+		`"last_draw":{"date":"2026-09-14","winner_id":"","prize":0,"tickets_sold":0,"buyers":0}}}}`)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+
+	jobs, err := st.collectDailyAnnouncements(migrationDay)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if len(jobs[0].LotteryDraws) != 0 {
+		t.Fatalf("job.LotteryDraws = %+v, want empty — a draw that named nobody is not a result", jobs[0].LotteryDraws)
+	}
+	if queue := readGuild(t, path, "guild1").Lottery.Unannounced; len(queue) != 0 {
+		t.Fatalf("persisted Unannounced = %+v, want empty — a winner-less draw must not enter the queue", queue)
+	}
+}
+
+// TestCollectDailyAnnouncements_LeavesAPostQueueFileAlone is the other side of
+// the guard: once a file HAS a queue, the queue is the authority and last_draw
+// contributes nothing. The state below is what a confirmed 9/14 posting leaves
+// when a later draw is already waiting — retiring the older entry empties
+// nothing, and deriving a second entry from last_draw would post 9/15 twice.
+func TestCollectDailyAnnouncements_LeavesAPostQueueFileAlone(t *testing.T) {
+	st, _ := newTempStore(t)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-09-13")
+	queued := LotteryDraw{Date: "2026-09-14", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	newer := LotteryDraw{Date: "2026-09-15", WinnerID: "u8", Prize: 90, TicketsSold: 1, Buyers: 1}
+	if err := st.Update(func(d *Data) error {
+		lottery := &ensureGuildLocked(d, "guild1").Lottery
+		lottery.DrawDate = "2026-09-15" // 9/15's draw has run
+		lottery.LastDraw = &newer
+		lottery.Unannounced = []LotteryDraw{queued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the lottery state: %v", err)
+	}
+
+	jobs, err := st.collectDailyAnnouncements(time.Date(2026, 9, 15, 10, 0, 0, 0, jst))
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if got := jobs[0].LotteryDraws; len(got) != 1 || got[0] != queued {
+		t.Fatalf("job.LotteryDraws = %+v, want exactly [%+v] — a file that already has a queue must be read from the queue alone",
+			got, queued)
+	}
+}
+
+// TestCollectDailyAnnouncements_MigratesBeforeTodaysDrawOverwritesLastDraw is
+// why the migration sits in normalizeLotteryLocked rather than at the
+// announcement: the rollover overwrites last_draw with TODAY's winner, and the
+// normalisation point is the one place that runs BEFORE it. The morning after
+// the upgrade therefore posts both winners, oldest first.
+func TestCollectDailyAnnouncements_MigratesBeforeTodaysDrawOverwritesLastDraw(t *testing.T) {
+	st, _ := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-12",`+
+		`"lottery":{"draw_date":"2026-09-13","sales":200,"carryover":0,"tickets":{"u1":2},`+
+		`"last_draw":{"date":"2026-09-13","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	// One scripted roll: u1 holds every ticket, so 9/14's draw names them.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	migrated := LotteryDraw{Date: "2026-09-13", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+
+	jobs, err := st.collectDailyAnnouncements(migrationDay)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	got := jobs[0].LotteryDraws
+	if len(got) != 2 {
+		t.Fatalf("job.LotteryDraws = %+v, want 2 draws — 9/13's migrated winner and 9/14's fresh one", got)
+	}
+	if got[0] != migrated {
+		t.Fatalf("job.LotteryDraws[0] = %+v, want %+v — the older result must be posted first and must survive today's draw",
+			got[0], migrated)
+	}
+	if got[1].Date != "2026-09-14" || got[1].WinnerID != "u1" {
+		t.Fatalf("job.LotteryDraws[1] = %+v, want the 2026-09-14 draw won by u1", got[1])
+	}
+}
+
+// TestMigrateUnannounced_WaitsForAnAnnouncementChannel pins the one case the
+// migration deliberately declines: a guild with nowhere to post. The queue
+// feeds the 9am posting and nothing else, so migrating for a channel-less
+// guild writes a record no reader will ever reach. Declining is not losing
+// it — the repair lives at the read point, so it happens the moment a channel
+// is configured.
+func TestMigrateUnannounced_WaitsForAnAnnouncementChannel(t *testing.T) {
+	st, path := oldFormatStore(t, `{"guild1":{"announce_channel_id":"","last_announced":"2026-09-13",`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,`+
+		`"last_draw":{"date":"2026-09-14","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	// 9/14's draw is stamped, so no Intn roll may be taken on either pass.
+	st.rng = &lotteryRand{t: t, float: 0.5}
+
+	if _, err := st.EnsureTodayRate("guild1", migrationDay); err != nil {
+		t.Fatalf("EnsureTodayRate without an announcement channel: %v", err)
+	}
+	if queue := readGuild(t, path, "guild1").Lottery.Unannounced; len(queue) != 0 {
+		t.Fatalf("Unannounced = %+v, want empty — a guild with no channel has no posting to feed", queue)
+	}
+
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-09-13")
+	if _, err := st.EnsureTodayRate("guild1", migrationDay); err != nil {
+		t.Fatalf("EnsureTodayRate after the channel was configured: %v", err)
+	}
+	want := LotteryDraw{Date: "2026-09-14", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	queue := readGuild(t, path, "guild1").Lottery.Unannounced
+	if len(queue) != 1 || queue[0] != want {
+		t.Fatalf("Unannounced = %+v, want exactly [%+v] — configuring a channel must pick the unposted winner up", queue, want)
 	}
 }

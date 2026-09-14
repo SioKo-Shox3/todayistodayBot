@@ -345,7 +345,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯(資金の保存則)。**切り詰めは「壊れたファイルの値」にだけ許され、実装が作った値には許さない** — この区別を設計書に 1 行で書く。
 
 ## C3-18: 旧形式の未掲示結果を待ち行列へ移行する(2 周目 blocking 1)
-- status: todo
+- status: done
 - done-when: 同レビューの blocking 1 を直す。`CollectDailyAnnouncements` は `Unannounced` だけを見るため、**C3-12 より前の形式**で書かれた `data/casino.json`(`unannounced` キーが無く、未掲示の当選が `LastDraw` にだけある)を読むと、その回の掲示と祝いが永久に失われる(再現: `LastAnnounced="2026-09-13"`・`LastDraw.Date="2026-09-14"`・当選者あり・`unannounced` 無しで 14 日 10 時に起動)。読み取り点(`normalizeLotteryLocked`)で移行する: `Unannounced` が空で、`LastDraw` が非 nil・当選者あり・`LastDraw.Date > LastAnnounced` なら、`LastDraw` の写しを待ち行列へ 1 件入れる(`LastAnnounced` はギルド側にあるので、移行には `GuildEconomy` を渡す形にしてよい)。既に待ち行列に同じ日付があれば入れない(二重掲示の防止)。回帰テスト: 旧形式の JSON から掲示を集めると当選が job に入る / 同じ状態で 2 回集めても 1 件のまま / `LastDraw.Date <= LastAnnounced`(掲示済み)なら入らない / 当選者不在の `LastDraw` は入らない / 新形式(`unannounced` あり)の挙動が変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

@@ -410,7 +410,7 @@ func ensureTodayRateIndexLocked(economy *GuildEconomy, now time.Time, rng randSo
 	// to a value that has already wrapped. Every command and the
 	// announcement sweep reach the lottery through this function, so this
 	// one call is the whole guard — there is no second read path to cover.
-	normalizeLotteryLocked(&economy.Lottery)
+	normalizeLotteryLocked(economy)
 	seedJackpotLocked(economy)
 	// Roll the daily lottery over at the very same point, for the very same
 	// reason the rate is generated here (設計書 C-3a §3 の取りこぼし防止): this
@@ -1227,8 +1227,15 @@ func creditChipsCappedLocked(account *UserAccount, amount int64) int64 {
 // so it is deleted outright, and an oversized one is trimmed to the cap so
 // PickLotteryWinner's weighted walk cannot be handed a total that wraps. An
 // emptied map goes back to nil so it serialises as the zero Lottery does.
+//
+// It takes the whole GuildEconomy rather than the Lottery because the last
+// repair it performs — migrateUnannouncedLocked, a file from an older writer
+// fixed at the point it is read, the same kind of thing as the clamps — has
+// to compare a draw's date against economy.LastAnnounced, which lives one
+// level up from the pot.
 // Caller must already hold the Store's lock.
-func normalizeLotteryLocked(lottery *Lottery) {
+func normalizeLotteryLocked(economy *GuildEconomy) {
+	lottery := &economy.Lottery
 	if lottery.Sales < 0 {
 		lottery.Sales = 0
 	} else if lottery.Sales > MaxChips {
@@ -1252,6 +1259,55 @@ func normalizeLotteryLocked(lottery *Lottery) {
 	if len(lottery.Tickets) == 0 {
 		lottery.Tickets = nil
 	}
+	migrateUnannouncedLocked(economy)
+}
+
+// migrateUnannouncedLocked lifts a pre-C3-12 file's one pending result into
+// the announcement queue. Before C3-12 a settled draw lived only in LastDraw
+// and the 9am posting read THAT; the queue replaced it, and
+// collectDailyAnnouncements now reads nothing else. A casino.json written by
+// the older build therefore holds a winner in LastDraw and no "unannounced"
+// key at all — and if the upgrade landed between the draw and the next 09:00,
+// that winner would never be posted or celebrated, by this pass or any later
+// one.
+//
+// It runs from normalizeLotteryLocked, i.e. at the READ point, for the reason
+// 設計書 C-3a §8 gives for every other repair here: every command and the
+// announcement sweep reach the lottery through ensureTodayRateIndexLocked,
+// and normalisation happens there BEFORE drawLotteryLocked — so the old
+// result is queued before today's draw can overwrite LastDraw.
+//
+// "Not posted yet" is LastDraw.Date > LastAnnounced, which is exactly the
+// test the queue replaced. A file that already HAS a queue is a post-C3-12
+// file and is left alone: there the queue is authoritative, and re-deriving
+// an entry from LastDraw would repost a draw MarkAnnounced has retired
+// (LastDraw deliberately survives that retirement, so /lottery status keeps
+// showing the last real result). The same empty-queue guard is what makes
+// this idempotent — the entry it migrates is itself the reason the next pass
+// does nothing. A draw with no WinnerID is not a result and has nothing to
+// celebrate, and a dateless one (only a hand edit produces it) fails the
+// comparison, so neither reaches the queue.
+//
+// A guild with no AnnounceChannelID is skipped because the queue exists to
+// feed a posting and that guild has nowhere to post: collectDailyAnnouncements
+// passes it over entirely, so a migrated entry would be a write to the file
+// that nothing ever reads. Nothing is lost by waiting — this runs at every
+// read, so configuring a channel later migrates the result then, on the same
+// terms. (drawLotteryLocked queues regardless of the channel, and rightly so:
+// it is recording an event as it happens, not repairing a file.)
+// Caller must already hold the Store's lock.
+func migrateUnannouncedLocked(economy *GuildEconomy) {
+	lottery := &economy.Lottery
+	if economy.AnnounceChannelID == "" || len(lottery.Unannounced) > 0 {
+		return
+	}
+	last := lottery.LastDraw
+	if last == nil || last.WinnerID == "" || last.Date <= economy.LastAnnounced {
+		return
+	}
+	// Copied, not aliased: LastDraw and the queue entry are two independent
+	// records of one draw, and MarkAnnounced retires only the latter.
+	lottery.Unannounced = append(lottery.Unannounced, *last)
 }
 
 // lotterySummaryLocked totals the pot currently being sold into: tickets
