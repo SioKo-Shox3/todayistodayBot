@@ -285,3 +285,83 @@ func TestSweepIdleBoardsPaysNothingForAStateItCannotResolve(t *testing.T) {
 	}
 	editor.idle(t)
 }
+
+// --- 評価者の指摘(反復 1): 時間切れのボタンは無効化して残す ----------------
+
+// 設計書 §4/§8: 決着したメッセージのボタンは無効化(disabled)して残す. The
+// sweeper used to clear the row instead, which loses the hand the player was
+// looking at. It now asks the game that registered the custom_id prefix to
+// redraw its own buttons greyed out.
+func TestSweepIdleBoardsKeepsTheGamesButtonsDisabled(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+	RegisterComponent(&BlackjackCommand{}) // the real renderer, not a stand-in
+
+	seed := blackjackSeedWhere(t, "a playable hand", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying
+	})
+	bank, mgr, opened := sweepFixture(t, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	// sweepFixture opens every board as high&low; this hand is a blackjack
+	// one, and the sweeper must route by the session's own game.
+	mgr.Close(firstSessionID(t, mgr))
+	session, err := mgr.Open("g1", "u1", casino.GameBlackjack, blackjackProbe(100, seed), casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	if err != nil {
+		t.Fatalf("opening the blackjack board: %v", err)
+	}
+
+	editor := newRecordingEditor()
+	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+	edit := editor.took(t)
+	if edit.Components == nil || len(*edit.Components) != 1 {
+		t.Fatal("the timed-out board lost its buttons instead of keeping them disabled")
+	}
+	row, isRow := (*edit.Components)[0].(discordgo.ActionsRow)
+	if !isRow {
+		t.Fatalf("the kept components are %T, want discordgo.ActionsRow", (*edit.Components)[0])
+	}
+	if len(row.Components) != 3 {
+		t.Fatalf("the row kept %d buttons, want blackjack's 3", len(row.Components))
+	}
+	for _, component := range row.Components {
+		button, isButton := component.(discordgo.Button)
+		if !isButton {
+			t.Fatalf("the row holds a %T, want discordgo.Button", component)
+		}
+		if !button.Disabled {
+			t.Errorf("button %q is still pressable on a board that is over", button.Label)
+		}
+		if game, id, _, ok := ParseCustomID(button.CustomID); !ok || game != string(casino.GameBlackjack) || id != session.ID {
+			t.Errorf("button %q carries custom_id %q, want this blackjack board's", button.Label, button.CustomID)
+		}
+	}
+}
+
+// A game that does not draw its own closing row still gets its live buttons
+// removed — a nil Components field would leave a PLAYABLE row under a board
+// that is over.
+func TestSweepIdleBoardsClearsTheButtonsOfAGameThatCannotRedrawThem(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	board := &fixedResolver{payout: 250}
+	bank, mgr, opened := sweepFixture(t, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	editor := newRecordingEditor()
+
+	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+	edit := editor.took(t)
+	if edit.Components == nil || len(*edit.Components) != 0 {
+		t.Error("an unrenderable board must have its live buttons cleared")
+	}
+}
+
+// firstSessionID returns the ID of the manager's only board.
+func firstSessionID(t *testing.T, mgr *casino.SessionManager) string {
+	t.Helper()
+	expired := mgr.Sweep(time.Now().Add(100 * 365 * 24 * time.Hour))
+	if len(expired) != 1 {
+		t.Fatalf("the fixture holds %d boards, want exactly 1", len(expired))
+	}
+	return expired[0].ID
+}

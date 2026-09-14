@@ -265,6 +265,18 @@ func highLowButtons(sessionID string, board highLowBoard, disableAll bool) []dis
 	}
 }
 
+// DisabledComponents redraws a swept board's buttons greyed out, for the
+// sweeper's closing edit (設計書 §4: 決着したメッセージのボタンは無効化して残す).
+// state is the board Sweep took out of the manager, so reading it here needs
+// no lock.
+func (c *HighLowCommand) DisabledComponents(sessionID string, state any) []discordgo.MessageComponent {
+	game, isHighLow := state.(*casino.HighLowGame)
+	if !isHighLow {
+		return nil
+	}
+	return highLowButtons(sessionID, snapshotHighLow(game), true)
+}
+
 // translateHighLowError renders the errors /highlow can refuse a bet with
 // (設計書 §9). Anything else is logged (redacted) and reported generically:
 // a store failure must not leak a path or a token into the channel.

@@ -590,6 +590,19 @@ func (c *BlackjackCommand) stakeDouble(session casino.Session, sessionID string)
 	return c.store.AddToEscrow(session.GuildID, session.UserID, extra)
 }
 
+// DisabledComponents redraws a swept hand's buttons greyed out, for the
+// sweeper's closing edit (設計書 §4: 決着したメッセージのボタンは無効化して残す).
+// state is the board Sweep took out of the manager, so reading it here needs
+// no lock. affordsDouble is false on purpose: every button is disabled
+// anyway, and asking the store would put disk I/O on the sweep path.
+func (c *BlackjackCommand) DisabledComponents(sessionID string, state any) []discordgo.MessageComponent {
+	game, isBlackjack := state.(*casino.BlackjackGame)
+	if !isBlackjack {
+		return nil
+	}
+	return blackjackButtons(sessionID, snapshotBlackjack(game), false, true)
+}
+
 // blackjackPending is a finished hand's unpaid settlement: everything needed
 // to pay it and to draw the closing message.
 type blackjackPending struct {

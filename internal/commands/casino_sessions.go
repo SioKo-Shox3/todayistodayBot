@@ -114,16 +114,44 @@ func editTimedOutBoard(editor boardEditor, session *casino.Session, settled casi
 
 	edit := discordgo.NewMessageEdit(session.Ref.ChannelID, session.Ref.MessageID)
 	edit.SetEmbeds([]*discordgo.MessageEmbed{casinoTimeoutEmbed(settled)})
-	// The buttons go rather than turn grey, which is the one place this
-	// departs from 設計書 §4's "disable and keep": those buttons are the
-	// GAME's (their labels carry its hand), and the sweeper only knows it
-	// swept an AutoResolver. Rebuilding them here would mean teaching this
-	// file every game's rendering — the coupling §5 keeps it free of.
-	edit.Components = &[]discordgo.MessageComponent{}
+	// 設計書 §4/§8: a settled board keeps its buttons, greyed out. The labels
+	// are the GAME's (they carry its hand and its odds), so the sweeper asks
+	// the game that registered this custom_id prefix to redraw them disabled
+	// instead of learning every game's rendering itself.
+	components := disabledComponentsFor(session)
+	edit.Components = &components
 
 	if _, err := editor.ChannelMessageEditComplex(edit); err != nil {
 		slog.Error("discord: editing a timed-out board failed", "game", string(session.Game), "error", redactInteractionError(err))
 	}
+}
+
+// timedOutBoardRenderer is the optional half of ComponentHandler: a game that
+// implements it can redraw a swept board's buttons disabled for the closing
+// edit. It is optional rather than part of ComponentHandler because the
+// sweeper has an answer either way — a game that does not implement it simply
+// loses its buttons, which is strictly what this file did before.
+//
+// state is the swept session's board. Sweep already removed it from the
+// manager and handed it to this goroutine alone, so reading it here needs no
+// lock (the same licence sweepIdleBoards uses for AutoResolve).
+type timedOutBoardRenderer interface {
+	DisabledComponents(sessionID string, state any) []discordgo.MessageComponent
+}
+
+// disabledComponentsFor asks the game that owns session's custom_id prefix
+// for its greyed-out buttons. The empty (non-nil) slice is what removes the
+// live buttons when no game answers — a nil Components field would leave the
+// PLAYABLE row under a board that is over.
+func disabledComponentsFor(session *casino.Session) []discordgo.MessageComponent {
+	if handler, found := registeredComponents[string(session.Game)]; found {
+		if renderer, draws := handler.(timedOutBoardRenderer); draws {
+			if components := renderer.DisabledComponents(session.ID, session.State); components != nil {
+				return components
+			}
+		}
+	}
+	return []discordgo.MessageComponent{}
 }
 
 // casinoTimeoutEmbed is the closing message of an auto-resolved board. It
