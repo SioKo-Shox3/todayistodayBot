@@ -3261,7 +3261,14 @@ func TestLotteryDraw_NoBuyersRollsThePrizeForwardAndKeepsTheLastResult(t *testin
 
 	older := LotteryDraw{Date: "2026-07-01", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
 	if err := st.Update(func(d *Data) error {
-		lottery := &ensureGuildLocked(d, guildID).Lottery
+		economy := ensureGuildLocked(d, guildID)
+		// Seeded as ALREADY POSTED. Without this, the file is indistinguishable
+		// from a pre-queue one — a winner in last_draw, no queue, no posting
+		// ever recorded — and migrateUnannouncedLocked rightly queues it, which
+		// would put an entry in Unannounced that the quiet draw below did not
+		// put there and make the assertion on it read the wrong mechanism.
+		economy.LastAnnounced = older.Date
+		lottery := &economy.Lottery
 		lottery.Carryover, lottery.DrawDate, lottery.LastDraw = 300, jstDate(fixedNow), &older
 		return nil
 	}); err != nil {

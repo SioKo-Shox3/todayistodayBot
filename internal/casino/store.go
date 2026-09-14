@@ -1288,17 +1288,18 @@ func normalizeLotteryLocked(economy *GuildEconomy) {
 // celebrate, and a dateless one (only a hand edit produces it) fails the
 // comparison, so neither reaches the queue.
 //
-// A guild with no AnnounceChannelID is skipped because the queue exists to
-// feed a posting and that guild has nowhere to post: collectDailyAnnouncements
-// passes it over entirely, so a migrated entry would be a write to the file
-// that nothing ever reads. Nothing is lost by waiting — this runs at every
-// read, so configuring a channel later migrates the result then, on the same
-// terms. (drawLotteryLocked queues regardless of the channel, and rightly so:
-// it is recording an event as it happens, not repairing a file.)
+// AnnounceChannelID is deliberately NOT part of this test, the same way
+// drawLotteryLocked ignores it: whether a draw is WORTH KEEPING and whether
+// there is somewhere to post it today are two different questions, and only
+// collectDailyAnnouncements gets to answer the second. Gating the migration
+// on a configured channel loses the result outright — the window is only
+// open until the next draw, and drawLotteryLocked overwrites LastDraw — so a
+// guild that configures its channel a day later would find the winner gone,
+// which is precisely the failure this migration exists to prevent.
 // Caller must already hold the Store's lock.
 func migrateUnannouncedLocked(economy *GuildEconomy) {
 	lottery := &economy.Lottery
-	if economy.AnnounceChannelID == "" || len(lottery.Unannounced) > 0 {
+	if len(lottery.Unannounced) > 0 {
 		return
 	}
 	last := lottery.LastDraw

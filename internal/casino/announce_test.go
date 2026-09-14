@@ -1188,33 +1188,98 @@ func TestCollectDailyAnnouncements_MigratesBeforeTodaysDrawOverwritesLastDraw(t 
 	}
 }
 
-// TestMigrateUnannounced_WaitsForAnAnnouncementChannel pins the one case the
-// migration deliberately declines: a guild with nowhere to post. The queue
-// feeds the 9am posting and nothing else, so migrating for a channel-less
-// guild writes a record no reader will ever reach. Declining is not losing
-// it — the repair lives at the read point, so it happens the moment a channel
-// is configured.
-func TestMigrateUnannounced_WaitsForAnAnnouncementChannel(t *testing.T) {
-	st, path := oldFormatStore(t, `{"guild1":{"announce_channel_id":"","last_announced":"2026-09-13",`+
-		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,`+
-		`"last_draw":{"date":"2026-09-14","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
-	// 9/14's draw is stamped, so no Intn roll may be taken on either pass.
-	st.rng = &lotteryRand{t: t, float: 0.5}
+// TestMigrateUnannounced_KeepsTheWinnerOfAGuildWithNoChannelYet is the C3-19
+// [P1] repro. A guild with no AnnounceChannelID is exactly the guild that
+// needs the migration most: nothing posts for it, so the only record of
+// 9/13's winner is last_draw — and 9/14's draw overwrites last_draw within
+// hours. If the migration waits for a channel, the winner is gone before the
+// channel can be configured. Note the tickets: they are what makes 9/14
+// draw at all, which is what made the old gate lossy rather than merely late.
+func TestMigrateUnannounced_KeepsTheWinnerOfAGuildWithNoChannelYet(t *testing.T) {
+	st, path := oldFormatStore(t, `{"guild1":{"announce_channel_id":"","last_announced":"2026-09-12",`+
+		`"lottery":{"draw_date":"2026-09-13","sales":100,"carryover":0,"tickets":{"u1":2},`+
+		`"last_draw":{"date":"2026-09-13","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	// One scripted roll: u1 holds every ticket, so 9/14's draw names them and
+	// overwrites last_draw. That overwrite is the whole point of the repro.
+	st.rng = &lotteryRand{t: t, float: 0.5, rolls: []int{0}}
+	want := LotteryDraw{Date: "2026-09-13", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
 
 	if _, err := st.EnsureTodayRate("guild1", migrationDay); err != nil {
 		t.Fatalf("EnsureTodayRate without an announcement channel: %v", err)
 	}
-	if queue := readGuild(t, path, "guild1").Lottery.Unannounced; len(queue) != 0 {
-		t.Fatalf("Unannounced = %+v, want empty — a guild with no channel has no posting to feed", queue)
+
+	lottery := readGuild(t, path, "guild1").Lottery
+	if lottery.LastDraw == nil || lottery.LastDraw.Date != "2026-09-14" {
+		t.Fatalf("LastDraw = %+v, want 9/14's draw — the setup must actually overwrite it", lottery.LastDraw)
+	}
+	if len(lottery.Unannounced) == 0 {
+		t.Fatalf("Unannounced is empty — 9/13's winner %+v was lost to 9/14's draw because the guild had no channel yet", want)
+	}
+	if lottery.Unannounced[0] != want {
+		t.Fatalf("Unannounced[0] = %+v, want %+v — the migrated winner must survive today's draw", lottery.Unannounced[0], want)
 	}
 
+	// Configuring the channel afterwards posts it: the point of keeping it.
 	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-09-13")
-	if _, err := st.EnsureTodayRate("guild1", migrationDay); err != nil {
-		t.Fatalf("EnsureTodayRate after the channel was configured: %v", err)
+	jobs, err := st.collectDailyAnnouncements(migrationDay)
+	if err != nil {
+		t.Fatalf("collectDailyAnnouncements after the channel was configured: %v", err)
 	}
-	want := LotteryDraw{Date: "2026-09-14", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
-	queue := readGuild(t, path, "guild1").Lottery.Unannounced
-	if len(queue) != 1 || queue[0] != want {
-		t.Fatalf("Unannounced = %+v, want exactly [%+v] — configuring a channel must pick the unposted winner up", queue, want)
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(jobs), jobs)
+	}
+	if got := jobs[0].LotteryDraws; len(got) != 2 || got[0] != want {
+		t.Fatalf("job.LotteryDraws = %+v, want 9/13's migrated winner first, then 9/14's", got)
+	}
+}
+
+// TestMarkAnnounced_DoesNotLetAClockRollbackRepostADraw is the C3-19 [P2]
+// repro. 9/14 is posted and marked. The clock then steps back to 9/13, which
+// posts for that earlier day — and if that posting pulled LastAnnounced back
+// with it, the 9/14 pass that follows would see 9/14 as unposted, re-queue
+// its winner off LastDraw and celebrate them twice.
+func TestMarkAnnounced_DoesNotLetAClockRollbackRepostADraw(t *testing.T) {
+	var (
+		day13 = time.Date(2026, 9, 13, 10, 0, 0, 0, jst)
+		day14 = time.Date(2026, 9, 14, 10, 0, 0, 0, jst)
+		drawn = LotteryDraw{Date: "2026-09-14", WinnerID: "u9", Prize: 1234, TicketsSold: 7, Buyers: 2}
+	)
+	// New format: "unannounced" is present and empty because MarkAnnounced
+	// already retired 9/14's entry. Rates for both days exist, so neither
+	// pass rolls a draw — 9/14's pot is stamped and sold nothing.
+	st, _ := oldFormatStore(t, `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-14",`+
+		`"rates":[{"date":"2026-09-13","rate":100},{"date":"2026-09-14","rate":100}],`+
+		`"lottery":{"draw_date":"2026-09-14","sales":0,"carryover":0,"unannounced":[],`+
+		`"last_draw":{"date":"2026-09-14","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}}}}`)
+	st.rng = &lotteryRand{t: t, float: 0.5}
+
+	var posted []AnnouncementJob
+	callback := func(job AnnouncementJob) error {
+		posted = append(posted, job)
+		return nil
+	}
+	runAnnouncePass(context.Background(), st, callback, day13) // the clock steps back
+	runAnnouncePass(context.Background(), st, callback, day14) // and forward again
+
+	for _, job := range posted {
+		for _, draw := range job.LotteryDraws {
+			if draw == drawn {
+				t.Fatalf("posted %+v again (jobs: %+v) — MarkAnnounced let a rolled-back clock reopen an announced day", drawn, posted)
+			}
+		}
+	}
+}
+
+// TestMarkAnnounced_AdvancesTheMarkOnAForwardClock is the other half of the
+// high-water mark: refusing to go backwards must not stop it going forwards.
+func TestMarkAnnounced_AdvancesTheMarkOnAForwardClock(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAnnounceGuild(t, st, "guild1", "chan1", "2026-09-13")
+
+	if err := st.MarkAnnounced("guild1", "2026-09-14"); err != nil {
+		t.Fatalf("MarkAnnounced: %v", err)
+	}
+	if got := readGuild(t, path, "guild1").LastAnnounced; got != "2026-09-14" {
+		t.Fatalf("LastAnnounced = %q, want %q — a normal forward posting must still move the mark", got, "2026-09-14")
 	}
 }

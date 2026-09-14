@@ -102,10 +102,23 @@ func (s *Store) collectDailyAnnouncements(now time.Time) ([]AnnouncementJob, err
 // that settled WHILE the message was in flight carries a later date and must
 // survive to be posted next time. Both sides are "YYYY-MM-DD", so the
 // lexicographic order is the calendar one.
+//
+// LastAnnounced only ever moves FORWARD. It is a high-water mark — "every
+// day up to here has had its posting" — and both readers treat it as one:
+// collectDailyAnnouncements skips a guild whose mark already reads today,
+// and migrateUnannouncedLocked calls a draw unposted when it is dated after
+// the mark. A clock that steps back (NTP correction, a host with the wrong
+// date) posts for the earlier day, and letting that posting pull the mark
+// back would re-open both tests on days that are already done: the later
+// day would be announced a second time and its winner re-queued and
+// re-celebrated. Pruning is NOT gated the same way — those draws really
+// were in the message that just went out, whatever today's date says.
 func (s *Store) MarkAnnounced(guildID, date string) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
-		economy.LastAnnounced = date
+		if date > economy.LastAnnounced {
+			economy.LastAnnounced = date
+		}
 		lottery := &economy.Lottery
 		kept := lottery.Unannounced[:0]
 		for _, draw := range lottery.Unannounced {
