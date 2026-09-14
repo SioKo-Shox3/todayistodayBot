@@ -35,3 +35,22 @@ func TestFormatHelpText_Empty(t *testing.T) {
 		t.Fatalf("expected empty-list message, got: %q", got)
 	}
 }
+
+// 設計書 §8「`/help` の一覧に 2 本を足す」。The list IS the registry, so the
+// two button games are on it by having registered themselves — this pins that
+// the self-registration holds, because a game that forgets Register() would
+// disappear from /help without any other test noticing.
+func TestFormatHelpText_ListsTheButtonGames(t *testing.T) {
+	defs := make([]*discordgo.ApplicationCommand, 0, len(All()))
+	for _, cmd := range All() {
+		defs = append(defs, cmd.Definition())
+	}
+
+	got := formatHelpText(defs)
+
+	for _, name := range []string{"highlow", "blackjack"} {
+		if !strings.Contains(got, "`/"+name+"` - ") {
+			t.Errorf("/help does not list /%s:\n%s", name, got)
+		}
+	}
+}

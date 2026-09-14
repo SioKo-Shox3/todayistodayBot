@@ -112,10 +112,17 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: ダブルの追加ベットは `AddToEscrow` が失敗したら盤面に適用しない(順序: 永続化 → 適用)。
 
 ## C2-08: 起動時の返金・放置の Sweep goroutine・help・文書(§3・§5・§8)
-- status: todo
+- status: done
 - done-when: `cmd/bot/main.go`: 起動時(セッション接続後、掲示スケジューラの起動と同じ場所)に `casino.Default().RefundStaleEscrows(now)` を呼んで件数をログ、Sweep goroutine(30 秒周期、掲示スケジューラと同じ ctx で終了)を起動 — goroutine 本体は `internal/commands/casino_sessions.go`(`RunSessionSweeper(ctx, s, mgr, store, interval)`: `Sweep` → 各ゲームの `AutoResolve` → `SettleGame` → メッセージを「⌛ 時間切れ — 自動決着」に編集。編集失敗はログのみ)。`RunSessionSweeper` のテスト(fake clock + fake responder: 期限切れ 1 件が精算され編集される、ctx cancel で戻る)。`/help` にコマンド一覧があれば `/highlow` `/blackjack` を足す。`README.md` のコマンド一覧に 2 本を足す。`Docs/agent-guide/architecture.md` は展開コピーなので触らず、`blocked/C2-08.md` に正本(MyWorkflow)へ写す追記(レイヤー表・所有権(SessionManager)・依存方向・危険地帯 5 点目 = escrow の保存則と二重決着)を書く。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./... -count=1`
 - verify: `go build -o bin/todayistodaybot ./cmd/bot`
 - paths: cmd/bot/main.go, cmd/bot/main_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/commands/help.go, internal/commands/help_test.go, README.md, blocked/C2-08.md
 - notes: `main.go` の変更は C2-01 の分岐と合わせて 3 点(§12)。README は公開物 — 過程を書かない。
+
+## C2-09: README のコマンド一覧に C-1 のカジノ 7 コマンドを足す
+- status: todo
+- done-when: `README.md` の「カジノ」節に `/balance` `/daily` `/rate` `/exchange` `/slot` `/rank` `/casino-admin` を、各コマンドの `Definition()` の説明・オプションと矛盾しない形で足す(C2-08 で `/highlow` `/blackjack` だけが載っている状態を解消する)。文書のみで実装は変えない。
+- verify: `go build ./... && go vet ./...`
+- paths: README.md
+- notes: C2-08 で見つけた取りこぼし。README は公開物 — 過程を書かない。
