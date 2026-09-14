@@ -126,10 +126,10 @@ func TestBalanceCommand_ShowsTheNetTheEconomyRecorded(t *testing.T) {
 	if err := store.EnsureCasinoAccess("g1", "u1", now); err != nil {
 		t.Fatalf("EnsureCasinoAccess: %v", err)
 	}
-	if err := store.OpenGame("g1", "u1", string(casino.GameHighLow), 200, now); err != nil {
+	if err := store.OpenGame("g1", "u1", string(casino.GameHighLow), testEscrowSession, 200, now); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
-	if _, err := store.SettleGame("g1", "u1", 0); err != nil {
+	if _, err := store.SettleGame("g1", "u1", testEscrowSession, 0); err != nil {
 		t.Fatalf("SettleGame: %v", err)
 	}
 

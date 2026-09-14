@@ -358,15 +358,23 @@ func settleRetryButtons(game, sessionID string) []discordgo.MessageComponent {
 // deals. *casino.Store satisfies it; only the tests supply anything else.
 type casinoBank interface {
 	EnsureCasinoAccess(guildID, userID string, now time.Time) error
-	OpenGame(guildID, userID, game string, bet int64, now time.Time) error
-	AddToEscrow(guildID, userID string, amount int64) error
-	SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error)
+	// Every call that touches a stake names the BOARD it belongs to
+	// (設計書 C-3b): OpenGame marks the chips, BindEscrowSession hands that
+	// mark to the board once the manager has published its ID, and the rest
+	// are refused with casino.ErrEscrowMismatch unless the account is holding
+	// the stake that board opened. The two-step open is what keeps the stake
+	// unspendable in the gap — the chips move BEFORE the board exists
+	// (C2-06), so there is no board ID to mark them with yet.
+	OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error
+	BindEscrowSession(guildID, userID, sessionID string) error
+	AddToEscrow(guildID, userID, sessionID string, amount int64) error
+	SettleGame(guildID, userID, sessionID string, payout int64) (casino.SettleResult, error)
 	ViewAccount(guildID, userID string, now time.Time) (casino.AccountView, error)
 	// The duel settles two accounts at once and withdraws through its own
 	// route: AcceptDuel is the whole game in one transaction, and DeclineDuel
 	// is the refund that cannot fail on the chip cap (設計書 C-3b §4.5). They
 	// are on this interface rather than on a second one so that /duel keeps
 	// the same seam — and the same test doubles — as the other two games.
-	AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (casino.DuelSettlement, error)
-	DeclineDuel(guildID, challengerID string) error
+	AcceptDuel(guildID, challengerID, opponentID, sessionID string, bet int64, challengerWins bool) (casino.DuelSettlement, error)
+	DeclineDuel(guildID, challengerID, sessionID string) error
 }

@@ -29,6 +29,16 @@ var (
 	// inside the Update closure, so a refusal persists nothing.
 	ErrGameInProgress   = errors.New("casino: a game is already in progress")
 	ErrNoGameInProgress = errors.New("casino: no game in progress")
+	// ErrEscrowMismatch means the account IS holding a stake, but not the one
+	// the caller is settling: the escrow carries another board's session ID
+	// (設計書 C-3b). ErrNoGameInProgress guards the account that has nothing
+	// left to pay; this guards the account that has something to pay which
+	// belongs to somebody else's game — a settlement that was still in
+	// flight when its own board was closed and refunded, arriving after the
+	// player has opened the next game. Like the other two it is returned
+	// from inside the Update closure, so the stake it refuses to touch is
+	// left exactly as it was for the board that does own it.
+	ErrEscrowMismatch = errors.New("casino: the stake in escrow belongs to another board")
 	// ErrDuelSelf refuses a duel whose two sides are the same user. The
 	// command layer rejects this first with its own 「❌ 自分自身とは対戦
 	// できません」 (設計書 §4.5), so this is defense in depth — but of the

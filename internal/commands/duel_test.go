@@ -137,10 +137,10 @@ func duelDrainChips(t *testing.T, bank *flakyBank, userID string, keep int64) {
 	if loss <= 0 {
 		t.Fatalf("%s already holds %d chips, cannot drain down to %d", userID, chips, keep)
 	}
-	if err := bank.OpenGame("g1", userID, string(casino.GameHighLow), loss, time.Now()); err != nil {
+	if err := bank.OpenGame("g1", userID, string(casino.GameHighLow), testEscrowSession, loss, time.Now()); err != nil {
 		t.Fatalf("draining %s: OpenGame: %v", userID, err)
 	}
-	if _, err := bank.SettleGame("g1", userID, 0); err != nil {
+	if _, err := bank.SettleGame("g1", userID, testEscrowSession, 0); err != nil {
 		t.Fatalf("draining %s: SettleGame: %v", userID, err)
 	}
 }
@@ -668,7 +668,7 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 	if err := bank.EnsureCasinoAccess("g1", duelChallenger, opened); err != nil {
 		t.Fatalf("EnsureCasinoAccess: %v", err)
 	}
-	if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), 100, opened); err != nil {
+	if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), casino.EscrowOpening, 100, opened); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
 	// The manager's clock is frozen at the challenge, so LastActionAt is
@@ -676,8 +676,14 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
 	c.sessions = mgr
 	board := &casino.DuelState{ChallengerID: duelChallenger, OpponentID: duelOpponent, Bet: 100, Stage: casino.DuelPending}
-	if _, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
+	session, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	if err != nil {
 		t.Fatalf("opening the challenge: %v", err)
+	}
+	// The stake becomes this challenge's, as /duel binds it once the manager
+	// has published an ID (C-3b) — the sweeper withdraws by that ID.
+	if err := bank.BindEscrowSession("g1", duelChallenger, session.ID); err != nil {
+		t.Fatalf("BindEscrowSession: %v", err)
 	}
 
 	editor := newRecordingEditor()
@@ -730,12 +736,12 @@ type duelFailingBank struct {
 	acceptErr error
 }
 
-func (b *duelFailingBank) AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (casino.DuelSettlement, error) {
+func (b *duelFailingBank) AcceptDuel(guildID, challengerID, opponentID, sessionID string, bet int64, challengerWins bool) (casino.DuelSettlement, error) {
 	if err := b.acceptErr; err != nil {
 		b.acceptErr = nil // once — the retry must reach the real store
 		return casino.DuelSettlement{}, err
 	}
-	return b.flakyBank.AcceptDuel(guildID, challengerID, opponentID, bet, challengerWins)
+	return b.flakyBank.AcceptDuel(guildID, challengerID, opponentID, sessionID, bet, challengerWins)
 }
 
 // 反復 4 の指摘 1: 保存前に失敗した受諾は、預かりを口座に残したまま返ってくる。
@@ -808,13 +814,16 @@ func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
 			if err := bank.EnsureCasinoAccess("g1", duelChallenger, opened); err != nil {
 				t.Fatalf("EnsureCasinoAccess: %v", err)
 			}
-			if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), 100, opened); err != nil {
+			if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), casino.EscrowOpening, 100, opened); err != nil {
 				t.Fatalf("OpenGame: %v", err)
 			}
 			board := &casino.DuelState{ChallengerID: duelChallenger, OpponentID: duelOpponent, Bet: 100, Stage: casino.DuelPending}
 			session, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 			if err != nil {
 				t.Fatalf("opening the challenge: %v", err)
+			}
+			if err := bank.BindEscrowSession("g1", duelChallenger, session.ID); err != nil {
+				t.Fatalf("BindEscrowSession: %v", err)
 			}
 
 			// One second before the deadline, a bystander presses.

@@ -365,7 +365,9 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 	// Stake BEFORE the hand (完了条件の順序), for the reason /highlow states:
 	// Store.OpenGame is the persisted half of "one game per person", so it is
 	// the half that refuses a second bet.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), bet, now); err != nil {
+	// Marked casino.EscrowOpening until the hand exists, for the reason
+	// /highlow states: an unmarked stake is one any settlement can spend.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), casino.EscrowOpening, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
@@ -374,7 +376,16 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 
 	session, err := c.sessions.Open(i.GuildID, userID, casino.GameBlackjack, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableHand(i.GuildID, userID, bet) // the chips already moved: hand them straight back
+		c.refundUnplayableHand(i.GuildID, userID, casino.EscrowOpening, bet) // the chips already moved: hand them straight back
+		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
+	}
+
+	// The hand owns the stake from here: ⏫, every press and the sweeper all
+	// name this ID, and nothing else can settle these chips.
+	if err := c.store.BindEscrowSession(i.GuildID, userID, session.ID); err != nil {
+		if c.sessions.Close(session.ID) {
+			c.refundUnplayableHand(i.GuildID, userID, casino.EscrowOpening, bet)
+		}
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
@@ -434,7 +445,7 @@ func (c *BlackjackCommand) closeUndeliveredHand(sessionID, guildID, userID strin
 	defer c.locks.release(sessionID, lock)
 
 	if c.sessions.Close(sessionID) {
-		c.refundUnplayableHand(guildID, userID, bet)
+		c.refundUnplayableHand(guildID, userID, sessionID, bet)
 	}
 }
 
@@ -442,8 +453,12 @@ func (c *BlackjackCommand) closeUndeliveredHand(sessionID, guildID, userID strin
 // Failing only means the chips stay in escrow until the next restart returns
 // them (RefundStaleEscrows), so it is logged rather than shown to the player,
 // who already has a refusal in front of them.
-func (c *BlackjackCommand) refundUnplayableHand(guildID, userID string, bet int64) {
-	if _, err := c.store.SettleGame(guildID, userID, bet); err != nil {
+//
+// escrowID is the mark the stake carries at this point of the open — see
+// /highlow's refundUnplayableBoard — so the refund can only ever hand back
+// the chips this hand staked.
+func (c *BlackjackCommand) refundUnplayableHand(guildID, userID, escrowID string, bet int64) {
+	if _, err := c.store.SettleGame(guildID, userID, escrowID, bet); err != nil {
 		slog.Error("casino: refunding an undelivered blackjack hand failed", "error", redactInteractionError(err))
 	}
 }
@@ -620,7 +635,7 @@ func (c *BlackjackCommand) stakeDouble(session casino.Session, sessionID string)
 	}); err != nil {
 		return err
 	}
-	return c.store.AddToEscrow(session.GuildID, session.UserID, extra)
+	return c.store.AddToEscrow(session.GuildID, session.UserID, sessionID, extra)
 }
 
 // DisabledComponents redraws a swept hand's buttons greyed out, for the
@@ -688,7 +703,7 @@ type blackjackPending struct {
 // ChannelMessageWithSource for a hand that ended at the deal, where no message
 // exists yet, and UpdateMessage for every press. The caller holds lock.
 func (c *BlackjackCommand) settle(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, lock *boardLock, pending *blackjackPending, responseType discordgo.InteractionResponseType) error {
-	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, pending.Payout)
+	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, sessionID, pending.Payout)
 	if err != nil {
 		slog.Error("casino: SettleGame failed for blackjack", "error", redactInteractionError(err))
 		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{

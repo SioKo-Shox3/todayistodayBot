@@ -327,7 +327,7 @@ func (c *DuelCommand) SettleTimedOutBoard(session *casino.Session) (casino.Settl
 	if !isDuel {
 		return casino.SettleResult{}, errDuelBadState
 	}
-	if err := c.store.DeclineDuel(session.GuildID, board.ChallengerID); err != nil {
+	if err := c.store.DeclineDuel(session.GuildID, board.ChallengerID, session.ID); err != nil {
 		return casino.SettleResult{}, err
 	}
 	board.Stage = casino.DuelSettled
@@ -437,7 +437,11 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 	// Stake the challenger BEFORE the board, the order C2-06 settled: the
 	// persisted half of "one game per person" is the half that survives a
 	// restart, so it is the one that must refuse a second bet.
-	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), bet, now); err != nil {
+	// The stake is marked casino.EscrowOpening until the challenge board
+	// exists (設計書 C-3b): two challenges of the same size are otherwise
+	// indistinguishable, so an unmarked stake is one another acceptance could
+	// spend.
+	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), casino.EscrowOpening, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
@@ -446,7 +450,17 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 
 	session, err := c.sessions.Open(i.GuildID, challengerID, casino.GameDuel, state, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUndeliveredChallenge(i.GuildID, challengerID)
+		c.refundUndeliveredChallenge(i.GuildID, challengerID, casino.EscrowOpening)
+		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
+	}
+
+	// The challenge owns the stake from here: 🎲 and 🚫, the sweeper and this
+	// function's own refund all name this board, and an acceptance that names
+	// a challenge already withdrawn is refused instead of paid out of it.
+	if err := c.store.BindEscrowSession(i.GuildID, challengerID, session.ID); err != nil {
+		if c.sessions.Close(session.ID) {
+			c.refundUndeliveredChallenge(i.GuildID, challengerID, casino.EscrowOpening)
+		}
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
@@ -464,7 +478,7 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 		// message and still fail this call, and the challenge can be answered
 		// while the error is in flight.
 		if c.sessions.Close(session.ID) {
-			c.refundUndeliveredChallenge(i.GuildID, challengerID)
+			c.refundUndeliveredChallenge(i.GuildID, challengerID, session.ID)
 		}
 		return err
 	}
@@ -476,9 +490,11 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 // refundUndeliveredChallenge returns a stake whose challenge never became
 // pressable. It goes through DeclineDuel rather than SettleGame for the
 // reason SettleTimedOutBoard gives, and that call's EscrowGame check is what
-// stops it from refunding some other game's stake if one has opened since.
-func (c *DuelCommand) refundUndeliveredChallenge(guildID, challengerID string) {
-	if err := c.store.DeclineDuel(guildID, challengerID); err != nil {
+// stops it from refunding some other game's stake if one has opened since —
+// and escrowID, the mark the stake carries at this point of the open, is what
+// stops it when that other game is another DUEL (設計書 C-3b).
+func (c *DuelCommand) refundUndeliveredChallenge(guildID, challengerID, escrowID string) {
+	if err := c.store.DeclineDuel(guildID, challengerID, escrowID); err != nil {
 		slog.Error("casino: refunding an undelivered duel challenge failed", "error", redactInteractionError(err))
 	}
 }
@@ -567,7 +583,7 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 // store transaction, THEN shows the result: chips before pixels, the order
 // every board in this package keeps.
 func (c *DuelCommand) accept(r interactionResponder, i *discordgo.InteractionCreate, sessionID, guildID string, board casino.DuelState) error {
-	settlement, err := c.store.AcceptDuel(guildID, board.ChallengerID, board.OpponentID, board.Bet, c.flip())
+	settlement, err := c.store.AcceptDuel(guildID, board.ChallengerID, board.OpponentID, sessionID, board.Bet, c.flip())
 	if err != nil {
 		if duelAcceptDropsTheChallenge(err) {
 			// The stake behind this challenge is gone, so the board can never
@@ -592,7 +608,7 @@ func (c *DuelCommand) accept(r interactionResponder, i *discordgo.InteractionCre
 // decline returns the challenger's stake and closes the challenge. The
 // opponent staked nothing, so nothing of theirs moves.
 func (c *DuelCommand) decline(r interactionResponder, i *discordgo.InteractionCreate, sessionID, guildID string, board casino.DuelState) error {
-	if err := c.store.DeclineDuel(guildID, board.ChallengerID); err != nil {
+	if err := c.store.DeclineDuel(guildID, board.ChallengerID, sessionID); err != nil {
 		// Nothing was refunded, so the challenge stays exactly as it was: a
 		// board whose stake is still in escrow must keep a button that can
 		// release it (and the sweeper will, three minutes on).

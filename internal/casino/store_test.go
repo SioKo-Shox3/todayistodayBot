@@ -1916,9 +1916,13 @@ func TestStore_ConcurrentMixedOperations_AcrossUsers_NoCorruption(t *testing.T) 
 // forgets to persist half of a move fails here.
 
 // escrowGuild / escrowUser are the fixed identifiers the escrow tests use.
+// escrowSession is the board those stakes belong to (C-3b): every test that
+// opens a game and then settles it names the SAME board, which is the normal
+// case. The tests that name a different one are the ones about the mark.
 const (
-	escrowGuild = "guild1"
-	escrowUser  = "user1"
+	escrowGuild   = "guild1"
+	escrowUser    = "user1"
+	escrowSession = "board-1"
 )
 
 // assertHoldings reads guildID/userID back through a fresh Store and checks
@@ -1946,7 +1950,7 @@ func TestOpenGame_StakesTheBetWithoutChangingHoldings(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 250, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 250, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
@@ -1965,10 +1969,10 @@ func TestOpenGame_SecondGameIsRefusedAndPersistsNothing(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 250, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 250, fixedNow); err != nil {
 		t.Fatalf("first OpenGame returned error: %v", err)
 	}
-	err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow)
+	err := st.OpenGame(escrowGuild, escrowUser, "blackjack", escrowSession, 100, fixedNow)
 	if !errors.Is(err, ErrGameInProgress) {
 		t.Fatalf("second OpenGame error = %v, want ErrGameInProgress", err)
 	}
@@ -1994,7 +1998,7 @@ func TestOpenGame_RejectsBetsTheBalanceOrTheRulesDoNotAllow(t *testing.T) {
 			st, path := newTempStore(t)
 			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: tt.chips})
 
-			err := st.OpenGame(escrowGuild, escrowUser, "highlow", tt.bet, fixedNow)
+			err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, tt.bet, fixedNow)
 			if err == nil {
 				t.Fatalf("OpenGame(%d) succeeded, want %v", tt.bet, tt.wantErr)
 			}
@@ -2022,11 +2026,11 @@ func TestOpenGame_RejectsBetsTheBalanceOrTheRulesDoNotAllow(t *testing.T) {
 func TestAddToEscrow_RaisesTheStakeWithoutChangingHoldings(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-	if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", escrowSession, 100, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
-	if err := st.AddToEscrow(escrowGuild, escrowUser, 100); err != nil {
+	if err := st.AddToEscrow(escrowGuild, escrowUser, escrowSession, 100); err != nil {
 		t.Fatalf("AddToEscrow returned error: %v", err)
 	}
 
@@ -2039,7 +2043,7 @@ func TestAddToEscrow_RefusalsPersistNothing(t *testing.T) {
 		st, path := newTempStore(t)
 		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
-		err := st.AddToEscrow(escrowGuild, escrowUser, 100)
+		err := st.AddToEscrow(escrowGuild, escrowUser, escrowSession, 100)
 		if !errors.Is(err, ErrNoGameInProgress) {
 			t.Fatalf("AddToEscrow error = %v, want ErrNoGameInProgress", err)
 		}
@@ -2049,13 +2053,13 @@ func TestAddToEscrow_RefusalsPersistNothing(t *testing.T) {
 	t.Run("raise above the free balance", func(t *testing.T) {
 		st, path := newTempStore(t)
 		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 150})
-		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 100, fixedNow); err != nil {
+		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", escrowSession, 100, fixedNow); err != nil {
 			t.Fatalf("OpenGame returned error: %v", err)
 		}
 
 		// 50 chips are free; the escrowed 100 is not available to raise with.
 		var insufficient *ErrInsufficientChips
-		err := st.AddToEscrow(escrowGuild, escrowUser, 100)
+		err := st.AddToEscrow(escrowGuild, escrowUser, escrowSession, 100)
 		if !errors.As(err, &insufficient) {
 			t.Fatalf("AddToEscrow error = %v, want *ErrInsufficientChips", err)
 		}
@@ -2083,11 +2087,11 @@ func TestSettleGame_PaysTheStakeAndWinningsAndClosesTheGame(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			st, path := newTempStore(t)
 			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-			if err := st.OpenGame(escrowGuild, escrowUser, "highlow", tt.bet, fixedNow); err != nil {
+			if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, tt.bet, fixedNow); err != nil {
 				t.Fatalf("OpenGame returned error: %v", err)
 			}
 
-			result, err := st.SettleGame(escrowGuild, escrowUser, tt.payout)
+			result, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, tt.payout)
 			if err != nil {
 				t.Fatalf("SettleGame returned error: %v", err)
 			}
@@ -2102,15 +2106,15 @@ func TestSettleGame_PaysTheStakeAndWinningsAndClosesTheGame(t *testing.T) {
 func TestSettleGame_SecondSettlementIsRefused(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 200, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 200, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
-	if _, err := st.SettleGame(escrowGuild, escrowUser, 400); err != nil {
+	if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 400); err != nil {
 		t.Fatalf("first SettleGame returned error: %v", err)
 	}
 
 	// Paying 400 again would mint 400 chips out of nothing.
-	_, err := st.SettleGame(escrowGuild, escrowUser, 400)
+	_, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 400)
 	if !errors.Is(err, ErrNoGameInProgress) {
 		t.Fatalf("second SettleGame error = %v, want ErrNoGameInProgress", err)
 	}
@@ -2120,11 +2124,11 @@ func TestSettleGame_SecondSettlementIsRefused(t *testing.T) {
 func TestSettleGame_NegativePayoutIsRefusedAndKeepsTheEscrow(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 200, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 200, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
-	_, err := st.SettleGame(escrowGuild, escrowUser, -1)
+	_, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, -1)
 	if !errors.Is(err, ErrInvalidAmount) {
 		t.Fatalf("SettleGame(-1) error = %v, want ErrInvalidAmount", err)
 	}
@@ -2140,12 +2144,12 @@ func TestSettleGame_NegativePayoutIsRefusedAndKeepsTheEscrow(t *testing.T) {
 func TestSettleGame_PayoutOverTheChipCapKeepsOnlyWhatFits(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips - 500})
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 1000, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
 	// Free chips are MaxChips-1500, so of a 2000 payout only 1500 fits.
-	result, err := st.SettleGame(escrowGuild, escrowUser, 2000)
+	result, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 2000)
 	if err != nil {
 		t.Fatalf("SettleGame returned error: %v", err)
 	}
@@ -2187,7 +2191,7 @@ func TestSettleGame_AtTheCapAfterTheMonthlyBonusStillClosesTheGame(t *testing.T)
 		t.Fatalf("seeding the season returned error: %v", err)
 	}
 
-	result, err := st.at(seasonAugust).SettleGame(seasonGuild, "leader", 200)
+	result, err := st.at(seasonAugust).SettleGame(seasonGuild, "leader", escrowSession, 200)
 	if err != nil {
 		t.Fatalf("SettleGame returned error: %v — the cap must not refuse a settlement", err)
 	}
@@ -2211,7 +2215,7 @@ func TestSettleGame_AtTheCapAfterTheMonthlyBonusStillClosesTheGame(t *testing.T)
 	assertSeasonNet(t, path, seasonGuild, "leader", 0)
 
 	// The game is CLOSED, not waiting for a retry that can never succeed.
-	if _, err := st.SettleGame(seasonGuild, "leader", 200); !errors.Is(err, ErrNoGameInProgress) {
+	if _, err := st.SettleGame(seasonGuild, "leader", escrowSession, 200); !errors.Is(err, ErrNoGameInProgress) {
 		t.Fatalf("second SettleGame returned %v, want ErrNoGameInProgress", err)
 	}
 }
@@ -2295,7 +2299,7 @@ func TestUserAccount_PreC2JSONWithoutEscrowFieldsLoadsAsNoGame(t *testing.T) {
 
 	// And the account can open a game — i.e. the absent fields are genuinely
 	// "no game", not an unreadable state.
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 100, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 100, fixedNow); err != nil {
 		t.Fatalf("OpenGame on a legacy account returned error: %v", err)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, "highlow")
@@ -2337,7 +2341,7 @@ func TestOpenGame_ConcurrentOpensForOneUserLeaveExactlyOneStake(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			err := st.OpenGame(escrowGuild, escrowUser, "highlow", 100, fixedNow)
+			err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 100, fixedNow)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -2375,7 +2379,7 @@ func TestTotalAssets_CountEscrowAsTheUsersOwnMoney(t *testing.T) {
 		t.Fatalf("TopAssets returned error: %v", err)
 	}
 
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 400, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 400, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
@@ -2416,7 +2420,7 @@ func TestTotalAssets_CountEscrowAsTheUsersOwnMoney(t *testing.T) {
 func TestClaimDaily_WhileStaked_CannotMintChipsOverTheCap(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips})
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 1000, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
@@ -2441,7 +2445,7 @@ func TestClaimDaily_WhileStaked_CannotMintChipsOverTheCap(t *testing.T) {
 func TestExchangeCoinToChip_WhileStaked_CannotMintChipsOverTheCap(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: MaxChips, Coins: 10})
-	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", 1000, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 1000, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 
@@ -4175,7 +4179,7 @@ const duelOpponent = "user2"
 // duel's game name — the state a pending challenge leaves behind.
 func openDuelChallenge(t *testing.T, st *Store, bet int64) {
 	t.Helper()
-	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), bet, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), escrowSession, bet, fixedNow); err != nil {
 		t.Fatalf("OpenGame(duel) returned error: %v", err)
 	}
 }
@@ -4219,7 +4223,7 @@ func TestAcceptDuel_MovesThePotToTheWinnerAndKeepsTheTwoAccountsSummedUnchanged(
 			})
 			openDuelChallenge(t, st, 200)
 
-			got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, tc.challengerWins)
+			got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, escrowSession, 200, tc.challengerWins)
 			if err != nil {
 				t.Fatalf("AcceptDuel returned error: %v", err)
 			}
@@ -4280,7 +4284,7 @@ func TestAcceptDuel_WinnerAtTheCapTakesOnlyWhatFitsAndSeasonNetCountsThat(t *tes
 	})
 	openDuelChallenge(t, st, 200)
 
-	got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+	got, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, escrowSession, 200, true)
 	if err != nil {
 		t.Fatalf("AcceptDuel returned error: %v", err)
 	}
@@ -4325,7 +4329,7 @@ func TestAcceptDuel_RefusalsLeaveTheChallengersStakeExactlyWhereItWas(t *testing
 			name: "the opponent is already mid-game",
 			setUp: func(t *testing.T, st *Store) {
 				seedAccounts(t, st, escrowGuild, map[string]UserAccount{duelOpponent: {Chips: 1000}})
-				if err := st.OpenGame(escrowGuild, duelOpponent, "blackjack", 100, fixedNow); err != nil {
+				if err := st.OpenGame(escrowGuild, duelOpponent, "blackjack", escrowSession, 100, fixedNow); err != nil {
 					t.Fatalf("seeding the opponent's blackjack hand: %v", err)
 				}
 			},
@@ -4353,7 +4357,7 @@ func TestAcceptDuel_RefusalsLeaveTheChallengersStakeExactlyWhereItWas(t *testing
 				tc.setUp(t, st)
 			}
 
-			_, err := st.AcceptDuel(escrowGuild, escrowUser, tc.opponent, tc.bet, true)
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, tc.opponent, escrowSession, tc.bet, true)
 			if tc.wantIsErr != nil {
 				if !tc.wantIsErr(err) {
 					t.Fatalf("AcceptDuel error = %v, which is not the expected refusal", err)
@@ -4383,7 +4387,7 @@ func TestAcceptDuel_RefusesWhenTheChallengerHoldsNoDuelStake(t *testing.T) {
 			// hand's stake against a duel nobody is playing.
 			name: "some other game's stake",
 			setUp: func(t *testing.T, st *Store) {
-				if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 200, fixedNow); err != nil {
+				if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", escrowSession, 200, fixedNow); err != nil {
 					t.Fatalf("seeding the blackjack hand: %v", err)
 				}
 			},
@@ -4398,7 +4402,7 @@ func TestAcceptDuel_RefusesWhenTheChallengerHoldsNoDuelStake(t *testing.T) {
 			})
 			tc.setUp(t, st)
 
-			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, escrowSession, 200, true)
 			if !errors.Is(err, ErrNoGameInProgress) {
 				t.Fatalf("AcceptDuel error = %v, want ErrNoGameInProgress", err)
 			}
@@ -4413,7 +4417,7 @@ func TestDeclineDuel_ReturnsEveryChipAndNeverTouchesTheOpponent(t *testing.T) {
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 	openDuelChallenge(t, st, 200)
 
-	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+	if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); err != nil {
 		t.Fatalf("DeclineDuel returned error: %v", err)
 	}
 
@@ -4441,7 +4445,7 @@ func TestDeclineDuel_HandEditedOverTheCapKeepsEveryChip(t *testing.T) {
 		EscrowOpenedAt: fixedNow.In(jst).Format(time.RFC3339),
 	})
 
-	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+	if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); err != nil {
 		t.Fatalf("DeclineDuel returned error: %v", err)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, MaxChips+500, 0, "")
@@ -4452,12 +4456,12 @@ func TestDeclineDuel_RefusesASecondRefundAndAnotherGamesStake(t *testing.T) {
 		st, path := newTempStore(t)
 		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 		openDuelChallenge(t, st, 200)
-		if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+		if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); err != nil {
 			t.Fatalf("first DeclineDuel returned error: %v", err)
 		}
 
 		// Refunding again would mint 200 chips out of nothing.
-		if err := st.DeclineDuel(escrowGuild, escrowUser); !errors.Is(err, ErrNoGameInProgress) {
+		if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); !errors.Is(err, ErrNoGameInProgress) {
 			t.Fatalf("second DeclineDuel error = %v, want ErrNoGameInProgress", err)
 		}
 		assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
@@ -4466,11 +4470,11 @@ func TestDeclineDuel_RefusesASecondRefundAndAnotherGamesStake(t *testing.T) {
 	t.Run("a stale duel button after another game opened", func(t *testing.T) {
 		st, path := newTempStore(t)
 		seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", 200, fixedNow); err != nil {
+		if err := st.OpenGame(escrowGuild, escrowUser, "blackjack", escrowSession, 200, fixedNow); err != nil {
 			t.Fatalf("OpenGame(blackjack) returned error: %v", err)
 		}
 
-		if err := st.DeclineDuel(escrowGuild, escrowUser); !errors.Is(err, ErrNoGameInProgress) {
+		if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); !errors.Is(err, ErrNoGameInProgress) {
 			t.Fatalf("DeclineDuel error = %v, want ErrNoGameInProgress", err)
 		}
 		// The blackjack stake survives for its own board to settle.
@@ -4501,7 +4505,7 @@ func TestAcceptDuel_ConcurrentAcceptancesSettleExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, 200, true)
+			_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, escrowSession, 200, true)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -4603,15 +4607,15 @@ func TestSettleGame_SeasonNetUsesTheWholeEscrowAsTheStake(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st, path := newTempStore(t)
 			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
-			if err := st.OpenGame(escrowGuild, escrowUser, string(tc.game), tc.bet, fixedNow); err != nil {
+			if err := st.OpenGame(escrowGuild, escrowUser, string(tc.game), escrowSession, tc.bet, fixedNow); err != nil {
 				t.Fatalf("OpenGame returned error: %v", err)
 			}
 			if tc.raise > 0 {
-				if err := st.AddToEscrow(escrowGuild, escrowUser, tc.raise); err != nil {
+				if err := st.AddToEscrow(escrowGuild, escrowUser, escrowSession, tc.raise); err != nil {
 					t.Fatalf("AddToEscrow returned error: %v", err)
 				}
 			}
-			if _, err := st.SettleGame(escrowGuild, escrowUser, tc.payout); err != nil {
+			if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, tc.payout); err != nil {
 				t.Fatalf("SettleGame returned error: %v", err)
 			}
 			assertHoldings(t, path, escrowGuild, escrowUser, tc.wantChipsLeft, 0, "")
@@ -4628,7 +4632,7 @@ func TestSettleGame_RefusalsLeaveSeasonNetUntouched(t *testing.T) {
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
 	// No game in flight at all.
-	if _, err := st.SettleGame(escrowGuild, escrowUser, 200); !errors.Is(err, ErrNoGameInProgress) {
+	if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 200); !errors.Is(err, ErrNoGameInProgress) {
 		t.Fatalf("SettleGame with no escrow returned %v, want ErrNoGameInProgress", err)
 	}
 	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
@@ -4637,10 +4641,10 @@ func TestSettleGame_RefusalsLeaveSeasonNetUntouched(t *testing.T) {
 	// this list since C3B-12: it caps the credit instead of refusing it, so
 	// the 純利 it books is the landed amount rather than nothing — that is
 	// TestSettleGame_PayoutOverTheChipCapKeepsOnlyWhatFits.)
-	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), 100, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), escrowSession, 100, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
-	if _, err := st.SettleGame(escrowGuild, escrowUser, -1); !errors.Is(err, ErrInvalidAmount) {
+	if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, -1); !errors.Is(err, ErrInvalidAmount) {
 		t.Fatalf("SettleGame with a negative payout returned %v, want ErrInvalidAmount", err)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, string(GameHighLow))
@@ -4661,10 +4665,10 @@ func TestSettleGame_SeasonNetAccumulatesAcrossGames(t *testing.T) {
 		{GameBlackjack, 300, 0, -200},
 		{GameHighLow, 50, 100, -150},
 	} {
-		if err := st.OpenGame(escrowGuild, escrowUser, string(step.game), step.bet, fixedNow); err != nil {
+		if err := st.OpenGame(escrowGuild, escrowUser, string(step.game), escrowSession, step.bet, fixedNow); err != nil {
 			t.Fatalf("OpenGame(%s) returned error: %v", step.game, err)
 		}
-		if _, err := st.SettleGame(escrowGuild, escrowUser, step.payout); err != nil {
+		if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, step.payout); err != nil {
 			t.Fatalf("SettleGame(%s) returned error: %v", step.game, err)
 		}
 		assertSeasonNet(t, path, escrowGuild, escrowUser, step.wantRunningNet)
@@ -4798,12 +4802,12 @@ func TestSeasonNet_RefundedStakesAreNotResults(t *testing.T) {
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
 	openDuelChallenge(t, st, 200)
-	if err := st.DeclineDuel(escrowGuild, escrowUser); err != nil {
+	if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); err != nil {
 		t.Fatalf("DeclineDuel returned error: %v", err)
 	}
 	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
 
-	if err := st.OpenGame(escrowGuild, escrowUser, string(GameBlackjack), 300, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameBlackjack), escrowSession, 300, fixedNow); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 	if _, err := st.RefundStaleEscrows(fixedNow); err != nil {
@@ -4834,12 +4838,12 @@ func TestSeasonNet_HandEditedExtremesAreNormalisedAtTheReadPoint(t *testing.T) {
 			st, path := newTempStore(t)
 			seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000, SeasonNet: tc.seeded})
 
-			if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), 100, fixedNow); err != nil {
+			if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), escrowSession, 100, fixedNow); err != nil {
 				t.Fatalf("OpenGame returned error: %v", err)
 			}
 			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantAfterRead)
 
-			if _, err := st.SettleGame(escrowGuild, escrowUser, 0); err != nil {
+			if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 0); err != nil {
 				t.Fatalf("SettleGame returned error: %v", err)
 			}
 			assertSeasonNet(t, path, escrowGuild, escrowUser, tc.wantAfterLoss)
@@ -5265,11 +5269,11 @@ func TestStore_SeasonRollover_SettleGameAcrossTheBoundaryBooksIntoTheNewMonth(t 
 	openSeason(t, st, path)
 
 	// Dealt in July...
-	if err := st.OpenGame(seasonGuild, "player", string(GameHighLow), 100, seasonJulyLate); err != nil {
+	if err := st.OpenGame(seasonGuild, "player", string(GameHighLow), escrowSession, 100, seasonJulyLate); err != nil {
 		t.Fatalf("OpenGame returned error: %v", err)
 	}
 	// ...paid in August, with no display in between.
-	if _, err := st.at(seasonAugust).SettleGame(seasonGuild, "player", 200); err != nil {
+	if _, err := st.at(seasonAugust).SettleGame(seasonGuild, "player", escrowSession, 200); err != nil {
 		t.Fatalf("SettleGame returned error: %v", err)
 	}
 
@@ -5316,10 +5320,10 @@ func TestStore_SeasonRollover_AcceptDuelAcrossTheBoundaryBooksIntoTheNewMonth(t 
 	})
 	openSeason(t, st, path)
 
-	if err := st.OpenGame(seasonGuild, "player", string(GameDuel), 200, seasonJulyLate); err != nil {
+	if err := st.OpenGame(seasonGuild, "player", string(GameDuel), escrowSession, 200, seasonJulyLate); err != nil {
 		t.Fatalf("OpenGame(duel) returned error: %v", err)
 	}
-	if _, err := st.at(seasonAugust).AcceptDuel(seasonGuild, "player", "rival", 200, true); err != nil {
+	if _, err := st.at(seasonAugust).AcceptDuel(seasonGuild, "player", "rival", escrowSession, 200, true); err != nil {
 		t.Fatalf("AcceptDuel returned error: %v", err)
 	}
 
@@ -5649,4 +5653,222 @@ func TestSeasonDaysLeftIn_InsideTheMonthAndOnAnUnreadableOne(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- C3B-13: 預かりは開いた盤面のものだけを精算できる -------------------------
+//
+// The hole these pin: EscrowGame and the amount cannot tell two games apart.
+// A settlement that was still in flight while its own board was closed and
+// its stake refunded would find the player's NEXT stake on the account —
+// same game, same size — and spend that instead. The mark is the board's own
+// session ID, and every call that touches a stake has to name it.
+
+// The reproduction from C3B-13, at the store: an acceptance frozen just
+// before AcceptDuel, its challenge withdrawn and refunded underneath it, and
+// a second challenge for the same bet opened in its place.
+func TestAcceptDuel_AnAcceptanceInFlightCannotSettleTheNextChallengesStake(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccounts(t, st, escrowGuild, map[string]UserAccount{
+		escrowUser:   {Chips: 1000},
+		duelOpponent: {Chips: 1000},
+	})
+
+	const firstBoard, secondBoard = "board-1", "board-2"
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), firstBoard, 200, fixedNow); err != nil {
+		t.Fatalf("opening the first challenge: %v", err)
+	}
+	// The acceptance of the first challenge is frozen HERE. Meanwhile the
+	// challenge is withdrawn and the stake goes back...
+	if err := st.DeclineDuel(escrowGuild, escrowUser, firstBoard); err != nil {
+		t.Fatalf("withdrawing the first challenge: %v", err)
+	}
+	// ...and the player opens a second one for the same bet.
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), secondBoard, 200, fixedNow); err != nil {
+		t.Fatalf("opening the second challenge: %v", err)
+	}
+
+	// The frozen acceptance resumes. Its challenge is gone; the chips on the
+	// account are the second challenge's.
+	_, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, firstBoard, 200, true)
+	if !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("the stale acceptance returned %v, want ErrEscrowMismatch", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, string(GameDuel))
+	assertHoldings(t, path, escrowGuild, duelOpponent, 1000, 0, "")
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 0)
+	assertSeasonNet(t, path, escrowGuild, duelOpponent, 0)
+
+	// The board that DOES own the stake settles normally.
+	if _, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, secondBoard, 200, true); err != nil {
+		t.Fatalf("the second challenge's own acceptance returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1200, 0, "")
+	assertHoldings(t, path, escrowGuild, duelOpponent, 800, 0, "")
+}
+
+// The same hole on the 🚫 side: a withdrawal in flight must not take back a
+// stake that is now the next challenge's.
+func TestDeclineDuel_AWithdrawalInFlightCannotTakeBackTheNextChallengesStake(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	const firstBoard, secondBoard = "board-1", "board-2"
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), firstBoard, 200, fixedNow); err != nil {
+		t.Fatalf("opening the first challenge: %v", err)
+	}
+	if err := st.DeclineDuel(escrowGuild, escrowUser, firstBoard); err != nil {
+		t.Fatalf("withdrawing the first challenge: %v", err)
+	}
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameDuel), secondBoard, 200, fixedNow); err != nil {
+		t.Fatalf("opening the second challenge: %v", err)
+	}
+
+	if err := st.DeclineDuel(escrowGuild, escrowUser, firstBoard); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("the stale withdrawal returned %v, want ErrEscrowMismatch", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, string(GameDuel))
+}
+
+// The button games' half of the same hole: a settlement that names a board
+// which is over pays nothing out of the board that is live.
+func TestSettleGame_ASettlementInFlightCannotPayItselfOutOfTheNextBoardsStake(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	const firstBoard, secondBoard = "board-1", "board-2"
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), firstBoard, 250, fixedNow); err != nil {
+		t.Fatalf("opening the first board: %v", err)
+	}
+	if _, err := st.SettleGame(escrowGuild, escrowUser, firstBoard, 500); err != nil {
+		t.Fatalf("settling the first board: %v", err)
+	}
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameBlackjack), secondBoard, 100, fixedNow); err != nil {
+		t.Fatalf("opening the second board: %v", err)
+	}
+
+	// A retry of the first board's settlement, arriving after the player has
+	// dealt a new hand.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, firstBoard, 500); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("the stale settlement returned %v, want ErrEscrowMismatch", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1150, 100, string(GameBlackjack))
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 250) // the first board's 純利 only
+
+	// The hand that owns the stake settles as it always did.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, secondBoard, 200); err != nil {
+		t.Fatalf("the second board's own settlement returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1350, 0, "")
+	assertSeasonNet(t, path, escrowGuild, escrowUser, 350)
+}
+
+// ダブル raises the stake of the hand that is being played, never of whatever
+// hand the account happens to be holding now.
+func TestAddToEscrow_RaisingAStakeOpenedForAnotherBoardIsRefused(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameBlackjack), "board-2", 100, fixedNow); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	if err := st.AddToEscrow(escrowGuild, escrowUser, "board-1", 100); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("the stale raise returned %v, want ErrEscrowMismatch", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 900, 100, string(GameBlackjack))
+
+	if err := st.AddToEscrow(escrowGuild, escrowUser, "board-2", 100); err != nil {
+		t.Fatalf("the hand's own raise returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, string(GameBlackjack))
+}
+
+// BindEscrowSession is the second half of the command layer's open: the mark
+// moves from EscrowOpening to the board, once, and never off one board onto
+// another.
+func TestBindEscrowSession_HandsAStakeToItsOwnBoardOnly(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), EscrowOpening, 250, fixedNow); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	// A stake still being opened is settleable only by the opener, which is
+	// the one caller that can name the mark.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, "board-1", 250); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("settling a stake mid-open returned %v, want ErrEscrowMismatch", err)
+	}
+
+	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-1"); err != nil {
+		t.Fatalf("binding the stake to its board: %v", err)
+	}
+	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-1"); err != nil {
+		t.Fatalf("re-binding the same board returned error: %v — a retry must not fail", err)
+	}
+	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-2"); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("binding another board returned %v, want ErrEscrowMismatch", err)
+	}
+	// The mark is the board's now, so the opener's own EscrowOpening no
+	// longer opens it either.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, EscrowOpening, 250); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("settling a bound stake as EscrowOpening returned %v, want ErrEscrowMismatch", err)
+	}
+	if got := readAccount(t, path, escrowGuild, escrowUser).EscrowSession; got != "board-1" {
+		t.Fatalf("EscrowSession = %q, want the bound board", got)
+	}
+
+	if _, err := st.SettleGame(escrowGuild, escrowUser, "board-1", 500); err != nil {
+		t.Fatalf("the bound board's settlement returned error: %v", err)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1250, 0, "")
+	if got := readAccount(t, path, escrowGuild, escrowUser).EscrowSession; got != "" {
+		t.Fatalf("EscrowSession = %q after the settlement, want it cleared with the rest of the escrow", got)
+	}
+}
+
+// The compatibility direction: a game that was in flight when this version
+// was deployed has no mark at all, and the board that comes back for it must
+// still be paid. The guarantee is forward-only — see escrowOwnedByLocked.
+func TestSettleGame_AStakeOpenedBeforeTheMarkExistedIsSettledByItsBoard(t *testing.T) {
+	st, path := newTempStore(t)
+	raw := `{"guild1":{"users":{"user1":{"coins":0,"chips":750,"last_daily_date":"","streak_days":0,"escrow":250,"escrow_game":"highlow","escrow_opened_at":"2026-07-10T12:00:00+09:00"}}}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("seeding a pre-C3b file: %v", err)
+	}
+
+	settled, err := st.SettleGame(escrowGuild, escrowUser, "a-board-that-did-not-exist-yet", 500)
+	if err != nil {
+		t.Fatalf("settling an unmarked stake returned error: %v", err)
+	}
+	if settled.Payout != 500 {
+		t.Fatalf("payout = %d, want 500", settled.Payout)
+	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 1250, 0, "")
+}
+
+// The same compatibility, on the duel's two entry points.
+func TestDuel_AStakeOpenedBeforeTheMarkExistedIsStillAcceptedAndWithdrawn(t *testing.T) {
+	raw := `{"guild1":{"users":{"user1":{"coins":0,"chips":800,"last_daily_date":"","streak_days":0,"escrow":200,"escrow_game":"duel","escrow_opened_at":"2026-07-10T12:00:00+09:00"},"user2":{"coins":0,"chips":1000,"last_daily_date":"","streak_days":0}}}}`
+
+	t.Run("accepted", func(t *testing.T) {
+		st, path := newTempStore(t)
+		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+			t.Fatalf("seeding a pre-C3b file: %v", err)
+		}
+		if _, err := st.AcceptDuel(escrowGuild, escrowUser, duelOpponent, "a-board-that-did-not-exist-yet", 200, true); err != nil {
+			t.Fatalf("accepting an unmarked challenge returned error: %v", err)
+		}
+		assertHoldings(t, path, escrowGuild, escrowUser, 1200, 0, "")
+		assertHoldings(t, path, escrowGuild, duelOpponent, 800, 0, "")
+	})
+
+	t.Run("withdrawn", func(t *testing.T) {
+		st, path := newTempStore(t)
+		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+			t.Fatalf("seeding a pre-C3b file: %v", err)
+		}
+		if err := st.DeclineDuel(escrowGuild, escrowUser, "a-board-that-did-not-exist-yet"); err != nil {
+			t.Fatalf("withdrawing an unmarked challenge returned error: %v", err)
+		}
+		assertHoldings(t, path, escrowGuild, escrowUser, 1000, 0, "")
+	})
 }

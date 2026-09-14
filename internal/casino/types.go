@@ -191,11 +191,14 @@ type DailyRate struct {
 // daily bonus streak needs and the chips currently held by an in-flight
 // button game (設計書 §3).
 //
-// The escrow trio is omitempty so an account with no game in flight
-// serializes exactly as it did before this field existed, and — the
-// direction that actually matters — a data/casino.json written before C-2
-// unmarshals with Escrow 0 / EscrowGame "" / EscrowOpenedAt "", i.e. "no
-// game in progress". No migration step exists or is needed.
+// The escrow fields are omitempty so an account with no game in flight
+// serializes exactly as it did before they existed, and — the direction that
+// actually matters — a data/casino.json written before C-2 unmarshals with
+// Escrow 0 / EscrowGame "" / EscrowOpenedAt "", i.e. "no game in progress".
+// No migration step exists or is needed. EscrowSession (C-3b) is the same
+// story one release later: a stake opened before it existed unmarshals with
+// an EMPTY mark, which every settlement accepts (store.go's
+// escrowOwnedByLocked) — the mark binds only the stakes opened since.
 //
 // Escrow is NOT a separate pot of money: OpenGame/AddToEscrow move chips
 // out of Chips into Escrow and SettleGame moves them back, so the user's
@@ -210,6 +213,14 @@ type UserAccount struct {
 	Escrow         int64  `json:"escrow,omitempty"`           // chips staked on the in-flight game (bet + any double)
 	EscrowGame     string `json:"escrow_game,omitempty"`      // "highlow" | "blackjack" | "duel"
 	EscrowOpenedAt string `json:"escrow_opened_at,omitempty"` // RFC3339 in JST
+	// EscrowSession is the BOARD this stake belongs to — the session ID the
+	// command layer put on it when the game opened (設計書 C-3b). Every
+	// settlement names the board it is closing, and a name that is not this
+	// one is refused with ErrEscrowMismatch: without it a settlement that
+	// was in flight while its own board was closed and refunded would spend
+	// whatever stake the account happens to hold NOW, which is some other
+	// game's money.
+	EscrowSession string `json:"escrow_session,omitempty"`
 	// SeasonNet is the running 純利 for the month in progress: the sum of
 	// (what the account actually RECEIVED − what it staked) over game
 	// settlements only (設計書 C-3b §3). It is what the monthly season ranks

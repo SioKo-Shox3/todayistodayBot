@@ -807,16 +807,16 @@ type flakyBank struct {
 	afterAddToEscrow func()
 }
 
-func (b *flakyBank) SettleGame(guildID, userID string, payout int64) (casino.SettleResult, error) {
+func (b *flakyBank) SettleGame(guildID, userID, sessionID string, payout int64) (casino.SettleResult, error) {
 	b.settles++
 	if b.settleErr != nil {
 		return casino.SettleResult{}, b.settleErr
 	}
-	return b.Store.SettleGame(guildID, userID, payout)
+	return b.Store.SettleGame(guildID, userID, sessionID, payout)
 }
 
-func (b *flakyBank) AddToEscrow(guildID, userID string, amount int64) error {
-	if err := b.Store.AddToEscrow(guildID, userID, amount); err != nil {
+func (b *flakyBank) AddToEscrow(guildID, userID, sessionID string, amount int64) error {
+	if err := b.Store.AddToEscrow(guildID, userID, sessionID, amount); err != nil {
 		return err
 	}
 	if hook := b.afterAddToEscrow; hook != nil {

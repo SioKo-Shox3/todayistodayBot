@@ -401,7 +401,10 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 	// and it is the half that survives a restart, so it is the one that must
 	// refuse a second bet. The in-memory manager can then only fail on an
 	// exhausted crypto/rand, and that failure refunds.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), bet, now); err != nil {
+	// The stake is marked casino.EscrowOpening because the board it belongs
+	// to does not exist yet (設計書 C-3b): in that gap no settlement can
+	// spend it except this function's own refund, which names the mark.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), casino.EscrowOpening, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -410,7 +413,17 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 
 	session, err := c.sessions.Open(i.GuildID, userID, casino.GameHighLow, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableBoard(i.GuildID, userID, bet) // the chips already moved: hand them straight back
+		c.refundUnplayableBoard(i.GuildID, userID, casino.EscrowOpening, bet) // the chips already moved: hand them straight back
+		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
+	}
+
+	// The board is live, so the stake becomes ITS stake: every press and the
+	// sweeper settle by this ID from here on, and a settlement that still
+	// names the old board is refused rather than paid out of this one.
+	if err := c.store.BindEscrowSession(i.GuildID, userID, session.ID); err != nil {
+		if c.sessions.Close(session.ID) {
+			c.refundUnplayableBoard(i.GuildID, userID, casino.EscrowOpening, bet)
+		}
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -431,7 +444,7 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		// the escrow on the account belongs to whatever game came next, and
 		// refunding "our" bet would pay it out of somebody else's stake.
 		if c.sessions.Close(session.ID) {
-			c.refundUnplayableBoard(i.GuildID, userID, bet)
+			c.refundUnplayableBoard(i.GuildID, userID, session.ID, bet)
 		}
 		return err
 	}
@@ -444,8 +457,13 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 // Failing only means the chips stay in escrow until the next restart returns
 // them (RefundStaleEscrows), so it is logged rather than shown to the player,
 // who already has a refusal in front of them.
-func (c *HighLowCommand) refundUnplayableBoard(guildID, userID string, bet int64) {
-	if _, err := c.store.SettleGame(guildID, userID, bet); err != nil {
+//
+// escrowID is the mark the stake is carrying at THIS point of the open —
+// casino.EscrowOpening before the board has been bound, the board's own ID
+// after — so a refund can never hand back chips that have meanwhile become
+// another game's (casino.ErrEscrowMismatch refuses that instead).
+func (c *HighLowCommand) refundUnplayableBoard(guildID, userID, escrowID string, bet int64) {
+	if _, err := c.store.SettleGame(guildID, userID, escrowID, bet); err != nil {
 		slog.Error("casino: refunding an undelivered high&low board failed", "error", redactInteractionError(err))
 	}
 }
@@ -638,7 +656,7 @@ type highLowPending struct {
 // It is the only writer of lock.pending — cleared the moment the chips land,
 // kept (under a 🔁 button) when they do not. The caller holds lock.
 func (c *HighLowCommand) settle(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, lock *boardLock, pending *highLowPending) error {
-	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, pending.Payout)
+	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, sessionID, pending.Payout)
 	if err != nil {
 		slog.Error("casino: SettleGame failed for high&low", "error", redactInteractionError(err))
 		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{

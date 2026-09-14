@@ -204,10 +204,10 @@ func TestSeasonCommand_RendersTheStoresOwnView(t *testing.T) {
 	}
 	// One real result, booked through a game: /season must show 純利 that the
 	// economy actually recorded, not a number this test wrote into the file.
-	if err := store.OpenGame("g1", "u1", string(casino.GameHighLow), 200, now); err != nil {
+	if err := store.OpenGame("g1", "u1", string(casino.GameHighLow), testEscrowSession, 200, now); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
-	if _, err := store.SettleGame("g1", "u1", 500); err != nil {
+	if _, err := store.SettleGame("g1", "u1", testEscrowSession, 500); err != nil {
 		t.Fatalf("SettleGame: %v", err)
 	}
 

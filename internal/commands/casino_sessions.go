@@ -103,10 +103,12 @@ func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casino
 			slog.Error("casino: a swept board cannot resolve itself", "game", string(session.Game), "state", fmt.Sprintf("%T", session.State))
 			mgr.Remove(session.ID)
 			continue
-		case errors.Is(err, casino.ErrNoGameInProgress):
+		case errors.Is(err, casino.ErrNoGameInProgress), errors.Is(err, casino.ErrEscrowMismatch):
 			// The escrow is already closed: a press got there first, or an
 			// earlier retry paid and failed on something after the payout.
-			// There is nothing left to pay, so stop retrying this board.
+			// Mismatch is the same answer from the other side — the stake on
+			// the account belongs to a board that is not this one. Either way
+			// there is nothing left HERE to pay, so stop retrying this board.
 			slog.Warn("casino: a timed-out board had no stake left to settle", "game", string(session.Game))
 			mgr.Remove(session.ID)
 			continue
@@ -167,7 +169,10 @@ func settleSweptBoard(bank casinoBank, session *casino.Session) (casino.SettleRe
 		session.PendingPayout = resolver.AutoResolve()
 		session.PayoutResolved = true
 	}
-	return bank.SettleGame(session.GuildID, session.UserID, session.PendingPayout)
+	// Named by session ID like every other settlement (設計書 C-3b): a board
+	// this sweep is retrying may have been closed and refunded since, and the
+	// escrow on the account is then the player's NEXT game.
+	return bank.SettleGame(session.GuildID, session.UserID, session.ID, session.PendingPayout)
 }
 
 // editTimedOutBoard replaces the board with its closing line. A failure is

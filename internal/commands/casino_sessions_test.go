@@ -14,6 +14,12 @@ import (
 
 // --- fixtures --------------------------------------------------------------
 
+// testEscrowSession is the board a test stakes chips for when it opens an
+// escrow directly on the store instead of going through a command (C-3b).
+// Any settlement in the same test must name the same board, exactly as the
+// command layer does with the ID casino.SessionManager handed it.
+const testEscrowSession = "test-board"
+
 // recordingEditor is the sweeper's Discord half. Edits are handed over a
 // channel rather than appended to a slice: the loop test reads them from
 // another goroutine, and a slice shared that way would be a data race even
@@ -71,9 +77,19 @@ func (f *fixedResolver) AutoResolve() int64 {
 	return f.payout
 }
 
-// sweepFixture is an account with one staked board, on this test's own store
-// and its own manager — never casino.Default()/DefaultSessions().
+// sweepFixture is an account with one staked high&low board, on this test's
+// own store and its own manager — never casino.Default()/DefaultSessions().
 func sweepFixture(t *testing.T, state any, bet int64, ref casino.MessageRef) (*flakyBank, *casino.SessionManager, time.Time) {
+	t.Helper()
+	bank, mgr, _, opened := sweepFixtureFor(t, casino.GameHighLow, state, bet, ref)
+	return bank, mgr, opened
+}
+
+// sweepFixtureFor is sweepFixture for a board of any game, and it hands back
+// the board itself: a stake and the board that owns it name each other
+// (C-3b), so a test that needs to settle the stake from the outside needs the
+// board's ID to do it with.
+func sweepFixtureFor(t *testing.T, game casino.GameKind, state any, bet int64, ref casino.MessageRef) (*flakyBank, *casino.SessionManager, *casino.Session, time.Time) {
 	t.Helper()
 	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
 	opened := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
@@ -81,16 +97,23 @@ func sweepFixture(t *testing.T, state any, bet int64, ref casino.MessageRef) (*f
 	if err := bank.EnsureCasinoAccess("g1", "u1", opened); err != nil {
 		t.Fatalf("EnsureCasinoAccess: %v", err)
 	}
-	if err := bank.OpenGame("g1", "u1", string(casino.GameHighLow), bet, opened); err != nil {
+	// Opened in the command layer's own order: the stake is marked
+	// casino.EscrowOpening until the board it belongs to exists, and the
+	// board's ID replaces the mark as soon as there is one (C-3b).
+	if err := bank.OpenGame("g1", "u1", string(game), casino.EscrowOpening, bet, opened); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
 	// The manager's clock is frozen at the deal, so LastActionAt is `opened`
 	// and the sweeper's own clock alone decides what is expired.
 	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
-	if _, err := mgr.Open("g1", "u1", casino.GameHighLow, state, ref); err != nil {
+	session, err := mgr.Open("g1", "u1", game, state, ref)
+	if err != nil {
 		t.Fatalf("opening the board: %v", err)
 	}
-	return bank, mgr, opened
+	if err := bank.BindEscrowSession("g1", "u1", session.ID); err != nil {
+		t.Fatalf("BindEscrowSession: %v", err)
+	}
+	return bank, mgr, session, opened
 }
 
 func sweepChipsOf(t *testing.T, bank *flakyBank) (chips, escrow int64) {
@@ -285,11 +308,12 @@ func TestSweepIdleBoardsRetriesTheSameSettlementAtTheNextPass(t *testing.T) {
 // owner locked out of new games.
 func TestSweepIdleBoardsDropsABoardWhoseStakeIsAlreadyGone(t *testing.T) {
 	board := &fixedResolver{payout: 250}
-	bank, mgr, opened := sweepFixture(t, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	bank, mgr, session, opened := sweepFixtureFor(t, casino.GameHighLow, board, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 	editor := newRecordingEditor()
 
-	// Somebody else closed the escrow between the timeout and this pass.
-	if _, err := bank.Store.SettleGame("g1", "u1", 100); err != nil {
+	// Somebody else closed the escrow between the timeout and this pass —
+	// this board's own stake, named by this board (C-3b).
+	if _, err := bank.Store.SettleGame("g1", "u1", session.ID, 100); err != nil {
 		t.Fatalf("closing the escrow behind the sweeper: %v", err)
 	}
 
@@ -408,14 +432,9 @@ func TestSweepIdleBoardsKeepsTheGamesButtonsDisabled(t *testing.T) {
 	seed := blackjackSeedWhere(t, "a playable hand", func(g *casino.BlackjackGame) bool {
 		return g.State() == casino.BlackjackPlaying
 	})
-	bank, mgr, opened := sweepFixture(t, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
-	// sweepFixture opens every board as high&low; this hand is a blackjack
-	// one, and the sweeper must route by the session's own game.
-	dropFixtureBoard(t, mgr)
-	session, err := mgr.Open("g1", "u1", casino.GameBlackjack, blackjackProbe(100, seed), casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
-	if err != nil {
-		t.Fatalf("opening the blackjack board: %v", err)
-	}
+	// A blackjack board, so the sweeper has to route by the session's own
+	// game rather than by the fixture's default.
+	bank, mgr, session, opened := sweepFixtureFor(t, casino.GameBlackjack, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 
 	editor := newRecordingEditor()
 	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
@@ -508,11 +527,7 @@ func TestSweepIdleBoardsShowsTheTimedOutHandAndItsVerdict(t *testing.T) {
 			probe := blackjackProbe(100, seed)
 			wantPayout := probe.AutoResolve()
 
-			bank, mgr, opened := sweepFixture(t, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
-			dropFixtureBoard(t, mgr) // sweepFixture opens every board as high&low
-			if _, err := mgr.Open("g1", "u1", casino.GameBlackjack, blackjackProbe(100, seed), casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
-				t.Fatalf("opening the blackjack board: %v", err)
-			}
+			bank, mgr, _, opened := sweepFixtureFor(t, casino.GameBlackjack, blackjackProbe(100, seed), 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 
 			editor := newRecordingEditor()
 			sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))

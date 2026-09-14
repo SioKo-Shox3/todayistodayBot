@@ -1155,14 +1155,43 @@ func moveFromEscrowLocked(account *UserAccount) int64 {
 	return stake
 }
 
-// clearEscrowLocked zeroes the whole escrow trio. The two string fields are
+// clearEscrowLocked zeroes the whole escrow record. The string fields are
 // cleared alongside the amount so `Escrow == 0` and "no game in progress"
 // can never disagree — a leftover EscrowGame would make a settled account
-// look in-flight to anything that reads the game name.
+// look in-flight to anything that reads the game name, and a leftover
+// EscrowSession would let the NEXT game's stake be settled by the board this
+// one belonged to.
 func clearEscrowLocked(account *UserAccount) {
 	account.Escrow = 0
 	account.EscrowGame = ""
 	account.EscrowOpenedAt = ""
+	account.EscrowSession = ""
+}
+
+// EscrowOpening is the mark a stake carries between OpenGame and the board
+// that will own it (BindEscrowSession). The command layer has to stake the
+// chips BEFORE it opens the board — that order is what makes the persisted
+// half of "one game per person" the half that refuses a second bet (C2-06)
+// — so for the width of those two calls the stake has no board ID to carry.
+//
+// It is deliberately a value no board can present: session IDs are 32 hex
+// characters (session.go's newSessionID), so no settlement can ever name
+// this mark by accident, and a stake in mid-open is therefore settleable
+// only by the opener, which passes the constant explicitly to hand the chips
+// straight back. Leaving the mark EMPTY instead would open exactly the hole
+// this whole mechanism closes, for as long as the board takes to appear.
+const EscrowOpening = "opening"
+
+// escrowOwnedByLocked reports whether sessionID may settle the stake this
+// account is holding. Caller must already hold the Store's lock.
+//
+// An EMPTY mark belongs to everybody: that is what a stake opened before
+// C-3b looks like after a restart reads it off disk (types.go), and refusing
+// those would strand the chips of every game in flight across the upgrade.
+// The guarantee is therefore forward-only — every stake opened since carries
+// a mark, and a mark that is present must match exactly.
+func escrowOwnedByLocked(account *UserAccount, sessionID string) bool {
+	return account.EscrowSession == "" || account.EscrowSession == sessionID
 }
 
 // OpenGame stakes bet chips on a new game of `game` for guildID/userID,
@@ -1181,7 +1210,13 @@ func clearEscrowLocked(account *UserAccount) {
 //
 // now is the instant recorded as EscrowOpenedAt (RFC3339 in JST, the
 // package-wide convention); no decision here reads it.
-func (s *Store) OpenGame(guildID, userID, game string, bet int64, now time.Time) error {
+//
+// sessionID is the mark the stake will carry (設計書 C-3b): the ID of the
+// board that may settle it, and EscrowOpening for a caller whose board does
+// not exist yet — which is every caller in the command layer, because the
+// chips are staked first. Every later call names a board this way, and only
+// the named one is allowed to touch the chips.
+func (s *Store) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
 		account := ensureAccountLocked(economy, userID)
@@ -1193,6 +1228,38 @@ func (s *Store) OpenGame(guildID, userID, game string, bet int64, now time.Time)
 		}
 		account.EscrowGame = game
 		account.EscrowOpenedAt = now.In(jst).Format(time.RFC3339)
+		account.EscrowSession = sessionID
+		return nil
+	})
+}
+
+// BindEscrowSession hands a stake opened as EscrowOpening to the board that
+// will settle it, once the command layer has one (設計書 C-3b). It is the
+// second half of OpenGame, not a state change of its own: nothing about the
+// chips moves, only the name of who may spend them.
+//
+// Returns ErrNoGameInProgress when the account holds no stake — the game was
+// settled or refunded while the board was being created — and
+// ErrEscrowMismatch when the stake is already bound to a DIFFERENT board,
+// which is the same refusal every settlement makes and for the same reason:
+// the chips on the account are that other game's. Binding the ID a stake
+// already carries succeeds, so a retry cannot fail on its own first attempt,
+// and an unmarked stake (one opened before C-3b) is claimable for the same
+// reason every settlement accepts it — escrowOwnedByLocked.
+//
+// On any refusal nothing is persisted, so the caller can hand the stake back
+// with the mark it still has (EscrowOpening).
+func (s *Store) BindEscrowSession(guildID, userID, sessionID string) error {
+	return s.Update(func(d *Data) error {
+		economy := ensureGuildLocked(d, guildID)
+		account := ensureAccountLocked(economy, userID)
+		if account.Escrow == 0 {
+			return ErrNoGameInProgress
+		}
+		if account.EscrowSession != EscrowOpening && !escrowOwnedByLocked(account, sessionID) {
+			return ErrEscrowMismatch
+		}
+		account.EscrowSession = sessionID
 		return nil
 	})
 }
@@ -1205,12 +1272,20 @@ func (s *Store) OpenGame(guildID, userID, game string, bet int64, now time.Time)
 // persisted on any of those, so the command layer's "persist first, then
 // apply to the board" order leaves the board untouched when a raise is
 // refused.
-func (s *Store) AddToEscrow(guildID, userID string, amount int64) error {
+//
+// sessionID names the board raising its bet, and ErrEscrowMismatch refuses a
+// raise on a stake that belongs to another one (設計書 C-3b): a ⏫ that was
+// decided on a hand which has since been closed and refunded would otherwise
+// push the next game's stake up with chips no board is going to return.
+func (s *Store) AddToEscrow(guildID, userID, sessionID string, amount int64) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
 		account := ensureAccountLocked(economy, userID)
 		if account.Escrow == 0 {
 			return ErrNoGameInProgress
+		}
+		if !escrowOwnedByLocked(account, sessionID) {
+			return ErrEscrowMismatch
 		}
 		return moveToEscrowLocked(account, amount)
 	})
@@ -1236,6 +1311,14 @@ type SettleResult struct {
 // ErrInvalidAmount rejects a negative payout — on any error nothing at all is
 // persisted, so the escrow survives for a retry rather than vanishing.
 //
+// sessionID is the board being settled, and ErrEscrowMismatch is the other
+// half of that guard (設計書 C-3b): an account that has a stake is not
+// necessarily holding THIS board's stake. A settlement still in flight while
+// its own board is closed and refunded — the sweeper and a press racing, a
+// retry arriving late — finds the next game's chips on the account, and
+// without the mark it would pay this board's payout out of them and leave
+// the live board with nothing to settle.
+//
 // A payout that does not fit under MaxChips is NOT an error. The credit goes
 // through creditChipsCappedLocked: the account takes what fits and the rest is
 // dropped (設計書 C-3b §2, the same rule as the season bonus and the duel pot).
@@ -1248,7 +1331,7 @@ type SettleResult struct {
 // SettleResult.Owed keeps the owed figure so a caller can tell the two apart;
 // Payout is what the player really received, which is what the boards print
 // and what 純利 is booked from (§2: 「実際に口座へ入った額」).
-func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, error) {
+func (s *Store) SettleGame(guildID, userID, sessionID string, payout int64) (SettleResult, error) {
 	var result SettleResult
 	err := s.Update(func(d *Data) error {
 		if payout < 0 {
@@ -1259,6 +1342,9 @@ func (s *Store) SettleGame(guildID, userID string, payout int64) (SettleResult, 
 		account := ensureAccountLocked(economy, userID)
 		if account.Escrow == 0 {
 			return ErrNoGameInProgress
+		}
+		if !escrowOwnedByLocked(account, sessionID) {
+			return ErrEscrowMismatch
 		}
 		// The escrow is read BEFORE it is cleared because it is the only
 		// record of what this game was staked for: SettleGame is told the
@@ -1556,6 +1642,13 @@ type DuelSettlement struct {
 //     of 0 and pays nothing. EscrowGame is checked alongside the amount so a
 //     stale duel button cannot settle a blackjack hand the challenger opened
 //     afterwards.
+//   - ErrEscrowMismatch — the challenger IS holding a duel stake, but for
+//     another challenge (設計書 C-3b). EscrowGame and the bet cannot tell two
+//     duels of the same size apart, so an acceptance that was in flight while
+//     its own challenge was withdrawn and refunded would settle the NEXT
+//     challenge's stake — with the opponent of the old one. sessionID is the
+//     challenge board this acceptance belongs to, and only the stake that
+//     carries it can be spent here.
 //   - ErrDuelStakeMismatch — the challenger's stake is not this bet, so the
 //     transfer would not be zero-sum (see errors.go).
 //   - ErrGameInProgress / *ErrInsufficientChips — the OPPONENT cannot cover
@@ -1568,7 +1661,7 @@ type DuelSettlement struct {
 // is a winner already at MaxChips, who takes only what fits — the same
 // truncation every other payout in this package makes, and the reason
 // SeasonNet is fed the credited amount rather than the owed one (§2).
-func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, challengerWins bool) (DuelSettlement, error) {
+func (s *Store) AcceptDuel(guildID, challengerID, opponentID, sessionID string, bet int64, challengerWins bool) (DuelSettlement, error) {
 	var result DuelSettlement
 	err := s.Update(func(d *Data) error {
 		if challengerID == opponentID {
@@ -1584,6 +1677,9 @@ func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, 
 
 		if challenger.Escrow == 0 || challenger.EscrowGame != string(GameDuel) {
 			return ErrNoGameInProgress
+		}
+		if !escrowOwnedByLocked(challenger, sessionID) {
+			return ErrEscrowMismatch
 		}
 		if challenger.Escrow != bet {
 			return ErrDuelStakeMismatch
@@ -1601,6 +1697,7 @@ func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, 
 			return err
 		}
 		opponent.EscrowGame = string(GameDuel)
+		opponent.EscrowSession = sessionID
 
 		challengerPayout, opponentPayout := DuelPayout(bet, challengerWins)
 		clearEscrowLocked(challenger)
@@ -1657,12 +1754,20 @@ func (s *Store) AcceptDuel(guildID, challengerID, opponentID string, bet int64, 
 // case that actually moves chips — a stale duel button pressed after the
 // challenger has opened some other game, which without the EscrowGame check
 // would refund that game's stake out from under its own board.
-func (s *Store) DeclineDuel(guildID, challengerID string) error {
+//
+// ErrEscrowMismatch covers the case EscrowGame cannot see (設計書 C-3b): the
+// challenger's NEXT game is another duel. sessionID is the challenge board
+// this withdrawal belongs to, so a 🚫 or a sweep that arrives after its own
+// challenge has already been refunded cannot take the new one back instead.
+func (s *Store) DeclineDuel(guildID, challengerID, sessionID string) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
 		account := ensureAccountLocked(economy, challengerID)
 		if account.Escrow == 0 || account.EscrowGame != string(GameDuel) {
 			return ErrNoGameInProgress
+		}
+		if !escrowOwnedByLocked(account, sessionID) {
+			return ErrEscrowMismatch
 		}
 		moveFromEscrowLocked(account)
 		return nil

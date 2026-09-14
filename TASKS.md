@@ -484,7 +484,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。**「入金が拒否されて取引全体が巻き戻る」形を残さない** — 上限は行き先の問題であって、精算を止める理由にしない(§2)。
 
 ## C3B-13: 預かりに持ち主の印を付け、別の盤面の預かりで精算できないようにする(blocking 2 の構造、P1)
-- status: todo
+- status: done
 - done-when: `AcceptDuel`(`store.go` 1570 付近)の確認がゲーム種別と金額だけなので、**別のセッションの預かりで精算できる**(再現: S1 の受諾を `AcceptDuel` 直前で止め、S1 を後始末で閉じて返金 → 同額で S2 を開始 → 止めていた S1 の受諾を再開すると、S2 の預かりで A と B を精算する)。親の決定(2026-09-15): **預かりに持ち主の印を持たせる** — `UserAccount` に `EscrowSession string`(`json:"escrow_session,omitempty"`)を足し、`OpenGame` / `AddToEscrow` がセッション ID を書き、`SettleGame` / `AcceptDuel` / `DeclineDuel` は**渡されたセッション ID と一致するときだけ**精算する(不一致は `ErrNoGameInProgress` 相当の新しいセンチネル `ErrEscrowMismatch`)。呼び出し側(C-2 の H&L / BJ、C-3b の duel、掃除人)はセッション ID を渡す。既存 JSON(印なし)は「印が空なら従来どおり通す」で後方互換を保つ(印が付くのは C3B-13 以降に開かれた盤面だけ)。回帰テスト: 上の再現手順で S1 の受諾が `ErrEscrowMismatch` で拒否され S2 の預かりが動かない / 正常な H&L・BJ・duel の精算が通る / 印の無い既存データの精算が通る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`

@@ -722,8 +722,8 @@ type stakeWatchingBank struct {
 	onAddToEscrow func()
 }
 
-func (b *stakeWatchingBank) AddToEscrow(guildID, userID string, amount int64) error {
-	if err := b.flakyBank.AddToEscrow(guildID, userID, amount); err != nil {
+func (b *stakeWatchingBank) AddToEscrow(guildID, userID, sessionID string, amount int64) error {
+	if err := b.flakyBank.AddToEscrow(guildID, userID, sessionID, amount); err != nil {
 		return err
 	}
 	if b.onAddToEscrow != nil {
