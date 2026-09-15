@@ -681,3 +681,32 @@
 - **契約は変えていない**。`at-least-once` のまま。3 回とも失敗した後の巡回では embed も u9 への
   メンションも本当にもう一度出ることを `TestRunAnnouncePass_AnUnrecordedAnnouncementWarnsAndIsPostedAgain` が
   そのまま検査している(隠していない)。
+
+## 反復 9(C3B-20) — 2026-09-15
+
+- **Done**: C3B-20。`slotJackpotLine` と `slotCelebrationMessage` が、上限で切り詰められた 7️⃣7️⃣7️⃣ で
+  `JackpotWon`(払うはずだった額)を「獲得」と印字するのをやめた。新しい `slotJackpotCredited` が
+  `Owed - Payout` から `min(不足額, JackpotWon)` を取り、切り詰められたときだけ受け取った額で書く。
+  ゲート 3 本とも exit=0・全 8 パッケージ ok(`.harness/runs/20260915-080323/verify-C3B-20-{1,2,3}.txt`)。
+- **Next**: `TASKS.md` に未完なし(`status: todo` は 0 件)。次は M1 へ戻して次の一覧を立てる。
+
+### C3B-20 — 金額は正しく、食い違っていたのは文字列だけ
+
+- **直したのは表示だけ**。`JackpotWon` の意味は変えていない(プールが火を噴いた事実は祝いの条件として要る)。
+  口座へ入る額も、溢れた分がプールへ戻る経路も C3B-17 のまま。
+- **不足額のうちプールの取り分だけを名指す**。`min(不足額, JackpotWon)` は `Store.Spin` が
+  プールへ戻す額と同じ式 — テーブル配当の捨て分まで「プールが届かなかった」と書くと今度は逆向きに嘘になる。
+  捨てられたテーブル分は結果行が `Payout` を出す時点で既に正直なので、ジャックポットの 2 行は
+  プールを過大に書くのをやめるだけでよい。
+- **行き先ではなく「受け取れなかった」と書いた**。`creditJackpotCappedLocked` は `MaxJackpot` で
+  自分も頭打ちになりうるので、「プールへ戻りました」は常に真とは限らない。受け取れなかったことは常に真。
+- **回帰の数値は実 Store から写した**。`internal/casino/store_test.go` の
+  `TestStore_Spin_JackpotAtTheCapReturnsTheUndeliveredPoolToThePool`(MaxChips-30 → `Payout` 40)と
+  `..._JackpotPartlyFits_...`(MaxChips-1990 → `Payout` 2000)が固定済みの出力なので、
+  手作りの値で自分の思い込みを検査する形を避けられた(`paths:` の都合で commands 側から実 Spin は駆動できない)。
+- **通常範囲の fixture に `Owed` を足した**。前は `Owed` 未設定(0)で「たまたま」切り詰め判定に落ちない状態で、
+  文面は変わらないが、テストが偶然で通るのをやめさせた。
+- **効き目の確認(mutation)**: 3 つとも落ちる(`mutation-C3B-20.txt`)。結果行の切り詰め判定を外すと
+  「40枚 獲得」と「+5000 チップ」が並んだまま落ち、祝いの文だけ外すと祝いの文で落ち、
+  `min` の丸めを落とすと「1枚も入らなかった」側が落ちる。
+
