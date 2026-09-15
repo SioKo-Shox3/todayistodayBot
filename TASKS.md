@@ -622,7 +622,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。返金待ちは**掃除人からは見えたまま**でなければならない(払うのは掃除人)。
   拒否するのは押下と追加預かりだけで、`Sweep` / `Remove` / `closeBoardIfSettled` の判定は変えない。
 
-## C3B-P5: 盤面を消す機構を 1 つだけにし、走査を構文木で行う(C3B-P4 の差し戻し)
+## C3B-X1: 盤面を消す機構を 1 つだけにし、走査を構文木で行う(C3B-P4 の差し戻し)
 - status: todo
 - done-when: C3B-P4 で `sessions.Close` は 1 か所に絞ったが、**盤面を消す機構がもう 1 つ残っている** — `WithSession` のコールバックが `done=true` を返すとマネージャが盤面を消すため、押下による決着(`highlow.go` 597 / `blackjack.go` 649)が共通入口を通らず、精算に失敗すると預かりが取り残される(再現: 100 枚で開始 → `SettleGame` を失敗させてキャッシュアウト/スタンド → 復旧 → 掃除しても戻らない)。親の決定(2026-09-15): **機構を 1 つに減らす**。
   (1) `SessionManager.WithSession` から **`done` による削除をなくす**(コールバックの戻り値を `error` だけにする)。盤面を消せるのは `closeBoardIfSettled`(と、その中から呼ばれる `Close`)だけにする。`Sweep` が返した期限切れ盤面の扱いも同じ入口へ通す。
