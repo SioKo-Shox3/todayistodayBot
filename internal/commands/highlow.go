@@ -522,9 +522,9 @@ func (c *HighLowCommand) rememberBoardMessage(r interactionResponder, interactio
 		slog.Error("discord: InteractionResponse lookup failed for a high&low board", "error", redactInteractionError(err))
 		return
 	}
-	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) error {
 		session.Ref = casino.MessageRef{ChannelID: msg.ChannelID, MessageID: msg.ID}
-		return false, nil
+		return nil
 	}); err != nil {
 		slog.Error("casino: recording the high&low board message failed", "error", redactInteractionError(err))
 	}
@@ -549,7 +549,12 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		if msg := requireSessionOwner(i, pending.UserID); msg != "" {
 			return respondVia(r, i.Interaction, ephemeralResponse(msg))
 		}
-		return c.settle(r, i, sessionID, lock, pending)
+		err := c.settle(r, i, sessionID, lock, pending)
+		// The board this pot belongs to is still standing while the pot is
+		// unpaid (C3B-X1), so the retry that finally pays it is what retires
+		// it. Every later retry finds it gone, and the door answers nothing.
+		closeBoardIfSettled(c.store, c.sessions, pending.GuildID, pending.UserID, sessionID)
+		return err
 	}
 
 	// Hold, not Get: the board lock above serializes PRESSES, but the idle
@@ -594,28 +599,35 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 	)
 	// Everything inside this closure runs under the manager's lock: no
 	// Discord call, no disk I/O, no re-entry into the manager (危険地帯).
-	err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	//
+	// The board it finishes STAYS in the manager (C3B-X1). The closure used to
+	// report done=true and the board was dropped right here, under the lock —
+	// which is why a refused payout below stranded the stake: the board that
+	// named it was already gone, and the idle sweep only ever sees boards the
+	// manager still has. Nothing settles it twice in the meantime: this press
+	// holds the board lock for the whole handler and a Hold against the sweep.
+	err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		game, isHighLow := live.State.(*casino.HighLowGame)
 		if !isHighLow {
-			return true, errHighLowBadState
+			return errHighLowBadState
 		}
 		switch action {
 		case highLowActionCashOut:
 			payout = game.CashOut()
 			board = snapshotHighLow(game)
 			finished = true
-			return true, nil
+			return nil
 		case highLowActionHigh, highLowActionLow:
 			result, guessErr := game.Guess(action == highLowActionHigh)
 			if guessErr != nil {
-				return false, guessErr // a refused move leaves the board playable
+				return guessErr // a refused move leaves the board playable
 			}
 			step, guessed = result, true
 			board = snapshotHighLow(game)
 			finished, payout = result.Finished, result.Payout
-			return result.Finished, nil
+			return nil
 		default:
-			return false, errHighLowUnknownAction
+			return errHighLowUnknownAction
 		}
 	})
 	if err != nil {
@@ -639,7 +651,8 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		return nil
 	}
 
-	// The board is gone from the manager, so what it owes now lives here.
+	// What the board owes lives here as well as on the board itself, because
+	// the press is the only thing that can draw the closing message.
 	// Recording it BEFORE the store call is the whole point: a refused
 	// payout must leave something for the next press to retry.
 	pending := &highLowPending{
@@ -652,7 +665,13 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		},
 	}
 	lock.pending = pending
-	return c.settle(r, i, sessionID, lock, pending)
+	err = c.settle(r, i, sessionID, lock, pending)
+	// Chips first, board second — the order every route in this package keeps
+	// (C3B-X1). A payout that landed takes the board with it; one that was
+	// refused leaves the board standing for the idle sweep, which pays the
+	// number settle has fixed on it rather than dealing the hand again.
+	closeBoardIfSettled(c.store, c.sessions, session.GuildID, session.UserID, sessionID)
+	return err
 }
 
 // redrawStaleBoard repaints a board whose last edit was lost and answers the
@@ -664,13 +683,13 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 // get the same treatment. The caller holds both the board lock and a Hold.
 func (c *HighLowCommand) redrawStaleBoard(r interactionResponder, i *discordgo.InteractionCreate, sessionID, userID string) error {
 	var board highLowBoard
-	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		game, isHighLow := live.State.(*casino.HighLowGame)
 		if !isHighLow {
-			return true, errHighLowBadState
+			return errHighLowBadState
 		}
 		board = snapshotHighLow(game)
-		return false, nil
+		return nil
 	}); err != nil {
 		return respondVia(r, i.Interaction, ephemeralResponse(translateHighLowPressError(err)))
 	}
@@ -710,6 +729,11 @@ func (c *HighLowCommand) settle(r interactionResponder, i *discordgo.Interaction
 	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, sessionID, pending.Payout)
 	if err != nil {
 		slog.Error("casino: SettleGame failed for high&low", "error", redactInteractionError(err))
+		// The board outlives this failure (C3B-X1), so the sweep will reach it
+		// — and it must pay THIS number rather than cash the pot out again.
+		// The mark also takes the board out of play (C3B-P5): the hand is
+		// over, only the payment is missing.
+		c.sessions.MarkRefundPending(sessionID, pending.Payout)
 		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
 			Data: &discordgo.InteractionResponseData{

@@ -400,7 +400,15 @@ type casinoBank interface {
 // the ONLY place in this package that closes a board, it decides from the
 // ACCOUNT (not from the caller's belief about it) whether dropping is safe,
 // and casino_shared_test.go's source scan fails the build of any new route
-// that calls casino.SessionManager.Close itself.
+// that calls casino.SessionManager.Close or Remove itself.
+//
+// C3B-X1 closed the last way around it. Sealing the CALLERS was never enough
+// while the manager itself still had a second mechanism: WithSession removed
+// any board whose callback reported done=true, so a press that finished a
+// hand retired it before anything asked the account, and the settlement that
+// came next could still be refused. The flag is gone, the sweeper's Remove
+// now goes through here too, and there is exactly ONE route out of the
+// manager for every board in the process.
 
 // errBoardStillHoldsStake is what closeBoardIfSettled answers when the account
 // is still holding this board's stake. The board stays exactly where it is, so
@@ -425,13 +433,22 @@ var errBoardStillHoldsStake = errors.New("commands: the account is still holding
 // restart. An unknown or expired board is already somebody else's and is left
 // alone: expired belongs to the sweep goroutine until its settlement lands.
 //
-// Callers hold the board's per-board lock, the same as any other write to a
+// Presses hold the board's per-board lock, the same as any other write to a
 // live board. Holding the board itself (Hold) is not required: a sweep that
-// takes the board while this is deciding wins it outright, because Close
-// refuses an expired board — so the worst case is that the sweeper, not this
-// call, is the one that retires it.
+// takes the board while this is deciding does not steal it any more, because
+// an expired board is retired here too.
+//
+// The EXPIRED board is the sweeper's, and the sweeper is the only caller that
+// ever reaches one: Sweep hands a board out, the settlement lands, and the
+// pass calls this to retire it (C3B-X1). Close refuses an expired board on
+// purpose — that refusal is what keeps a press from taking one — so the drop
+// falls through to Remove, which is the sweeper's half of the expiry protocol
+// and is reached from nowhere else. The account check in front of it is the
+// same one a press gets, and it is a tightening for the sweep: a board it
+// could not resolve used to be dropped outright, stranding whatever was still
+// marked with it, and now stays until the chips have actually moved.
 func closeBoardIfSettled(bank casinoBank, sessions *casino.SessionManager, guildID, userID, sessionID string) error {
-	if _, live := sessions.Get(sessionID); !live {
+	if !sessions.Exists(sessionID) {
 		return nil
 	}
 	held, err := bank.EscrowHeldBy(guildID, userID, sessionID)
@@ -443,6 +460,11 @@ func closeBoardIfSettled(bank casinoBank, sessions *casino.SessionManager, guild
 		slog.Warn("casino: a board still holds its stake and will not be closed, the idle sweep settles it", "session", sessionID)
 		return errBoardStillHoldsStake
 	}
-	sessions.Close(sessionID)
+	if !sessions.Close(sessionID) {
+		// Not live: either the board expired between the read above and here
+		// — the sweeper owns it and this call IS the sweeper — or somebody
+		// else retired it already. Remove answers both, and reports which.
+		sessions.Remove(sessionID)
+	}
 	return nil
 }

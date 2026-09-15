@@ -83,11 +83,13 @@ func runSessionSweeper(ctx context.Context, editor boardEditor, mgr *casino.Sess
 // button pressed a moment too late gets ErrSessionNotFound instead of a
 // second settlement.
 //
-// The board is removed only AFTER the settlement has landed. A settlement
-// that fails leaves the board expired, carrying the payout it already
-// resolved, and the next pass (CasinoSweepInterval later) pays that same
-// number: dropping the board here would lose the payout AND leave the stake
-// in escrow, where it blocks every new game until the next restart.
+// The board is removed only AFTER the settlement has landed, and it is
+// removed through closeBoardIfSettled — the one door (C3B-X1), which asks the
+// ACCOUNT rather than this pass's belief before it drops anything. A
+// settlement that fails leaves the board expired, carrying the payout it
+// already resolved, and the next pass (CasinoSweepInterval later) pays that
+// same number: dropping the board here would lose the payout AND leave the
+// stake in escrow, where it blocks every new game until the next restart.
 //
 // One failing board never stops the pass.
 func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casinoBank, now time.Time) {
@@ -97,11 +99,13 @@ func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casino
 		case errors.Is(err, errBoardCannotResolve):
 			// Unreachable while every registered game either resolves itself
 			// or settles itself. Nothing can decide what this board owes, so
-			// retrying it forever would only keep its owner locked out of new
-			// games: drop it and leave the escrow to RefundStaleEscrows at the
-			// next restart. That is worth a loud line.
+			// nothing here can pay it — but the board is still the only thing
+			// that names the stake, and dropping it used to strand exactly
+			// that (C3B-X1). It goes to the same door as every other board:
+			// gone if the account is no longer holding its stake, standing if
+			// it is. A line this loud, once every pass, is the point.
 			slog.Error("casino: a swept board cannot resolve itself", "game", string(session.Game), "state", fmt.Sprintf("%T", session.State))
-			mgr.Remove(session.ID)
+			closeBoardIfSettled(bank, mgr, session.GuildID, session.UserID, session.ID)
 			continue
 		case errors.Is(err, casino.ErrNoGameInProgress):
 			// The escrow is already closed: a press got there first, or an
@@ -109,7 +113,7 @@ func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casino
 			// There is nothing left to pay, and no later pass could find any,
 			// so retrying would only keep the owner locked out of new games.
 			slog.Warn("casino: a timed-out board had no stake left to settle", "game", string(session.Game))
-			mgr.Remove(session.ID)
+			closeBoardIfSettled(bank, mgr, session.GuildID, session.UserID, session.ID)
 			continue
 		case errors.Is(err, casino.ErrEscrowMismatch):
 			// The account IS holding a stake and it is not this board's. That
@@ -127,7 +131,7 @@ func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casino
 			slog.Error("casino: settling a timed-out board failed, retrying at the next sweep", "game", string(session.Game), "error", redactInteractionError(err))
 			continue
 		}
-		mgr.Remove(session.ID)
+		closeBoardIfSettled(bank, mgr, session.GuildID, session.UserID, session.ID)
 		editTimedOutBoard(editor, session, settled)
 	}
 }

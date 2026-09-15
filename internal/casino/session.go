@@ -311,17 +311,27 @@ func (m *SessionManager) Get(id string) (Session, bool) {
 
 // WithSession applies fn to the live board under the manager's lock, which
 // is what serializes two fast button presses (and a concurrent Sweep)
-// against the same hand. fn reports whether the board is finished; a
-// finished session is removed from the maps immediately, so the second
-// press gets ErrSessionNotFound instead of settling the hand twice. fn's
-// error is returned as-is; done alone decides removal, so a rejected move
-// (e.g. ErrDoubleUnavailable, done=false) leaves the board playable while a
-// board that finished AND reported an error still leaves the maps — a
-// finished board must never stay addressable.
+// against the same hand.
+//
+// NOTHING fn returns removes the board (C3B-X1). fn used to report a `done`
+// flag and a finished board was dropped from the maps inside this very call —
+// which made this the SECOND mechanism that could retire a board, sitting
+// beside the one door the package is supposed to have. A press that finished
+// a hand therefore skipped the door's account check: when the settlement that
+// followed was refused, the stake stayed in escrow with no board left to give
+// it back, and the idle sweep — which only ever sees boards the manager still
+// has — could not reach it either. A press that finishes a hand now settles
+// it with the board still standing and closes it through closeBoardIfSettled
+// once the chips have landed; one that cannot pay leaves the board for the
+// sweep, exactly as every other unpaid settlement does (C2-10).
+//
+// fn's error is returned as-is and leaves the board untouched, so a refused
+// move (ErrDoubleUnavailable) and a board in the wrong state are both still
+// settleable afterwards.
 //
 // LastActionAt is refreshed on every successful call, so an active player
 // never trips the idle sweep.
-func (m *SessionManager) WithSession(id string, fn func(*Session) (done bool, err error)) error {
+func (m *SessionManager) WithSession(id string, fn func(*Session) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -334,12 +344,7 @@ func (m *SessionManager) WithSession(id string, fn func(*Session) (done bool, er
 		return ErrSessionNotFound
 	}
 
-	done, err := fn(session)
-	if done {
-		m.removeLocked(session)
-		return err
-	}
-	if err != nil {
+	if err := fn(session); err != nil {
 		return err
 	}
 	session.LastActionAt = m.now()
@@ -486,6 +491,20 @@ func (m *SessionManager) Sweep(now time.Time) []*Session {
 		}
 	}
 	return expired
+}
+
+// Exists reports whether the manager still has this board — expired ones
+// included. It is the door's first question (closeBoardIfSettled): a board
+// that is already gone needs no account read, and an EXPIRED board is still
+// the manager's, so the door must be able to see it in order to retire it on
+// the sweeper's behalf. Get deliberately hides expired boards from presses,
+// which is why this is a separate question rather than a flag on that one.
+func (m *SessionManager) Exists(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, ok := m.sessions[id]
+	return ok
 }
 
 // Remove drops a board for good. It is the sweeper's half of the expiry

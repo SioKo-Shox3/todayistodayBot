@@ -563,9 +563,9 @@ func (c *DuelCommand) rememberChallengeMessage(r interactionResponder, interacti
 		slog.Error("discord: InteractionResponse lookup failed for a duel challenge", "error", redactInteractionError(err))
 		return
 	}
-	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) error {
 		session.Ref = casino.MessageRef{ChannelID: msg.ChannelID, MessageID: msg.ID}
-		return false, nil
+		return nil
 	}); err != nil {
 		slog.Error("casino: recording the duel challenge message failed", "error", redactInteractionError(err))
 	}
@@ -606,13 +606,13 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 
 	var board casino.DuelState
 	var refusal string
-	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		state, isDuel := live.State.(*casino.DuelState)
 		if !isDuel {
-			return true, errDuelBadState
+			return errDuelBadState
 		}
 		if state.Stage != casino.DuelPending {
-			return false, casino.ErrNoGameInProgress
+			return casino.ErrNoGameInProgress
 		}
 		// The owner of a challenge is the RECEIVER, not Session.UserID. The
 		// test runs INSIDE the closure, and a refusal leaves through the
@@ -622,10 +622,10 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 		// the refund the challenger is waiting for.
 		if msg := requireDuelOpponent(i, state.OpponentID); msg != "" {
 			refusal = msg
-			return false, errDuelNotOpponent
+			return errDuelNotOpponent
 		}
 		board = *state
-		return false, nil
+		return nil
 	}); err != nil {
 		if errors.Is(err, errDuelNotOpponent) {
 			return respondVia(r, i.Interaction, ephemeralResponse(refusal))

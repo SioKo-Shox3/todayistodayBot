@@ -549,9 +549,9 @@ func (c *BlackjackCommand) rememberHandMessage(r interactionResponder, interacti
 		slog.Error("discord: InteractionResponse lookup failed for a blackjack hand", "error", redactInteractionError(err))
 		return
 	}
-	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(session *casino.Session) error {
 		session.Ref = casino.MessageRef{ChannelID: msg.ChannelID, MessageID: msg.ID}
-		return false, nil
+		return nil
 	}); err != nil {
 		slog.Error("casino: recording the blackjack hand message failed", "error", redactInteractionError(err))
 	}
@@ -635,31 +635,38 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 	)
 	// Everything inside this closure runs under the manager's lock: no
 	// Discord call, no disk I/O, no re-entry into the manager (危険地帯).
-	err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	//
+	// The hand it finishes STAYS in the manager (C3B-X1). The closure used to
+	// report done=true and the hand was dropped right here, under the lock —
+	// which is why a refused payout below stranded the stake: the hand that
+	// named it was already gone, and the idle sweep only ever sees boards the
+	// manager still has. Nothing settles it twice in the meantime: this press
+	// holds the board lock for the whole handler and a Hold against the sweep.
+	err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		game, isBlackjack := live.State.(*casino.BlackjackGame)
 		if !isBlackjack {
-			return true, errBlackjackBadState
+			return errBlackjackBadState
 		}
 		switch action {
 		case blackjackActionHit:
 			if _, hitErr := game.Hit(); hitErr != nil {
-				return false, hitErr // a refused move leaves the hand playable
+				return hitErr // a refused move leaves the hand playable
 			}
 		case blackjackActionStand:
 			if standErr := game.Stand(); standErr != nil {
-				return false, standErr
+				return standErr
 			}
 		case blackjackActionDouble:
 			if _, doubleErr := game.Double(); doubleErr != nil {
-				return false, doubleErr
+				return doubleErr
 			}
 		default:
-			return false, errBlackjackUnknownAction
+			return errBlackjackUnknownAction
 		}
 		board = snapshotBlackjack(game)
 		finished = board.Finished
 		payout = game.Settle()
-		return finished, nil
+		return nil
 	})
 	if err != nil {
 		return respondVia(r, i.Interaction, ephemeralResponse(translateBlackjackPressError(err)))
@@ -682,12 +689,19 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 		return nil
 	}
 
-	// The hand is gone from the manager, so what it owes now lives here.
-	// Recording it BEFORE the store call is the whole point: a refused payout
-	// must leave something for the next press to retry.
+	// What the hand owes lives here as well as on the hand itself, because the
+	// press is the only thing that can draw the closing message. Recording it
+	// BEFORE the store call is the whole point: a refused payout must leave
+	// something for the next press to retry.
 	pending := &blackjackPending{GuildID: session.GuildID, UserID: session.UserID, Payout: payout, Board: board}
 	lock.pending = pending
-	return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseUpdateMessage)
+	err = c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseUpdateMessage)
+	// Chips first, hand second — the order every route in this package keeps
+	// (C3B-X1). A payout that landed takes the hand with it; one that was
+	// refused leaves the hand standing for the idle sweep, which pays the
+	// number settle has fixed on it rather than standing the hand again.
+	closeBoardIfSettled(c.store, c.sessions, session.GuildID, session.UserID, sessionID)
+	return err
 }
 
 // stakeDouble runs the double in the order C2-04 fixed: ask the hand whether
@@ -697,23 +711,23 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 // stake safe: no other press on this hand can run inside it.
 func (c *BlackjackCommand) stakeDouble(session casino.Session, sessionID string) error {
 	var extra int64
-	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		game, isBlackjack := live.State.(*casino.BlackjackGame)
 		if !isBlackjack {
-			return true, errBlackjackBadState
+			return errBlackjackBadState
 		}
 		// Asked of the LIVE hand, not of the copy the press is holding: this
 		// is the only place in the package that adds chips to an escrow that
 		// already exists, so the refusal sits against the write itself rather
 		// than only against the press that reached it (C3B-P5).
 		if live.RefundPending() {
-			return false, casino.ErrRefundPending
+			return casino.ErrRefundPending
 		}
 		if !game.CanDouble() {
-			return false, casino.ErrDoubleUnavailable
+			return casino.ErrDoubleUnavailable
 		}
 		extra = game.Bet()
-		return false, nil
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -742,13 +756,13 @@ func (c *BlackjackCommand) DisabledComponents(sessionID string, state any) []dis
 // the same treatment. The caller holds both the board lock and a Hold.
 func (c *BlackjackCommand) redrawStaleHand(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, session casino.Session) error {
 	var board blackjackBoard
-	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {
+	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) error {
 		game, isBlackjack := live.State.(*casino.BlackjackGame)
 		if !isBlackjack {
-			return true, errBlackjackBadState
+			return errBlackjackBadState
 		}
 		board = snapshotBlackjack(game)
-		return false, nil
+		return nil
 	}); err != nil {
 		return respondVia(r, i.Interaction, ephemeralResponse(translateBlackjackPressError(err)))
 	}
@@ -788,6 +802,12 @@ func (c *BlackjackCommand) settle(r interactionResponder, i *discordgo.Interacti
 	settled, err := c.store.SettleGame(pending.GuildID, pending.UserID, sessionID, pending.Payout)
 	if err != nil {
 		slog.Error("casino: SettleGame failed for blackjack", "error", redactInteractionError(err))
+		// The hand outlives this failure (C3B-X1), so the sweep will reach it
+		// — and it must pay THIS number rather than stand the hand again
+		// against a dealer who may beat it. The mark also takes the hand out
+		// of play (C3B-P5): it is over, only the payment is missing. A hand
+		// that ended at the deal is already marked with the same number.
+		c.sessions.MarkRefundPending(sessionID, pending.Payout)
 		return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 			Type: responseType,
 			Data: &discordgo.InteractionResponseData{
