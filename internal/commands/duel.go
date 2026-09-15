@@ -601,7 +601,7 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 	// so that a marked challenge can never be accepted for a stake that is
 	// already on its way back.
 	if session.RefundPending() {
-		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoRefundPendingMessage))
 	}
 
 	var board casino.DuelState

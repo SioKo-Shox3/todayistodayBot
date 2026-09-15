@@ -325,8 +325,9 @@ func translateBlackjackPressError(err error) string {
 		return blackjackSessionOverMessage
 	case errors.Is(err, casino.ErrRefundPending):
 		// Not "the hand is over": it is standing, and the chips are on their
-		// way back. Same wording as a settlement that has not landed yet.
-		return casinoSettleFailedMessage
+		// way back — by the sweep's retry, not by a press, so the line says to
+		// wait (C3B-X2).
+		return casinoRefundPendingMessage
 	case errors.Is(err, casino.ErrDoubleUnavailable):
 		return blackjackDoubleOverMessage
 	case errors.Is(err, errBlackjackUnknownAction):
@@ -605,9 +606,10 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 	// decided at the deal) was refused (C3B-P5). What it owes is already
 	// fixed, so a hit, a stand or a ⏫ here would move a hand whose number can
 	// no longer change — and ⏫ would stake a second bet the fixed amount will
-	// never return. The wording is the one an unpaid settlement already uses.
+	// never return. The wording says to wait (C3B-X2): the sweep is what retries
+	// the refund, so pressing again is not the way out of this hand.
 	if session.RefundPending() {
-		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoRefundPendingMessage))
 	}
 
 	// The hand's last edit never reached Discord, so the message shows the

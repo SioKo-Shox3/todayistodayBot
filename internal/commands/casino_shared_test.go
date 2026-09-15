@@ -621,3 +621,20 @@ type escrowBlindBank struct {
 func (b *escrowBlindBank) EscrowHeldBy(guildID, userID, sessionID string) (bool, error) {
 	return false, b.escrowErr
 }
+
+// The two lines a board answers a press with while its chips have not moved are
+// not interchangeable. casinoSettleFailedMessage sits under a 🔁 the player can
+// press, so it asks for a retry; a board refused by RefundPending has no such
+// button left to reach — the idle sweep is the retry — so its line must tell
+// the player to wait. Collapsing them back into one string (the state before
+// C3B-X2) asks a player to press buttons that do nothing.
+func TestTheRefundPendingLineTellsThePlayerToWaitRatherThanRetry(t *testing.T) {
+	if casinoRefundPendingMessage == casinoSettleFailedMessage {
+		t.Fatal("the waiting line and the refused-settlement line are the same string: a press with no retry behind it is asking the player to retry")
+	}
+	for _, retry := range []string{"もう一度", "再度", "やり直"} {
+		if strings.Contains(casinoRefundPendingMessage, retry) {
+			t.Errorf("the waiting line contains %q — the player has nothing to retry here, the sweep does it for them", retry)
+		}
+	}
+}

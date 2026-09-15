@@ -575,11 +575,11 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 	// This board is only standing because the refund it owes was refused
 	// (C3B-P5). What it pays is already fixed, so a guess taken here would
 	// raise a pot the sweep will never pay: the refund is the whole of what
-	// is left to happen on it. The wording is the one an unpaid settlement
-	// already uses — from the player's side both are "the chips have not
-	// moved yet, it is being retried".
+	// is left to happen on it. The wording is its own (C3B-X2): the retry here
+	// belongs to the sweep, not to the player, so the line says to wait rather
+	// than to press again.
 	if session.RefundPending() {
-		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoRefundPendingMessage))
 	}
 
 	// The board's last edit never reached Discord, so the message shows the

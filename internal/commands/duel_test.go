@@ -1255,8 +1255,8 @@ func TestDuelRefusesAPressWhileItsRefundIsPending(t *testing.T) {
 		if err := c.handleComponent(presser, duelButtonInteraction(customID, duelOpponent), sessionID, action); err != nil {
 			t.Fatalf("press %q: %v", action, err)
 		}
-		if got := presser.last(t).Data.Content; got != casinoSettleFailedMessage {
-			t.Errorf("%q on a challenge awaiting its refund answered %q, want %q", action, got, casinoSettleFailedMessage)
+		if got := presser.last(t).Data.Content; got != casinoRefundPendingMessage {
+			t.Errorf("%q on a challenge awaiting its refund answered %q, want %q", action, got, casinoRefundPendingMessage)
 		}
 	}
 

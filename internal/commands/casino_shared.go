@@ -254,6 +254,15 @@ const casinoActionSettle = "settle"
 // landed. The 🔁 button under it is the retry.
 const casinoSettleFailedMessage = "❌ 精算に失敗しました。もう一度お試しください。"
 
+// casinoRefundPendingMessage answers a press on a board that is standing only
+// because the refund it owes was refused (casino.Session.RefundPending). It is
+// deliberately NOT casinoSettleFailedMessage: that line sits under a 🔁 the
+// player can actually press, while a board reached here has no retry of its own
+// — the idle sweep is what hands the stake back. Telling this player to try
+// again would point them at buttons that do nothing; waiting really does return
+// the chips, so that is what it says (C3B-X2).
+const casinoRefundPendingMessage = "⏳ この盤面は返金の再試行を待っています。完了すると自動でチップが戻ります。"
+
 // casinoPayoutLine is the one line that names money. It exists so that the
 // games and the sweeper cannot word it differently — and, more importantly,
 // so that "there are no numbers to print yet" is a decision about whether to

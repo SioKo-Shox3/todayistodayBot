@@ -1232,8 +1232,8 @@ func TestBlackjackRefusesAPressWhileItsRefundIsPending(t *testing.T) {
 	presser := &fakeCasinoResponder{}
 	for _, action := range []string{blackjackActionDouble, blackjackActionHit, blackjackActionStand} {
 		resp := c.press(t, presser, sessionID, action)
-		if resp.Data.Content != casinoSettleFailedMessage {
-			t.Errorf("%q on a hand awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoSettleFailedMessage)
+		if resp.Data.Content != casinoRefundPendingMessage {
+			t.Errorf("%q on a hand awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoRefundPendingMessage)
 		}
 		if resp.Type == discordgo.InteractionResponseUpdateMessage {
 			t.Errorf("%q repainted a hand whose refund is still owed", action)

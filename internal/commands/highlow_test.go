@@ -1314,8 +1314,8 @@ func TestHighLowRefusesAPressWhileItsRefundIsPending(t *testing.T) {
 	presser := &fakeHighLowResponder{}
 	for _, action := range []string{highLowActionHigh, highLowActionLow} {
 		resp := c.press(t, presser, sessionID, action)
-		if resp.Data.Content != casinoSettleFailedMessage {
-			t.Errorf("%q on a board awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoSettleFailedMessage)
+		if resp.Data.Content != casinoRefundPendingMessage {
+			t.Errorf("%q on a board awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoRefundPendingMessage)
 		}
 		if resp.Type == discordgo.InteractionResponseUpdateMessage {
 			t.Errorf("%q repainted a board whose refund is still owed", action)
