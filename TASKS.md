@@ -621,3 +621,17 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/blackjack.go, internal/commands/highlow.go, internal/commands/duel.go, internal/commands/blackjack_test.go, internal/commands/highlow_test.go, internal/commands/duel_test.go
 - notes: 危険地帯。返金待ちは**掃除人からは見えたまま**でなければならない(払うのは掃除人)。
   拒否するのは押下と追加預かりだけで、`Sweep` / `Remove` / `closeBoardIfSettled` の判定は変えない。
+
+## C3B-P5: 盤面を消す機構を 1 つだけにし、走査を構文木で行う(C3B-P4 の差し戻し)
+- status: todo
+- done-when: C3B-P4 で `sessions.Close` は 1 か所に絞ったが、**盤面を消す機構がもう 1 つ残っている** — `WithSession` のコールバックが `done=true` を返すとマネージャが盤面を消すため、押下による決着(`highlow.go` 597 / `blackjack.go` 649)が共通入口を通らず、精算に失敗すると預かりが取り残される(再現: 100 枚で開始 → `SettleGame` を失敗させてキャッシュアウト/スタンド → 復旧 → 掃除しても戻らない)。親の決定(2026-09-15): **機構を 1 つに減らす**。
+  (1) `SessionManager.WithSession` から **`done` による削除をなくす**(コールバックの戻り値を `error` だけにする)。盤面を消せるのは `closeBoardIfSettled`(と、その中から呼ばれる `Close`)だけにする。`Sweep` が返した期限切れ盤面の扱いも同じ入口へ通す。
+  (2) 押下による決着は「盤面を保持したまま精算 → 成功したら共通入口で閉じる」へ書き換える(H&L・BJ・duel)。精算に失敗したら盤面と確定配当を残し、掃除人が再試行する(C2-10 の規律)。
+  (3) ソース走査テストを**構文木**で行う(`go/parser` + `go/ast`。標準ライブラリのみ)。`internal/commands` の非テストファイルを構文解析し、`closeBoardIfSettled` の実装ファイル以外で「セッションマネージャのメソッド呼び出しのうち盤面を消すもの」が現れたら落ちる。行単位の文字列一致は複数行に折り返された呼び出しを見逃すので使わない。
+  (4) 回帰テスト: 押下による決着で精算が失敗 → 盤面が残る → 復旧後の掃除で預かりが戻る(H&L・BJ・duel の 3 本)。`PROGRESS.md` の経路表を更新し、**盤面を消す経路が 1 本しかない**ことを書く。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go
+- notes: 危険地帯。**扉が 2 つあるうちは塞ぎ続けても終わらない** — この系統は「盤面を消せる場所が 1 つしかない」状態にして閉じる。`WithSession` の戻り値を変えると呼び出し側が全部コンパイルエラーになるので、移行漏れはコンパイラが教える(それも狙いのうち)。
