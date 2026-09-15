@@ -700,3 +700,77 @@ func TestSessionSetNeedsRedrawLowersTheFlag(t *testing.T) {
 		t.Error("the flag stayed up after the redraw landed, so every later press would only redraw")
 	}
 }
+
+// --- the ID the caller brings (C3B-18) --------------------------------------
+
+// OpenWithID exists so the command layer can mark a stake with its board
+// BEFORE the board is published: the chips move first (C2-06), and the only
+// way for them to name their real owner from that first write is for the ID
+// to already exist. The board the manager publishes must therefore be the
+// one the caller was given.
+func TestOpenWithIDPublishesTheCallersOwnID(t *testing.T) {
+	m := NewSessionManager(time.Now, 3*time.Minute)
+
+	id, err := NewSessionID()
+	if err != nil {
+		t.Fatalf("NewSessionID: %v", err)
+	}
+	opened, err := m.OpenWithID(id, "guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("OpenWithID: %v", err)
+	}
+	if opened.ID != id {
+		t.Fatalf("the board was published as %q, want the ID the stake was marked with (%q)", opened.ID, id)
+	}
+	if found, ok := m.Get(id); !ok || found.ID != id {
+		t.Fatalf("Get(%q) = %+v, %v — the board must be addressable by the caller's ID", id, found, ok)
+	}
+
+	// The one-game rule does not care where the ID came from.
+	other, err := NewSessionID()
+	if err != nil {
+		t.Fatalf("NewSessionID: %v", err)
+	}
+	if _, err := m.OpenWithID(other, "guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); !errors.Is(err, ErrGameInProgress) {
+		t.Fatalf("a second board for the same player returned %v, want ErrGameInProgress", err)
+	}
+}
+
+// An ID that is already live must be refused rather than taken over: the
+// second caller's stake is marked with it too, so overwriting the board would
+// hand one player's chips to another player's game.
+func TestOpenWithIDRefusesAnIDThatIsAlreadyLive(t *testing.T) {
+	m := NewSessionManager(time.Now, 3*time.Minute)
+
+	if _, err := m.OpenWithID("shared-id", "guild-1", "user-1", GameHighLow, &struct{}{}, testRef); err != nil {
+		t.Fatalf("OpenWithID: %v", err)
+	}
+	if _, err := m.OpenWithID("shared-id", "guild-1", "user-2", GameBlackjack, &struct{}{}, testRef); !errors.Is(err, ErrSessionIDTaken) {
+		t.Fatalf("reusing a live ID returned %v, want ErrSessionIDTaken", err)
+	}
+	if found, ok := m.Get("shared-id"); !ok || found.UserID != "user-1" || found.Game != GameHighLow {
+		t.Fatalf("the live board is now %+v, %v — the refused open took it over", found, ok)
+	}
+	if m.Len() != 1 {
+		t.Fatalf("%d boards are live, want 1", m.Len())
+	}
+}
+
+// NewSessionID is exported for the command layer, so its shape is part of the
+// contract now: 32 hex characters, and never the same twice.
+func TestNewSessionIDIsUnguessableAndUnique(t *testing.T) {
+	seen := make(map[string]bool, 64)
+	for i := 0; i < 64; i++ {
+		id, err := NewSessionID()
+		if err != nil {
+			t.Fatalf("NewSessionID: %v", err)
+		}
+		if len(id) != 32 {
+			t.Fatalf("NewSessionID() = %q (%d chars), want 32 hex characters", id, len(id))
+		}
+		if seen[id] {
+			t.Fatalf("NewSessionID() repeated %q", id)
+		}
+		seen[id] = true
+	}
+}

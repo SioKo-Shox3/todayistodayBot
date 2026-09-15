@@ -763,7 +763,14 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 	if err := bank.EnsureCasinoAccess("g1", duelChallenger, opened); err != nil {
 		t.Fatalf("EnsureCasinoAccess: %v", err)
 	}
-	if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), casino.EscrowOpening, 100, opened); err != nil {
+	// The stake names the challenge from its first write, as /duel mints the
+	// board's ID before it stakes anything (C-3b) — the sweeper withdraws by
+	// that same ID.
+	sessionID, err := casino.NewSessionID()
+	if err != nil {
+		t.Fatalf("NewSessionID: %v", err)
+	}
+	if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), sessionID, 100, opened); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
 	// The manager's clock is frozen at the challenge, so LastActionAt is
@@ -771,14 +778,8 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
 	c.sessions = mgr
 	board := &casino.DuelState{ChallengerID: duelChallenger, OpponentID: duelOpponent, Bet: 100, Stage: casino.DuelPending}
-	session, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
-	if err != nil {
+	if _, err := mgr.OpenWithID(sessionID, "g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
 		t.Fatalf("opening the challenge: %v", err)
-	}
-	// The stake becomes this challenge's, as /duel binds it once the manager
-	// has published an ID (C-3b) — the sweeper withdraws by that ID.
-	if err := bank.BindEscrowSession("g1", duelChallenger, session.ID); err != nil {
-		t.Fatalf("BindEscrowSession: %v", err)
 	}
 
 	editor := newRecordingEditor()
@@ -909,16 +910,17 @@ func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
 			if err := bank.EnsureCasinoAccess("g1", duelChallenger, opened); err != nil {
 				t.Fatalf("EnsureCasinoAccess: %v", err)
 			}
-			if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), casino.EscrowOpening, 100, opened); err != nil {
+			sessionID, err := casino.NewSessionID()
+			if err != nil {
+				t.Fatalf("NewSessionID: %v", err)
+			}
+			if err := bank.OpenGame("g1", duelChallenger, string(casino.GameDuel), sessionID, 100, opened); err != nil {
 				t.Fatalf("OpenGame: %v", err)
 			}
 			board := &casino.DuelState{ChallengerID: duelChallenger, OpponentID: duelOpponent, Bet: 100, Stage: casino.DuelPending}
-			session, err := mgr.Open("g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+			session, err := mgr.OpenWithID(sessionID, "g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 			if err != nil {
 				t.Fatalf("opening the challenge: %v", err)
-			}
-			if err := bank.BindEscrowSession("g1", duelChallenger, session.ID); err != nil {
-				t.Fatalf("BindEscrowSession: %v", err)
 			}
 
 			// One second before the deadline, a bystander presses.
@@ -946,28 +948,28 @@ func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
 // --- the undelivered challenge (C3B-14) ------------------------------------
 
 // duelBankThatRefusesOneRefund is a real store whose NEXT DeclineDuel fails,
-// and that remembers the board a stake was bound to. Neither is reachable
+// and that remembers the board the stake was opened for. Neither is reachable
 // from the outside — a refund only moves chips the account already owns, and
-// the board's ID is published by the manager — but "the withdrawal was
-// decided and the chips did not move" is exactly the state the retry exists
-// for, and the recorded ID is how a test presses the board the failing call
-// is standing on.
+// the board's ID is minted inside /duel — but "the withdrawal was decided and
+// the chips did not move" is exactly the state the retry exists for, and the
+// recorded ID is how a test presses the board the failing call is standing
+// on.
 type duelBankThatRefusesOneRefund struct {
 	*flakyBank
 	refuseNextRefund error
 	declines         int
-	bound            string
+	board            string
 	// beforeDecline runs once, immediately before a refund is attempted —
 	// the window this cleanup shares with ⚔️, and the only way a test gets
 	// to act inside it instead of hoping to hit it by timing.
 	beforeDecline func()
 }
 
-func (b *duelBankThatRefusesOneRefund) BindEscrowSession(guildID, userID, sessionID string) error {
-	if err := b.flakyBank.BindEscrowSession(guildID, userID, sessionID); err != nil {
+func (b *duelBankThatRefusesOneRefund) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
+	if err := b.flakyBank.OpenGame(guildID, userID, game, sessionID, bet, now); err != nil {
 		return err
 	}
-	b.bound = sessionID
+	b.board = sessionID
 	return nil
 }
 
@@ -1053,7 +1055,7 @@ func TestDuelUndeliveredCleanupAndAcceptanceDoNotBothPay(t *testing.T) {
 	var acceptResponder *fakeCasinoResponder
 	bank.beforeDecline = func() {
 		acceptResponder = &fakeCasinoResponder{}
-		sessionID := bank.bound
+		sessionID := bank.board
 		go func() {
 			defer close(accepted)
 			customID := BuildCustomID(c.Prefix(), sessionID, duelActionAccept)

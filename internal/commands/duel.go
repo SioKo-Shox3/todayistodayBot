@@ -461,33 +461,33 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 		return respondVia(r, i.Interaction, messageResponse("❌ カジノの初期化に失敗しました。"))
 	}
 
+	// The challenge board's ID comes first, before the challenger is staked:
+	// two challenges of the same size are otherwise indistinguishable, and
+	// minting the ID up front is what lets the stake name its own board from
+	// the first write (設計書 C-3b). Nothing has moved yet, so a failure here
+	// costs only the refusal.
+	sessionID, err := casino.NewSessionID()
+	if err != nil {
+		slog.Error("casino: minting a duel challenge ID failed", "command", "duel", "error", redactInteractionError(err))
+		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
+	}
+
 	// Stake the challenger BEFORE the board, the order C2-06 settled: the
 	// persisted half of "one game per person" is the half that survives a
-	// restart, so it is the one that must refuse a second bet.
-	// The stake is marked casino.EscrowOpening until the challenge board
-	// exists (設計書 C-3b): two challenges of the same size are otherwise
-	// indistinguishable, so an unmarked stake is one another acceptance could
-	// spend.
-	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), casino.EscrowOpening, bet, now); err != nil {
+	// restart, so it is the one that must refuse a second bet. 🎲 and 🚫, the
+	// sweeper and this function's own refund all name sessionID, and an
+	// acceptance that names a challenge already withdrawn is refused instead
+	// of paid out of this one.
+	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), sessionID, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
 	state := &casino.DuelState{ChallengerID: challengerID, OpponentID: opponentID, Bet: bet, Stage: casino.DuelPending}
 	board := *state // safe without the lock: nobody can reach this board until Open publishes its ID
 
-	session, err := c.sessions.Open(i.GuildID, challengerID, casino.GameDuel, state, casino.MessageRef{ChannelID: i.ChannelID})
+	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, challengerID, casino.GameDuel, state, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUndeliveredChallenge(i.GuildID, challengerID, casino.EscrowOpening)
-		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
-	}
-
-	// The challenge owns the stake from here: 🎲 and 🚫, the sweeper and this
-	// function's own refund all name this board, and an acceptance that names
-	// a challenge already withdrawn is refused instead of paid out of it.
-	if err := c.store.BindEscrowSession(i.GuildID, challengerID, session.ID); err != nil {
-		if c.sessions.Close(session.ID) {
-			c.refundUndeliveredChallenge(i.GuildID, challengerID, casino.EscrowOpening)
-		}
+		c.refundUndeliveredChallenge(i.GuildID, challengerID, sessionID)
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 

@@ -103,14 +103,25 @@ func sweepIdleBoards(editor boardEditor, mgr *casino.SessionManager, bank casino
 			slog.Error("casino: a swept board cannot resolve itself", "game", string(session.Game), "state", fmt.Sprintf("%T", session.State))
 			mgr.Remove(session.ID)
 			continue
-		case errors.Is(err, casino.ErrNoGameInProgress), errors.Is(err, casino.ErrEscrowMismatch):
+		case errors.Is(err, casino.ErrNoGameInProgress):
 			// The escrow is already closed: a press got there first, or an
 			// earlier retry paid and failed on something after the payout.
-			// Mismatch is the same answer from the other side — the stake on
-			// the account belongs to a board that is not this one. Either way
-			// there is nothing left HERE to pay, so stop retrying this board.
+			// There is nothing left to pay, and no later pass could find any,
+			// so retrying would only keep the owner locked out of new games.
 			slog.Warn("casino: a timed-out board had no stake left to settle", "game", string(session.Game))
 			mgr.Remove(session.ID)
+			continue
+		case errors.Is(err, casino.ErrEscrowMismatch):
+			// The account IS holding a stake and it is not this board's. That
+			// is not "nothing to pay" — it is a disagreement about who owns
+			// the chips, and dropping the board on it would throw away the
+			// payout this pass already resolved AND leave the stake behind
+			// (C2-10: 精算が成功するまで消さない). Keep the board expired so the
+			// next pass retries it, and say so loudly: with the board's ID
+			// minted before the stake is marked (設計書 C-3b), a mismatch is
+			// no longer a window the open can leave — it means a real
+			// inconsistency on the account.
+			slog.Error("casino: a timed-out board's stake belongs to another board, retrying at the next sweep", "game", string(session.Game), "session", session.ID)
 			continue
 		case err != nil:
 			slog.Error("casino: settling a timed-out board failed, retrying at the next sweep", "game", string(session.Game), "error", redactInteractionError(err))

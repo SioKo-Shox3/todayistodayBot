@@ -1197,20 +1197,6 @@ func clearEscrowLocked(account *UserAccount) {
 	account.EscrowSession = ""
 }
 
-// EscrowOpening is the mark a stake carries between OpenGame and the board
-// that will own it (BindEscrowSession). The command layer has to stake the
-// chips BEFORE it opens the board — that order is what makes the persisted
-// half of "one game per person" the half that refuses a second bet (C2-06)
-// — so for the width of those two calls the stake has no board ID to carry.
-//
-// It is deliberately a value no board can present: session IDs are 32 hex
-// characters (session.go's newSessionID), so no settlement can ever name
-// this mark by accident, and a stake in mid-open is therefore settleable
-// only by the opener, which passes the constant explicitly to hand the chips
-// straight back. Leaving the mark EMPTY instead would open exactly the hole
-// this whole mechanism closes, for as long as the board takes to appear.
-const EscrowOpening = "opening"
-
 // escrowOwnedByLocked reports whether sessionID may settle the stake this
 // account is holding. Caller must already hold the Store's lock.
 //
@@ -1278,11 +1264,13 @@ func (s *Store) GameInProgress(guildID, userID string) (bool, error) {
 // now is the instant recorded as EscrowOpenedAt (RFC3339 in JST, the
 // package-wide convention); no decision here reads it.
 //
-// sessionID is the mark the stake will carry (設計書 C-3b): the ID of the
-// board that may settle it, and EscrowOpening for a caller whose board does
-// not exist yet — which is every caller in the command layer, because the
-// chips are staked first. Every later call names a board this way, and only
-// the named one is allowed to touch the chips.
+// sessionID is the mark the stake carries (設計書 C-3b): the ID of the board
+// that may settle it, and nothing else. The command layer stakes the chips
+// BEFORE the board exists (C2-06), so it mints the ID itself with
+// NewSessionID and hands the SAME one to SessionManager.OpenWithID — the
+// stake is therefore owned by its board from the very first write, with no
+// window in which some provisional mark has to stand in for one. Every later
+// call names a board this way, and only the named one may touch the chips.
 func (s *Store) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
@@ -1295,37 +1283,6 @@ func (s *Store) OpenGame(guildID, userID, game, sessionID string, bet int64, now
 		}
 		account.EscrowGame = game
 		account.EscrowOpenedAt = now.In(jst).Format(time.RFC3339)
-		account.EscrowSession = sessionID
-		return nil
-	})
-}
-
-// BindEscrowSession hands a stake opened as EscrowOpening to the board that
-// will settle it, once the command layer has one (設計書 C-3b). It is the
-// second half of OpenGame, not a state change of its own: nothing about the
-// chips moves, only the name of who may spend them.
-//
-// Returns ErrNoGameInProgress when the account holds no stake — the game was
-// settled or refunded while the board was being created — and
-// ErrEscrowMismatch when the stake is already bound to a DIFFERENT board,
-// which is the same refusal every settlement makes and for the same reason:
-// the chips on the account are that other game's. Binding the ID a stake
-// already carries succeeds, so a retry cannot fail on its own first attempt,
-// and an unmarked stake (one opened before C-3b) is claimable for the same
-// reason every settlement accepts it — escrowOwnedByLocked.
-//
-// On any refusal nothing is persisted, so the caller can hand the stake back
-// with the mark it still has (EscrowOpening).
-func (s *Store) BindEscrowSession(guildID, userID, sessionID string) error {
-	return s.Update(func(d *Data) error {
-		economy := ensureGuildLocked(d, guildID)
-		account := ensureAccountLocked(economy, userID)
-		if account.Escrow == 0 {
-			return ErrNoGameInProgress
-		}
-		if account.EscrowSession != EscrowOpening && !escrowOwnedByLocked(account, sessionID) {
-			return ErrEscrowMismatch
-		}
 		account.EscrowSession = sessionID
 		return nil
 	})

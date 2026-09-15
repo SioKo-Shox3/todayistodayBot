@@ -359,14 +359,14 @@ func settleRetryButtons(game, sessionID string) []discordgo.MessageComponent {
 type casinoBank interface {
 	EnsureCasinoAccess(guildID, userID string, now time.Time) error
 	// Every call that touches a stake names the BOARD it belongs to
-	// (設計書 C-3b): OpenGame marks the chips, BindEscrowSession hands that
-	// mark to the board once the manager has published its ID, and the rest
-	// are refused with casino.ErrEscrowMismatch unless the account is holding
-	// the stake that board opened. The two-step open is what keeps the stake
-	// unspendable in the gap — the chips move BEFORE the board exists
-	// (C2-06), so there is no board ID to mark them with yet.
+	// (設計書 C-3b): OpenGame marks the chips with the board's ID, and the
+	// rest are refused with casino.ErrEscrowMismatch unless the account is
+	// holding the stake that board opened. The chips still move BEFORE the
+	// board exists (C2-06), but the ID does not — the command layer mints it
+	// with casino.NewSessionID first and passes the same one to
+	// SessionManager.OpenWithID, so the open is a single marked write rather
+	// than a gap some other caller could reach into.
 	OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error
-	BindEscrowSession(guildID, userID, sessionID string) error
 	AddToEscrow(guildID, userID, sessionID string, amount int64) error
 	SettleGame(guildID, userID, sessionID string, payout int64) (casino.SettleResult, error)
 	ViewAccount(guildID, userID string, now time.Time) (casino.AccountView, error)

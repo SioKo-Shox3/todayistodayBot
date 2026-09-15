@@ -5947,42 +5947,32 @@ func TestAddToEscrow_RaisingAStakeOpenedForAnotherBoardIsRefused(t *testing.T) {
 	assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, string(GameBlackjack))
 }
 
-// BindEscrowSession is the second half of the command layer's open: the mark
-// moves from EscrowOpening to the board, once, and never off one board onto
-// another.
-func TestBindEscrowSession_HandsAStakeToItsOwnBoardOnly(t *testing.T) {
+// The open is ONE marked write now (設計書 C-3b): the command layer mints the
+// board ID before it stakes anything, so the stake names its own board from
+// the moment it exists and no second call has to hand the mark over.
+func TestOpenGame_MarksTheStakeWithItsBoardFromTheFirstWrite(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
 
-	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), EscrowOpening, 250, fixedNow); err != nil {
+	if err := st.OpenGame(escrowGuild, escrowUser, string(GameHighLow), "board-1", 250, fixedNow); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
-	// A stake still being opened is settleable only by the opener, which is
-	// the one caller that can name the mark.
-	if _, err := st.SettleGame(escrowGuild, escrowUser, "board-1", 250); !errors.Is(err, ErrEscrowMismatch) {
-		t.Fatalf("settling a stake mid-open returned %v, want ErrEscrowMismatch", err)
+	if got := readAccount(t, path, escrowGuild, escrowUser).EscrowSession; got != "board-1" {
+		t.Fatalf("EscrowSession = %q right after the open, want the board that opened it", got)
 	}
 
-	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-1"); err != nil {
-		t.Fatalf("binding the stake to its board: %v", err)
+	// There is no instant at which the stake is anybody's: every other board
+	// is refused from the first write, not from a later binding call.
+	if _, err := st.SettleGame(escrowGuild, escrowUser, "board-2", 250); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("another board's settlement returned %v, want ErrEscrowMismatch", err)
 	}
-	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-1"); err != nil {
-		t.Fatalf("re-binding the same board returned error: %v — a retry must not fail", err)
+	if err := st.AddToEscrow(escrowGuild, escrowUser, "board-2", 100); !errors.Is(err, ErrEscrowMismatch) {
+		t.Fatalf("another board's raise returned %v, want ErrEscrowMismatch", err)
 	}
-	if err := st.BindEscrowSession(escrowGuild, escrowUser, "board-2"); !errors.Is(err, ErrEscrowMismatch) {
-		t.Fatalf("binding another board returned %v, want ErrEscrowMismatch", err)
-	}
-	// The mark is the board's now, so the opener's own EscrowOpening no
-	// longer opens it either.
-	if _, err := st.SettleGame(escrowGuild, escrowUser, EscrowOpening, 250); !errors.Is(err, ErrEscrowMismatch) {
-		t.Fatalf("settling a bound stake as EscrowOpening returned %v, want ErrEscrowMismatch", err)
-	}
-	if got := readAccount(t, path, escrowGuild, escrowUser).EscrowSession; got != "board-1" {
-		t.Fatalf("EscrowSession = %q, want the bound board", got)
-	}
+	assertHoldings(t, path, escrowGuild, escrowUser, 750, 250, string(GameHighLow))
 
 	if _, err := st.SettleGame(escrowGuild, escrowUser, "board-1", 500); err != nil {
-		t.Fatalf("the bound board's settlement returned error: %v", err)
+		t.Fatalf("the board's own settlement returned error: %v", err)
 	}
 	assertHoldings(t, path, escrowGuild, escrowUser, 1250, 0, "")
 	if got := readAccount(t, path, escrowGuild, escrowUser).EscrowSession; got != "" {

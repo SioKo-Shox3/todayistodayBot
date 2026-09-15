@@ -396,34 +396,34 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		return respondVia(r, i.Interaction, messageResponse("❌ カジノの初期化に失敗しました。"))
 	}
 
+	// The board's ID comes FIRST, before either half of the open (設計書
+	// C-3b). The stake has to move before the board exists (C2-06), and the
+	// only way for it to carry its real owner's name from its very first
+	// write is for that name to already exist. Nothing is staked yet, so an
+	// exhausted crypto/rand here costs nothing but the refusal.
+	sessionID, err := casino.NewSessionID()
+	if err != nil {
+		slog.Error("casino: minting a high&low board ID failed", "error", redactInteractionError(err))
+		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
+	}
+
 	// Stake BEFORE the board (C2-06 の完了条件: EnsureCasinoAccess → OpenGame
 	// → Open). Store.OpenGame is the PERSISTED half of "one game per person",
 	// and it is the half that survives a restart, so it is the one that must
-	// refuse a second bet. The in-memory manager can then only fail on an
-	// exhausted crypto/rand, and that failure refunds.
-	// The stake is marked casino.EscrowOpening because the board it belongs
-	// to does not exist yet (設計書 C-3b): in that gap no settlement can
-	// spend it except this function's own refund, which names the mark.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), casino.EscrowOpening, bet, now); err != nil {
+	// refuse a second bet. The stake is marked with sessionID, which is the
+	// board that will be opened on the next line, so there is no instant at
+	// which some other caller — the idle sweeper included — could find a
+	// stake whose owner has not been decided yet.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), sessionID, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
 	game := c.newGame(bet)
 	board := snapshotHighLow(game) // safe without the lock: nobody can reach this board until Open publishes its ID
 
-	session, err := c.sessions.Open(i.GuildID, userID, casino.GameHighLow, game, casino.MessageRef{ChannelID: i.ChannelID})
+	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, userID, casino.GameHighLow, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableBoard(i.GuildID, userID, casino.EscrowOpening, bet) // the chips already moved: hand them straight back
-		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
-	}
-
-	// The board is live, so the stake becomes ITS stake: every press and the
-	// sweeper settle by this ID from here on, and a settlement that still
-	// names the old board is refused rather than paid out of this one.
-	if err := c.store.BindEscrowSession(i.GuildID, userID, session.ID); err != nil {
-		if c.sessions.Close(session.ID) {
-			c.refundUnplayableBoard(i.GuildID, userID, casino.EscrowOpening, bet)
-		}
+		c.refundUnplayableBoard(i.GuildID, userID, sessionID, bet) // the chips already moved: hand them straight back
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -458,10 +458,10 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 // them (RefundStaleEscrows), so it is logged rather than shown to the player,
 // who already has a refusal in front of them.
 //
-// escrowID is the mark the stake is carrying at THIS point of the open —
-// casino.EscrowOpening before the board has been bound, the board's own ID
-// after — so a refund can never hand back chips that have meanwhile become
-// another game's (casino.ErrEscrowMismatch refuses that instead).
+// escrowID is the board the stake belongs to, which is the same ID from the
+// first write onwards (設計書 C-3b), so a refund can never hand back chips
+// that have meanwhile become another game's (casino.ErrEscrowMismatch
+// refuses that instead).
 func (c *HighLowCommand) refundUnplayableBoard(guildID, userID, escrowID string, bet int64) {
 	if _, err := c.store.SettleGame(guildID, userID, escrowID, bet); err != nil {
 		slog.Error("casino: refunding an undelivered high&low board failed", "error", redactInteractionError(err))

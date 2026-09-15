@@ -97,21 +97,22 @@ func sweepFixtureFor(t *testing.T, game casino.GameKind, state any, bet int64, r
 	if err := bank.EnsureCasinoAccess("g1", "u1", opened); err != nil {
 		t.Fatalf("EnsureCasinoAccess: %v", err)
 	}
-	// Opened in the command layer's own order: the stake is marked
-	// casino.EscrowOpening until the board it belongs to exists, and the
-	// board's ID replaces the mark as soon as there is one (C-3b).
-	if err := bank.OpenGame("g1", "u1", string(game), casino.EscrowOpening, bet, opened); err != nil {
+	// Opened in the command layer's own order (C-3b): the board's ID is
+	// minted first, the stake is marked with it, and the same ID opens the
+	// board — one marked write, no gap.
+	sessionID, err := casino.NewSessionID()
+	if err != nil {
+		t.Fatalf("NewSessionID: %v", err)
+	}
+	if err := bank.OpenGame("g1", "u1", string(game), sessionID, bet, opened); err != nil {
 		t.Fatalf("OpenGame: %v", err)
 	}
 	// The manager's clock is frozen at the deal, so LastActionAt is `opened`
 	// and the sweeper's own clock alone decides what is expired.
 	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
-	session, err := mgr.Open("g1", "u1", game, state, ref)
+	session, err := mgr.OpenWithID(sessionID, "g1", "u1", game, state, ref)
 	if err != nil {
 		t.Fatalf("opening the board: %v", err)
-	}
-	if err := bank.BindEscrowSession("g1", "u1", session.ID); err != nil {
-		t.Fatalf("BindEscrowSession: %v", err)
 	}
 	return bank, mgr, session, opened
 }
@@ -586,5 +587,228 @@ func TestSweepIdleBoardsShowsTheTimedOutBoardsCardAndStreak(t *testing.T) {
 	// The pot is the untouched bet, and it comes back on top of the 900 left.
 	if want := casinoPayoutLine(100, 1000); !strings.Contains(embed.Description, want) {
 		t.Errorf("the closing message does not name the money: want %q in\n%s", want, embed.Description)
+	}
+}
+
+// --- the stake names its board from the first write (C3B-18) ---------------
+
+// escrowMarkRecorder is a real store that remembers the mark a stake was
+// opened with. That mark is not observable afterwards — the board's ID is the
+// only name a later caller ever uses — and it is exactly what this change is
+// about: the stake used to be opened under a provisional mark and handed to
+// its board by a SECOND call, leaving a window in which nothing presenting a
+// real board ID could settle it.
+type escrowMarkRecorder struct {
+	*flakyBank
+	openedWith string
+}
+
+func (b *escrowMarkRecorder) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
+	if err := b.flakyBank.OpenGame(guildID, userID, game, sessionID, bet, now); err != nil {
+		return err
+	}
+	b.openedWith = sessionID
+	return nil
+}
+
+// The board a command publishes must be the board its chips were staked for,
+// in all three games. While the mark was handed over in a second step the two
+// could differ, and a settlement arriving in that gap named an ID the account
+// had never heard of: refused, and the stake left behind with no board to
+// return it.
+func TestCasinoOpenStakesTheChipsForTheBoardItPublishes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start func(t *testing.T, bank casinoBank, mgr *casino.SessionManager) string
+	}{
+		{
+			name: "highlow",
+			start: func(t *testing.T, bank casinoBank, mgr *casino.SessionManager) string {
+				c := &HighLowCommand{store: bank, sessions: mgr, newGame: func(bet int64) *casino.HighLowGame { return casino.NewHighLow(bet, zeroRng{}) }}
+				return startHighLow(t, c, &fakeHighLowResponder{}, 100)
+			},
+		},
+		{
+			name: "blackjack",
+			start: func(t *testing.T, bank casinoBank, mgr *casino.SessionManager) string {
+				c := &BlackjackCommand{store: bank, sessions: mgr, newGame: func(bet int64) *casino.BlackjackGame { return casino.NewBlackjack(bet, blackjackRngFor(1)) }}
+				return startBlackjack(t, c, &fakeCasinoResponder{}, 100)
+			},
+		},
+		{
+			name: "duel",
+			start: func(t *testing.T, bank casinoBank, mgr *casino.SessionManager) string {
+				c := &DuelCommand{store: bank, sessions: mgr, flip: func() bool { return true }}
+				return startDuel(t, c, &fakeCasinoResponder{}, 100)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bank := &escrowMarkRecorder{flakyBank: &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}}
+			mgr := casino.NewSessionManager(time.Now, casino.DefaultSessionTTL)
+
+			sessionID := tc.start(t, bank, mgr)
+			if bank.openedWith != sessionID {
+				t.Fatalf("the chips were staked for %q but the board went live as %q — for that gap the stake belongs to nobody", bank.openedWith, sessionID)
+			}
+			if _, live := mgr.Get(sessionID); !live {
+				t.Fatalf("board %q is not live after the start", sessionID)
+			}
+		})
+	}
+}
+
+// A sweep that lands the instant a board goes live — before anything else has
+// touched the stake — must still return the chips. This is the shape C3B-13
+// was sent back for: with the mark handed over in a second step, a board
+// swept in that gap settled against a mark no board could present, the
+// settlement was refused, the board was dropped, and the stake sat in escrow
+// until the next restart.
+func TestSweepingABoardTheInstantItOpensReturnsTheStake(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		game casino.GameKind
+		// wantChips is what the player holds once the sweep has settled a
+		// board nobody ever pressed: the duel withdraws the stake whole, the
+		// other two auto-resolve a hand that was dealt but never played.
+		wantChips func(t *testing.T, chips int64)
+	}{
+		{
+			name: "highlow",
+			game: casino.GameHighLow,
+			wantChips: func(t *testing.T, chips int64) {
+				if chips != 1000 {
+					t.Errorf("chips = %d, want 1000 — cashing out an untouched high&low board returns the stake", chips)
+				}
+			},
+		},
+		{
+			name: "blackjack",
+			game: casino.GameBlackjack,
+			wantChips: func(t *testing.T, chips int64) {
+				if chips < 900 {
+					t.Errorf("chips = %d, want at least 900 — an auto-stood hand cannot lose more than its bet", chips)
+				}
+			},
+		},
+		{
+			name: "duel",
+			game: casino.GameDuel,
+			wantChips: func(t *testing.T, chips int64) {
+				if chips != 1000 {
+					t.Errorf("chips = %d, want 1000 — a timed-out challenge is withdrawn whole", chips)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetComponentsForTest()
+			t.Cleanup(resetComponentsForTest)
+
+			bank, mgr, sessionID, opened := openBoardTheCommandWay(t, tc.game, 100)
+
+			// No press, no hand-over, no second call of any kind: straight
+			// from the open to the sweeper.
+			sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+			chips, escrow := sweepChipsOf(t, bank)
+			if escrow != 0 {
+				t.Errorf("escrow = %d after the sweep, want 0 — the stake was left behind with no board to return it", escrow)
+			}
+			tc.wantChips(t, chips)
+			if mgr.Len() != 0 {
+				t.Errorf("%d boards survived the sweep, want 0", mgr.Len())
+			}
+			if _, live := mgr.Get(sessionID); live {
+				t.Errorf("board %q is still addressable after its settlement", sessionID)
+			}
+		})
+	}
+}
+
+// openBoardTheCommandWay runs a real start path onto a frozen-clock manager,
+// so the test can sweep the board it produced at an exact instant. It returns
+// the bank the command staked on, the manager, the live board's ID, and the
+// instant the board was opened.
+func openBoardTheCommandWay(t *testing.T, game casino.GameKind, bet int64) (*flakyBank, *casino.SessionManager, string, time.Time) {
+	t.Helper()
+
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
+
+	switch game {
+	case casino.GameHighLow:
+		c := &HighLowCommand{store: bank, sessions: mgr, newGame: func(b int64) *casino.HighLowGame { return casino.NewHighLow(b, zeroRng{}) }}
+		RegisterComponent(c)
+		return bank, mgr, startHighLow(t, c, &fakeHighLowResponder{}, bet), opened
+	case casino.GameBlackjack:
+		c := &BlackjackCommand{store: bank, sessions: mgr, newGame: func(b int64) *casino.BlackjackGame { return casino.NewBlackjack(b, blackjackRngFor(1)) }}
+		RegisterComponent(c)
+		return bank, mgr, startBlackjack(t, c, &fakeCasinoResponder{}, bet), opened
+	case casino.GameDuel:
+		c := &DuelCommand{store: bank, sessions: mgr, flip: func() bool { return true }}
+		RegisterComponent(c)
+		return bank, mgr, startDuel(t, c, &fakeCasinoResponder{}, bet), opened
+	}
+	t.Fatalf("no start path for %q", game)
+	return nil, nil, "", opened
+}
+
+// --- the sweeper keeps a board it could not settle (C2-10) -----------------
+
+// A settlement refused with ErrEscrowMismatch is a DISAGREEMENT about who owns
+// the chips, not "there is nothing left to pay". Dropping the board on it
+// threw away the payout the pass had already resolved AND left the stake in
+// escrow, where it blocks every new game until the next restart. The board
+// stays expired instead, so the next pass retries it.
+func TestSweepKeepsABoardWhoseStakeBelongsToAnotherBoard(t *testing.T) {
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := bank.EnsureCasinoAccess("g1", "u1", opened); err != nil {
+		t.Fatalf("EnsureCasinoAccess: %v", err)
+	}
+	// The account's stake belongs to a board that is not the one below. With
+	// the open a single marked write, that state is no longer reachable by
+	// playing — which is the point: if it happens anyway, it is a real
+	// inconsistency and the sweeper must not paper over it by dropping chips.
+	if err := bank.OpenGame("g1", "u1", string(casino.GameHighLow), "some-other-board", 100, opened); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
+	session, err := mgr.OpenWithID("stranded-board", "g1", "u1", casino.GameHighLow, casino.NewHighLow(100, zeroRng{}), casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
+	if err != nil {
+		t.Fatalf("opening the board: %v", err)
+	}
+
+	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if mgr.Len() != 1 {
+		t.Fatalf("%d boards survived the mismatch, want 1 — dropping it loses the resolved payout and strands the stake", mgr.Len())
+	}
+	if _, escrow := sweepChipsOf(t, bank); escrow != 100 {
+		t.Errorf("escrow = %d, want 100 — a refused settlement must not move chips", escrow)
+	}
+	if bank.settles != 1 {
+		t.Errorf("SettleGame was called %d times in the first pass, want 1", bank.settles)
+	}
+
+	// The next pass is the retry, and it pays as soon as the account agrees
+	// again. The payout it hands over is the one the FIRST pass resolved:
+	// AutoResolve draws cards, so a second call would decide another game.
+	if _, err := bank.SettleGame("g1", "u1", "some-other-board", 100); err != nil {
+		t.Fatalf("clearing the other board's stake: %v", err)
+	}
+	if err := bank.OpenGame("g1", "u1", string(casino.GameHighLow), session.ID, 100, opened); err != nil {
+		t.Fatalf("re-staking for the stranded board: %v", err)
+	}
+	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(2*casino.DefaultSessionTTL))
+
+	if mgr.Len() != 0 {
+		t.Errorf("%d boards survived the retry, want 0 — the next pass is the retry", mgr.Len())
+	}
+	if _, escrow := sweepChipsOf(t, bank); escrow != 0 {
+		t.Errorf("escrow = %d after the retry, want 0", escrow)
 	}
 }

@@ -362,30 +362,30 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 		return respondVia(r, i.Interaction, messageResponse("❌ カジノの初期化に失敗しました。"))
 	}
 
+	// The hand's ID comes first, before the chips move, for the reason
+	// /highlow states: it is what lets the stake name its own board from its
+	// very first write (設計書 C-3b). Nothing is staked yet, so a failure
+	// here costs only the refusal.
+	sessionID, err := casino.NewSessionID()
+	if err != nil {
+		slog.Error("casino: minting a blackjack hand ID failed", "error", redactInteractionError(err))
+		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
+	}
+
 	// Stake BEFORE the hand (完了条件の順序), for the reason /highlow states:
 	// Store.OpenGame is the persisted half of "one game per person", so it is
-	// the half that refuses a second bet.
-	// Marked casino.EscrowOpening until the hand exists, for the reason
-	// /highlow states: an unmarked stake is one any settlement can spend.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), casino.EscrowOpening, bet, now); err != nil {
+	// the half that refuses a second bet. ⏫, every press and the sweeper name
+	// sessionID, and nothing else can settle these chips.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), sessionID, bet, now); err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
 	game := c.newGame(bet)
 	board := snapshotBlackjack(game) // safe without the lock: nobody can reach this hand until Open publishes its ID
 
-	session, err := c.sessions.Open(i.GuildID, userID, casino.GameBlackjack, game, casino.MessageRef{ChannelID: i.ChannelID})
+	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, userID, casino.GameBlackjack, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableHand(i.GuildID, userID, casino.EscrowOpening, bet) // the chips already moved: hand them straight back
-		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
-	}
-
-	// The hand owns the stake from here: ⏫, every press and the sweeper all
-	// name this ID, and nothing else can settle these chips.
-	if err := c.store.BindEscrowSession(i.GuildID, userID, session.ID); err != nil {
-		if c.sessions.Close(session.ID) {
-			c.refundUnplayableHand(i.GuildID, userID, casino.EscrowOpening, bet)
-		}
+		c.refundUnplayableHand(i.GuildID, userID, sessionID, bet) // the chips already moved: hand them straight back
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 

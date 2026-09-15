@@ -25,6 +25,11 @@ import (
 // "⌛ この盤面はもう終了しています" reply for a button pressed on an old message.
 var ErrSessionNotFound = errors.New("casino: session not found")
 
+// ErrSessionIDTaken means OpenWithID was handed an ID that is already live.
+// With NewSessionID values it is unreachable; it exists so that a caller who
+// passes a fixed string cannot silently adopt somebody else's board.
+var ErrSessionIDTaken = errors.New("casino: that session ID is already in use")
+
 // GameKind names the game a session is running. It is part of the custom_id
 // namespace, so the values are stable strings, not iota.
 type GameKind string
@@ -158,12 +163,18 @@ func DefaultSessions() *SessionManager {
 // snowflake, so no pair of (guild, user) can collide with another.
 func userKey(guildID, userID string) string { return guildID + "\x00" + userID }
 
-// newSessionID returns 16 crypto/rand bytes as hex. It is not a counter and
+// NewSessionID returns 16 crypto/rand bytes as hex. It is not a counter and
 // not derived from the user: the ID travels in a custom_id that anybody can
 // read off a message, so a guessable ID would let a third party address
 // somebody else's board (the owner check in requireSessionOwner is the
 // other half of that defence).
-func newSessionID() (string, error) {
+//
+// It is exported because the command layer needs the ID BEFORE either half
+// of an open exists (設計書 C-3b): the chips are staked first (C2-06), so the
+// mark Store.OpenGame writes has to be the same ID OpenWithID then publishes.
+// Minting it here is what removes the window in which a stake carried a
+// provisional mark that no board could present.
+func NewSessionID() (string, error) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", err
@@ -182,13 +193,29 @@ func newSessionID() (string, error) {
 // new bet anyway. The two halves of the rule must agree, or the player gets
 // a board here that the store then refuses to stake.
 func (m *SessionManager) Open(guildID, userID string, game GameKind, state any, ref MessageRef) (*Session, error) {
-	id, err := newSessionID()
+	id, err := NewSessionID()
 	if err != nil {
 		return nil, err
 	}
+	return m.OpenWithID(id, guildID, userID, game, state, ref)
+}
 
+// OpenWithID is Open for a caller that already has the board's ID — every
+// caller in the command layer, because the stake is marked with that ID
+// before the board exists (設計書 C-3b). Open is this function plus a
+// NewSessionID call, and everything it promises holds here too.
+//
+// Returns ErrSessionIDTaken if the ID is already live. That cannot happen
+// with a NewSessionID value (16 random bytes), so it is a caller passing a
+// constant or reusing an ID — refusing is what stops the second caller from
+// taking over the first one's board, and its stake with it.
+func (m *SessionManager) OpenWithID(id, guildID, userID string, game GameKind, state any, ref MessageRef) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if _, taken := m.sessions[id]; taken {
+		return nil, ErrSessionIDTaken
+	}
 
 	key := userKey(guildID, userID)
 	if existing, ok := m.byUser[key]; ok {
