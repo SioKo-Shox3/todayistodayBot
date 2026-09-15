@@ -604,3 +604,20 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/blackjack.go, internal/commands/highlow.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/blackjack_test.go, internal/commands/highlow_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 危険地帯。**「まだ遊べる盤面だけ」のような限定を入れない** — 入口の判定は「預かりの印がこの盤面を指しているか」だけで、ゲームの状態を見ない。印を読むための読み取りメソッドが `casino.Store` に無ければ足す(`Update` ではなく `Snapshot` 相当の軽い読み取りでよい)。
+
+## C3B-P5: 「返金待ち」の盤面をプレイできなくする(反復 1 の差し戻し 2)
+- status: todo
+- done-when: `MarkRefundPending` は掃除人が払う額を固定するだけで、盤面はその後も押せる。
+  返金に失敗した H&L で復旧後にボタンを押すと、ポットは 101 に増えるのに掃除人は固定した 100 しか払わない
+  (BJ も返金待ちからスタンド・ダブルへ進める)。**返金待ちを「ゲーム操作できない状態」として扱う**:
+  (1) 3 ゲームの押下と追加預かり(`AddToEscrow` / `stakeDouble`)が返金待ちの盤面を拒否し、
+  「返金の再試行を待っています」に相当する既存の文言で答える。(2) 返金失敗のあとの押下 → 掃除を
+  組み合わせた回帰テストを 3 ゲーム分足し、**押下で額が動かない**ことを数字で示す。
+  (3) 拒否は 1 か所(`casino.Session` の読み取り)で判定し、ゲームごとに書かない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/blackjack.go, internal/commands/highlow.go, internal/commands/duel.go, internal/commands/blackjack_test.go, internal/commands/highlow_test.go, internal/commands/duel_test.go
+- notes: 危険地帯。返金待ちは**掃除人からは見えたまま**でなければならない(払うのは掃除人)。
+  拒否するのは押下と追加預かりだけで、`Sweep` / `Remove` / `closeBoardIfSettled` の判定は変えない。
