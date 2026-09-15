@@ -4,6 +4,33 @@
 `git log` が第二の記録。ここには git に無いこと(判断・未解決・次に見るべき場所)を書く。
 
 ## Done
+- C3B-16(掲示済みの記録に失敗したときの再送を減らし、契約を明記する)。証拠 `.harness/runs/20260915-080323/verify-C3B-16-{1,2,3}.txt`(3 本とも exit=0、8 パッケージ ok)。
+  **再試行は重複を減らすだけで無くさない。それを隠さずに書くのが本題だった。** 送信(Discord)と記録(`MarkSeasonAnnounced`)は
+  別々の操作でトランザクションが無く、記録は**送信成功の後**にしか取れない(逆順だと送信に失敗した回の結果が「掲示済み」になって永久に消える)。
+  だから「送信済み・未記録」の窓は原理的に残る。親の決定どおり二相コミットは狙わず、(a) 3 回までの再試行 / (b) 警告 / (c) 契約の明記の 3 点だけ入れた。
+  **再試行の待ちを `SleepFunc` に相乗りさせず `markRetryWaiter` という別の引数にした** — 既存のテストの stub は
+  `sleep` が false を返すことで巡回そのものを止めている。再試行の待ちを同じ関数で表すと、stub の戻り値は
+  「再試行するな」と「巡回を止めろ」の両方を意味してしまい、どちらを言っているのか区別できない。別の口にすると
+  テストが**2 つの試行の間に**割り込める — これが回帰テストの成立条件で、実際 `retry` の中でストアを直して
+  「1 回目は失敗・2 回目は成功」を決定的に作っている(実時計に依存しない)。
+  **ログは `Error` ではなく `Warn`** — 失われたものは無い(結果はチャンネルに届いている)。代償は後の巡回で出る 2 通目だけなので、
+  重さが違う。文面も `MarkSeasonAnnounced failed` から「送信済みだが記録できなかった / 後の巡回で再掲示されうる」に変えた。
+  重複がチャンネルに出る前に、その理由がログに残っている状態にするのが狙い。
+  **記録の失敗をテストで起こす seam は「パスにディレクトリを置く」**(`breakableStore`)。ファイルを消すのでは駄目 —
+  欠損は初回起動前の状態で、`readLocked` は空の `Data` を返し `writeLocked` はディレクトリを作り直すので、
+  記録は**空の経済に対して成功してしまう**。ディレクトリなら `os.ReadFile` が全 OS で失敗する
+  (Linux は EISDIR、Windows は `Access is denied.`)ので `Update` ごと失敗する。
+  **効き目の確認**: `mutation-C3B-16-no-retry.txt`(再試行を消すと新規 2 件が「retried after 0 gaps」で落ちる)/
+  `mutation-C3B-16-bare-error-log.txt`(警告を元の `slog.Error("casino: MarkSeasonAnnounced failed")` に戻すと
+  `AnUnrecordedResultWarnsAndIsPostedAgain` が「no at-least-once warning」で落ちる)。既存 13 件の掲示テストは
+  引数が 1 つ増えただけで期待値は 1 つも変えていない。
+  **`MarkAnnounced`(日次 embed + 宝くじの待ち行列)には再試行を入れていない。理由は範囲だけ** — 呼び出しが
+  `internal/casino/announce.go` にあり C3B-16 の `paths:` の外。**穴の形も重さも同じ**で、こちらが書けないと
+  次の巡回で embed と**当選者へのメンション**が両方もう一度出る。設計上の理由ではないので `TASKS.md` に
+  **C3B-18** として起こした(P2)。設計書 §4 と `blocked/C3B-07.md` にもその通り書いてある(「重複しない」とは書いていない)。
+  **反復 4 の評価者所見(P2)も処理した** — C3B-15 の `paths:` に `internal/commands/casino_shared.go` を足した。
+  親が `NEXT_FINDINGS.md` に「置き場所は妥当、狭すぎたのは `paths:` 記載。この節は消してよい」と判断済みだったので、
+  記載を実態へ広げてコードは動かさず、節を消した。
 - C3B-12(精算の配当を口座の上限で切り詰め、精算そのものは必ず成功させる)。証拠 `.harness/runs/20260915-080323/verify-C3B-12-{1,2,3}.txt`(3 本とも exit=0、8 パッケージ ok)。
   **拒否が壊していたのは入金ではなく取引だった** — `SettleGame` は `ensureSeasonMonthLocked` を**同じ `Update` の中で**先に呼ぶ。月次切り替えは表彰台へ賞与を払い、その賞与が口座を上限まで埋める。そのあとの入金が `creditChipsLocked` で `ErrChipCapExceeded` を返すと、閉じたばかりの月次切り替えごと巻き戻る — つまり**再試行が拒否された状態を自分で作り直す**。預かり(`Escrow`)を抱えた手は永久に閉じない。上限は行き先の性質であって取引を失敗させる条件ではない、というのが §2 の読み。
   **入金は `creditChipsCappedLocked` に変え、`SeasonNet` は `credited-staked`**(払うはずだった額ではなく入った額。§2 の既存規則)。`SettleResult` は `Payout` を**実際に入った額**にし、払うはずだった額を新しい `Owed` に移した — 表示側(`casinoPayoutLine` / `blackjackResultEmbed` / 連勝の祝い)は全部 `Payout` を読むので、**フィールドの意味を入れ替える形にすると表示が自動的に本当のことを言う**。`Owed` を足したのは差が観測できるようにするため。
@@ -216,7 +243,9 @@
 - (なし)
 
 ## Next
-- **次は C3B-13**(預かりに持ち主の印を付け、別の盤面の預かりで精算できないようにする = blocking 2)。`TASKS.md` の未完で最優先。C3B-12 で `SettleGame` の入金側は触ったが、**どの盤面の預かりか**を見ていない点は手つかず — `staked := account.Escrow` は「いま預かっている額」であって「この盤面が預けた額」ではない、が争点の中心。
+- **次は C3B-17**(スロットの配当も上限で切り詰める = `TASKS.md` の未完で最優先)。C3B-12 で他の精算経路を確認したときに見つけた最後の不揃いで、`Store.Spin` だけが上限で**拒否する**側に残っている。設計書 §2 がスロットをその例として名指ししているのに実装が唯一の例外、という形。**争点はジャックポット** — 当たりで `economy.Jackpot = JackpotSeed` と一緒にリセットされるので、入り切らない分をそのまま捨てるとプールの分まで消える。宝くじ(`drawLotteryLocked`)は溢れをプールへ戻しており、同じ形にできるかを決める必要がある。
+- **その次は C3B-18 は新規**(`MarkAnnounced` にも C3B-16 と同じ再試行を入れる)。C3B-16 で `paths:` の外だったという理由だけで残した積み残しで、設計上の判断はもう付いている(入れる)。`markSeasonAnnouncedWithRetry` が雛形。**再試行の待ちを `RunAnnounceScheduler` の `SleepFunc` に相乗りさせないこと** — C3B-16 が `markRetryWaiter` を別引数にした理由がそのまま効く。
+- **旧: 次は C3B-13**(預かりに持ち主の印を付け、別の盤面の預かりで精算できないようにする = blocking 2)。`TASKS.md` の未完で最優先。C3B-12 で `SettleGame` の入金側は触ったが、**どの盤面の預かりか**を見ていない点は手つかず — `staked := account.Escrow` は「いま預かっている額」であって「この盤面が預けた額」ではない、が争点の中心。
 - **C3B-17 は新規**(スロットの配当だけが上限で拒否する側に残っている)。C3B-12 の確認で見つけた。P2 — 取引ごと巻き戻るので賭け金は戻り、`SettleGame` のような行き詰まりはしない。
 - **旧: 次は C3B-10**(月末に結果送信だけ失敗した場合の再送を回帰テストで押さえる)。実装の不具合は反復 4 の評価で見つかっていない — 足りないのは検証で、C3B-08 の done-when が名指しした「7/31 に結果送信だけ失敗 → 8/1 に 6 月の結果を再送」を、収集関数だけでなく**掲示側**(`startAnnounceScheduler`)から通す必要がある。雛形は `TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass` と、今回足した `TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay`。**7/31 → 8/1 は月替わりを通るので `LastSeason` が 7 月へ移る** — 送られるのは 6 月の結果である、が争点。
 - **その次は C3B-11**(README と `blocked/C3B-07.md` の文言を実装に合わせる)。コードは変えない。
