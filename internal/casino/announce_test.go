@@ -1,11 +1,14 @@
 package casino
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1258,8 +1261,8 @@ func TestMarkAnnounced_DoesNotLetAClockRollbackRepostADraw(t *testing.T) {
 		posted = append(posted, job)
 		return nil
 	}
-	runAnnouncePass(context.Background(), st, callback, day13) // the clock steps back
-	runAnnouncePass(context.Background(), st, callback, day14) // and forward again
+	runAnnouncePass(context.Background(), st, callback, day13, instantMarkRetry) // the clock steps back
+	runAnnouncePass(context.Background(), st, callback, day14, instantMarkRetry) // and forward again
 
 	for _, job := range posted {
 		for _, draw := range job.LotteryDraws {
@@ -1707,5 +1710,217 @@ func TestCollectDailyAnnouncements_AnnouncedTodayWithNothingOwedStaysSkipped(t *
 	}
 	if len(jobs) != 0 {
 		t.Fatalf("got %d jobs, want 0 (announced today, nothing owed): %+v", len(jobs), jobs)
+	}
+}
+
+// --- MarkAnnounced is retried too (C3B-19) ---------------------------------
+
+// instantMarkRetry is the tests' markRetryWaiter: it allows exactly the number
+// of retries production does, but does not wait, so no test sits on a real
+// timer. Tests that need to act BETWEEN two attempts bring their own.
+func instantMarkRetry(_ context.Context, attempt int) bool {
+	return attempt <= len(markAnnouncedRetryDelays)
+}
+
+// captureAnnounceLogs swaps the default slog logger for the duration of the
+// test and returns the buffer every line lands in. runAnnouncePass logs
+// through the package-level slog, which is what production writes to a file.
+func captureAnnounceLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
+
+// breakableAnnounceStore is a store whose file can be made unwritable and
+// writable again from inside a test, which is how the two below fail
+// MarkAnnounced on demand.
+//
+// The seam is the path itself: a DIRECTORY sitting where casino.json belongs
+// makes readLocked's os.ReadFile fail on every OS (EISDIR on Linux, "Access
+// is denied." on Windows), so Update — and therefore MarkAnnounced — returns
+// an error without the file being touched. Deleting the file instead would
+// NOT work: a missing file is the pre-first-command state, readLocked returns
+// an empty Data for it and writeLocked re-creates the directory, so the mark
+// would SUCCEED against an empty economy.
+type breakableAnnounceStore struct {
+	t       *testing.T
+	store   *Store
+	path    string
+	content string
+}
+
+func newBreakableAnnounceStore(t *testing.T, content string) *breakableAnnounceStore {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "casino.json")
+	b := &breakableAnnounceStore{t: t, store: New(path), path: path, content: content}
+	b.heal() // writes the seed for the first time
+	return b
+}
+
+// breakIt replaces the file with a directory: every later Update fails.
+func (b *breakableAnnounceStore) breakIt() {
+	b.t.Helper()
+	if err := os.RemoveAll(b.path); err != nil {
+		b.t.Fatalf("removing the store file: %v", err)
+	}
+	if err := os.Mkdir(b.path, 0o755); err != nil {
+		b.t.Fatalf("putting a directory in the store's place: %v", err)
+	}
+}
+
+// heal puts the seed file back, so the NEXT Update succeeds. It restores the
+// seed rather than whatever was last written, which is accurate: a failed
+// Update leaves the file untouched, so the seed IS the last committed state.
+func (b *breakableAnnounceStore) heal() {
+	b.t.Helper()
+	if err := os.RemoveAll(b.path); err != nil {
+		b.t.Fatalf("clearing the store's path: %v", err)
+	}
+	if err := os.WriteFile(b.path, []byte(b.content), 0o600); err != nil {
+		b.t.Fatalf("writing the seed file: %v", err)
+	}
+}
+
+// healIfBroken restores the seed only if the store is still unwritable, and
+// is what lets a test observe the DUPLICATE rather than a second pass that
+// cannot read anything: collectDailyAnnouncements writes too, so a store left
+// broken makes the next pass bail out before it posts, hiding the very repost
+// the retry exists to prevent. Leaving a healthy store alone is what keeps it
+// honest — a mark that landed must not be rolled back here.
+func (b *breakableAnnounceStore) healIfBroken() {
+	b.t.Helper()
+	info, err := os.Stat(b.path)
+	if err == nil && !info.IsDir() {
+		return // the store is writable: whatever it now holds is the truth
+	}
+	b.heal()
+}
+
+// unannouncedLotteryFile is a guild that has not been announced today and has
+// a lottery winner waiting in the queue, so a posting carries a MENTION.
+// Rates for both days are already there, so no pass has to roll a draw.
+const unannouncedLotteryFile = `{"guild1":{"announce_channel_id":"chan1","last_announced":"2026-09-14",` +
+	`"rates":[{"date":"2026-09-14","rate":100},{"date":"2026-09-15","rate":100}],` +
+	`"lottery":{"draw_date":"2026-09-15","sales":0,"carryover":0,` +
+	`"unannounced":[{"date":"2026-09-15","winner_id":"u9","prize":1234,"tickets_sold":7,"buyers":2}]}}}`
+
+// C3B-19: 記録が 1 回失敗 → 2 回目で成功すると embed も当選祝いも再送されない。
+// Without the retry the first failure left LastAnnounced behind AND left the
+// winner in the queue, so the next pass posted the embed and pinged u9 again.
+func TestRunAnnouncePass_ARetriedMarkKeepsTheEmbedAndItsMentionFromBeingPostedTwice(t *testing.T) {
+	b := newBreakableAnnounceStore(t, unannouncedLotteryFile)
+	logs := captureAnnounceLogs(t)
+	day := time.Date(2026, 9, 15, 10, 0, 0, 0, jst)
+
+	var posted []AnnouncementJob
+	// The embed lands, and the store goes unwritable right behind it: this is
+	// the window the task is about — posted, not yet recorded.
+	callback := func(job AnnouncementJob) error {
+		posted = append(posted, job)
+		b.breakIt()
+		return nil
+	}
+	waits := 0
+	// Heal inside the gap, so attempt 1 fails and attempt 2 succeeds.
+	retry := func(_ context.Context, attempt int) bool {
+		waits++
+		b.heal()
+		return attempt <= len(markAnnouncedRetryDelays)
+	}
+
+	runAnnouncePass(context.Background(), b.store, callback, day, retry)
+	if len(posted) != 1 {
+		t.Fatalf("the first pass posted %d jobs, want 1", len(posted))
+	}
+	if len(posted[0].LotteryDraws) != 1 {
+		t.Fatalf("the first posting carried %+v, want the one queued winner", posted[0].LotteryDraws)
+	}
+	// A second pass on the SAME day — a restart, or the scheduler waking on a
+	// clock that had not yet ticked past 09:00 — owes nothing: the mark went
+	// through on the retry, so there is no second embed, and — because that
+	// same call retires the queue — no second ping for u9 either.
+	b.healIfBroken() // a no-op here; it is what makes a mark that did NOT land repost
+	runAnnouncePass(context.Background(), b.store, callback, day, retry)
+	if len(posted) != 1 {
+		t.Fatalf("the day was posted %d times, want 1 — the retried mark did not stick: %+v", len(posted), posted)
+	}
+	if strings.Contains(logs.String(), "could not be recorded") {
+		t.Errorf("a recovered mark logged the at-least-once warning:\n%s", logs.String())
+	}
+	// Checked last, so the assertions above fail on the OUTCOME (a second
+	// embed, a second ping) rather than on the mechanism: this only pins
+	// that the mark above stuck BECAUSE of exactly one retry.
+	if waits != 1 {
+		t.Fatalf("the mark was retried after %d gaps, want exactly 1 (fail once, then succeed)", waits)
+	}
+}
+
+// C3B-19: 3 回とも失敗すると警告が出る(そして再送はされうる)。
+//
+// 嘘を書かないための回帰: the contract is at-least-once, and this pins the
+// "at least" half — the duplicate embed and the duplicate mention are
+// asserted, not hidden. What the retry buys is that it takes THREE failures
+// to get here, and what the warning buys is that the duplicate is explained
+// in the log before it reaches the channel.
+func TestRunAnnouncePass_AnUnrecordedAnnouncementWarnsAndIsPostedAgain(t *testing.T) {
+	b := newBreakableAnnounceStore(t, unannouncedLotteryFile)
+	logs := captureAnnounceLogs(t)
+	day := time.Date(2026, 9, 15, 10, 0, 0, 0, jst)
+
+	var posted []AnnouncementJob
+	broken := true
+	callback := func(job AnnouncementJob) error {
+		posted = append(posted, job)
+		if broken {
+			b.breakIt()
+		}
+		return nil
+	}
+	waits := 0
+	retry := func(_ context.Context, attempt int) bool {
+		if attempt > len(markAnnouncedRetryDelays) {
+			return false // out of attempts — this call is the refusal, not a gap
+		}
+		waits++ // no healing: every attempt fails
+		return true
+	}
+
+	runAnnouncePass(context.Background(), b.store, callback, day, retry)
+	if len(posted) != 1 {
+		t.Fatalf("the first pass posted %d jobs, want 1", len(posted))
+	}
+	if waits != len(markAnnouncedRetryDelays) {
+		t.Fatalf("the mark was retried after %d gaps, want %d (three attempts in total)", waits, len(markAnnouncedRetryDelays))
+	}
+	got := logs.String()
+	if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "could not be recorded") {
+		t.Fatalf("no at-least-once warning for a sent-but-unrecorded announcement:\n%s", got)
+	}
+
+	// The next pass, with the store writable again: the SAME day's embed goes
+	// out a second time and u9 is pinged again — the admitted cost of
+	// at-least-once, not a defect. The day is still unmarked, so nothing in
+	// the store knows it was already posted.
+	broken = false
+	b.heal()
+	runAnnouncePass(context.Background(), b.store, callback, day, retry)
+	if len(posted) != 2 {
+		t.Fatalf("the next pass posted %d jobs in total, want 2 (at-least-once)", len(posted))
+	}
+	if posted[1].Today.Date != posted[0].Today.Date {
+		t.Fatalf("the second posting was for %q, want the same day %q over again", posted[1].Today.Date, posted[0].Today.Date)
+	}
+	if len(posted[1].LotteryDraws) != 1 || posted[1].LotteryDraws[0].WinnerID != "u9" {
+		t.Fatalf("the second posting carried %+v, want u9 again — an unrecorded mark leaves the queue whole", posted[1].LotteryDraws)
+	}
+
+	// And now that the mark landed, it stops. A contract that re-posted
+	// forever would not be at-least-once, it would be broken.
+	runAnnouncePass(context.Background(), b.store, callback, day, retry)
+	if len(posted) != 2 {
+		t.Fatalf("a third pass posted %d jobs in total, want 2 — no further copy once the mark succeeded", len(posted))
 	}
 }

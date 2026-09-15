@@ -301,6 +301,64 @@ func RealSleepUntil(ctx context.Context, until time.Time) bool {
 	}
 }
 
+// markRetryWaiter blocks before the retry that follows a failed
+// MarkAnnounced and reports whether that retry should be made. `attempt` is
+// how many tries have already failed (1 after the first). Returning false
+// means "stop trying" — a shutdown, or the attempts are used up.
+//
+// It is a SEPARATE seam from SleepFunc even though both wait, and that is
+// the point: SleepFunc is the wait until tomorrow's 09:00, this one is the
+// gap between two write attempts inside a single pass. Folding them into one
+// function would leave a test unable to say WHICH wait its stub answered,
+// so "the retry stopped" and "the scheduler shut down" would be the same
+// observation (the same reason internal/commands gives markRetryWaiter its
+// own parameter, C3B-16).
+type markRetryWaiter func(ctx context.Context, attempt int) bool
+
+// markAnnouncedRetryDelays are the gaps before the 2nd and 3rd MarkAnnounced
+// attempts — three tries in total, matching markSeasonRetryDelays. Short on
+// purpose: this runs INSIDE the announce pass with the remaining guilds
+// queued behind it, so the wait is only long enough for a transient write
+// failure (a file lock, a scanner holding the temp file) to clear.
+var markAnnouncedRetryDelays = []time.Duration{50 * time.Millisecond, 150 * time.Millisecond}
+
+// realMarkAnnouncedRetryWait is the production markRetryWaiter — a real,
+// cancellable timer wait over markAnnouncedRetryDelays.
+func realMarkAnnouncedRetryWait(ctx context.Context, attempt int) bool {
+	if attempt < 1 || attempt > len(markAnnouncedRetryDelays) {
+		return false // out of attempts
+	}
+	timer := time.NewTimer(markAnnouncedRetryDelays[attempt-1])
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// markAnnouncedWithRetry records the day as posted, retrying a failure while
+// `wait` allows it, and returns the LAST error if every try failed.
+//
+// Retrying narrows the duplicate window; it does not close it. The send and
+// the mark are two separate operations with no transaction across them, so a
+// process that dies between them — or a store that stays unwritable — still
+// leaves an embed that went out but is not recorded, and the next pass posts
+// it again. That is the contract (設計書 C-3b §4 掲示: at-least-once), not a
+// bug this function hides.
+func markAnnouncedWithRetry(ctx context.Context, st *Store, guildID, date string, wait markRetryWaiter) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		if err = st.MarkAnnounced(guildID, date); err == nil {
+			return nil
+		}
+		if !wait(ctx, attempt) {
+			return err
+		}
+	}
+}
+
 // announceWindowOpen reports whether now is at or after 09:00 JST on now's
 // OWN JST calendar date — i.e. whether today's scheduled announcement time
 // has already arrived.
@@ -335,7 +393,7 @@ func announceWindowOpen(now time.Time) bool {
 // day entirely. The user chose this behaviour knowing that a late-night
 // restart produces a late-night announcement. "時間窓を切らない" means "no
 // upper bound", not "no lower bound".
-func runAnnouncePass(ctx context.Context, st *Store, callback AnnounceCallback, now time.Time) {
+func runAnnouncePass(ctx context.Context, st *Store, callback AnnounceCallback, now time.Time, markRetry markRetryWaiter) {
 	jobs, err := st.collectDailyAnnouncements(now) // step 1: rates, unconditionally
 	if err != nil {
 		slog.Error("casino: collectDailyAnnouncements failed", "error", err)
@@ -362,8 +420,20 @@ func runAnnouncePass(ctx context.Context, st *Store, callback AnnounceCallback, 
 			// callback itself, is what retires the results.
 			continue
 		}
-		if err := st.MarkAnnounced(job.GuildID, job.Today.Date); err != nil {
-			slog.Error("casino: MarkAnnounced failed", "guild_id", job.GuildID, "error", err)
+		// Retried a few times before giving up: the embed is already out,
+		// so an unrecorded mark costs the channel a DUPLICATE embed AND a
+		// second @mention of every lottery winner still queued (the queue is
+		// retired by this call alone), and a write that failed once (a
+		// momentary file lock) usually succeeds milliseconds later.
+		if err := markAnnouncedWithRetry(ctx, st, job.GuildID, job.Today.Date, markRetry); err != nil {
+			// Not an Error: nothing was lost. The embed reached the channel;
+			// what failed is the note that it did. The cost is a second copy
+			// on a later pass, which is what the at-least-once contract
+			// admits to — say that in the log rather than leaving a bare
+			// "MarkAnnounced failed" for someone to work out from the
+			// duplicate.
+			slog.Warn("casino: today's announcement was SENT but could not be recorded; a later pass may post it and its lottery mentions again (at-least-once, 設計書 C-3b §4)",
+				"guild_id", job.GuildID, "date", job.Today.Date, "attempts", len(markAnnouncedRetryDelays)+1, "error", err)
 		}
 	}
 }
@@ -406,7 +476,7 @@ func RunAnnounceScheduler(ctx context.Context, st *Store, callback AnnounceCallb
 			return
 		}
 		t := now()
-		runAnnouncePass(ctx, st, callback, t)
+		runAnnouncePass(ctx, st, callback, t, realMarkAnnouncedRetryWait)
 		if !sleep(ctx, nextRunAt(t)) {
 			return
 		}

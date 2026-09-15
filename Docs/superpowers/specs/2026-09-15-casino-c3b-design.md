@@ -100,8 +100,13 @@ C-2 までは「1 人 対 胴元」だけだった。C-3b は**人 対 人**の�
   日次 embed の `MarkAnnounced`(`internal/casino/announce.go`)も**まったく同じ形**の「送信済み・未記録」を持つ。
   こちらは宝くじの待ち行列も同時に retire するので、記録が書けないと**次の巡回で embed と当選者への
   メンションが両方もう一度出る** — 重複の重さは結果の掲示と変わらない。契約も同じく `at-least-once`。
-  **C3B-16 では再試行を入れていない**。理由は範囲だけ — 呼び出しが `internal/casino/announce.go` にあり、
-  C3B-16 の `paths:` の外だから。設計上の理由ではないので、揃える作業を別タスクとして起こしてある。
+  **緩和も同じ 3 つを入れてある**(C3B-19): `markAnnouncedWithRetry` が短い間隔で 3 回まで再試行し
+  (間隔は `markAnnouncedRetryDelays` = 50ms / 150ms)、3 回とも失敗したら「送信済みだが記録できなかった」を
+  `slog.Warn` で残す。再試行の待ちは `SleepFunc`(翌朝 9 時までの待ち)とは**別の引数**にしてある —
+  同じ関数で表すと、テストの stub がどちらの待ちを答えたのか区別できない(C3B-16 の `markRetryWaiter` と同じ理由)。
+  記録が成功した時点で止まるのも同じ
+  (`TestRunAnnouncePass_ARetriedMarkKeepsTheEmbedAndItsMentionFromBeingPostedTwice` /
+  `TestRunAnnouncePass_AnUnrecordedAnnouncementWarnsAndIsPostedAgain`)。
 
 ## 4.5 duel(`/duel @相手 <bet>`)
 

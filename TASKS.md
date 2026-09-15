@@ -539,7 +539,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。**差し戻しに置いたままだと 2 回続けて飛ばされたので、タスクにした。** 閉じたら `NEXT_FINDINGS.md` の当該節を消す。
 
 ## C3B-19: 日次掲示の記録(`MarkAnnounced`)にも同じ再試行を入れる(C3B-16 の積み残し、P2)
-- status: todo
+- status: done
 - done-when: C3B-16 は `MarkSeasonAnnounced` の失敗に 3 回までの再試行と「送信済みだが記録できなかった」警告を入れたが、`MarkAnnounced`(`internal/casino/announce.go` の `runAnnouncePass`)は `slog.Error` を残して続行するだけのまま。**穴の形も重さも同じ** — `MarkAnnounced` は宝くじの待ち行列も同時に retire するので、記録が書けないと次の巡回で embed と**当選者へのメンション**が両方もう一度出る。C3B-16 で入れなかったのは設計上の理由ではなく、呼び出しが `internal/casino` 側にあって `paths:` の外だったからだけ。`markSeasonAnnouncedWithRetry` と同じ形(3 回・短い間隔・最後は `slog.Warn` で at-least-once を名指し)を `runAnnouncePass` にも入れる。再試行の待ちは `RunAnnounceScheduler` が既に受け取っている `SleepFunc` とは**別の口**にする(9 時までの待ちと再試行の待ちを同じ関数で表すと、テストの stub がどちらを止めているのか区別できない — C3B-16 で `markRetryWaiter` を別の引数にしたのと同じ理由)。回帰テスト: 記録が 1 回失敗 → 2 回目で成功すると embed も当選祝いも再送されない / 3 回とも失敗すると警告が出る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
