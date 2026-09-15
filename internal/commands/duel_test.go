@@ -2,6 +2,7 @@ package commands
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -409,6 +410,100 @@ func TestDuelRefusesSelfAndBotsWithoutStaking(t *testing.T) {
 				t.Errorf("%d challenges are live after a refusal, want 0", c.sessions.Len())
 			}
 		})
+	}
+}
+
+// 設計書 §4.5 refuses a duel when EITHER side is mid-game, and C3B-15 is the
+// half that was missing: the opponent's escrow is not seen by OpenGame, which
+// only ever looks at the account it debits. Without the check the challenge
+// goes up and the challenger's chips are locked for three minutes behind an
+// ⚔️ that AcceptDuel can only refuse.
+func TestDuelRefusesAnOpponentWhoIsAlreadyPlaying(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	r := &fakeCasinoResponder{}
+	if err := bank.OpenGame("g1", duelOpponent, string(casino.GameBlackjack), testEscrowSession, 100, time.Now()); err != nil {
+		t.Fatalf("putting the opponent in a game: %v", err)
+	}
+
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err != nil {
+		t.Fatalf("/duel: %v", err)
+	}
+
+	want := fmt.Sprintf(duelOpponentInProgressFormat, duelOpponent)
+	if got := r.last(t).Data.Content; got != want {
+		t.Errorf("reply = %q, want %q", got, want)
+	}
+	// The whole point of refusing at the start: nothing of the challenger's
+	// was staked, so there is nothing to sit in escrow for three minutes.
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow, want 1000 / 0 — a refused challenge must not stake", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges are live after the refusal, want 0", c.sessions.Len())
+	}
+	// The opponent's own game is untouched: this path reads, it does not
+	// settle somebody else's hand.
+	if chips, escrow := duelHoldings(t, bank, duelOpponent); chips != 900 || escrow != 100 {
+		t.Errorf("opponent: %d chips / %d escrow, want 900 / 100 — the read must not move their stake", chips, escrow)
+	}
+}
+
+// The control for the test above: an opponent who has never touched the
+// casino has no account, and having none is not "in a game". The read must
+// also not open one for them — being named in someone else's challenge would
+// otherwise pay out the 1,000-chip welcome bonus.
+func TestDuelStartsAgainstAnOpponentWhoHasNoAccountYet(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	r := &fakeCasinoResponder{}
+
+	sessionID := startDuel(t, c, r, 100)
+
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d challenges are live, want exactly 1", c.sessions.Len())
+	}
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Errorf("challenger: %d chips / %d escrow, want 900 / 100", chips, escrow)
+	}
+	// Pressing ⚔️ is what opens the opponent's account (and the welcome bonus
+	// that comes with it), not the check at the start.
+	if resp := duelPress(t, c, r, sessionID, duelActionAccept, duelOpponent); resp.Data.Embeds[0].Title != duelResultTitle {
+		t.Errorf("accept title = %q, want %q", resp.Data.Embeds[0].Title, duelResultTitle)
+	}
+}
+
+// The check at the start is a courtesy, not the guarantee: three minutes pass
+// between the challenge and the ⚔️, and the opponent is free to start a game
+// in them. AcceptDuel's own check is the one that keeps the rule, and this
+// pins it — the acceptance is refused, and because nothing was persisted the
+// challenge stays live with its stake still refundable.
+func TestDuelAcceptStillRefusesAnOpponentWhoStartedAGameMeanwhile(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	r := &fakeCasinoResponder{}
+	sessionID := startDuel(t, c, r, 100)
+
+	if err := bank.OpenGame("g1", duelOpponent, string(casino.GameBlackjack), testEscrowSession, 100, time.Now()); err != nil {
+		t.Fatalf("putting the opponent in a game after the challenge went up: %v", err)
+	}
+
+	resp := duelPress(t, c, r, sessionID, duelActionAccept, duelOpponent)
+
+	if resp.Data.Content != duelInProgressMessage {
+		t.Errorf("reply = %q, want %q", resp.Data.Content, duelInProgressMessage)
+	}
+	if c.sessions.Len() != 1 {
+		t.Errorf("%d challenges are live after the refused acceptance, want 1 — the stake still needs a board that can release it", c.sessions.Len())
+	}
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Errorf("challenger: %d chips / %d escrow, want 900 / 100 — a refused acceptance settles nothing", chips, escrow)
+	}
+	if chips, escrow := duelHoldings(t, bank, duelOpponent); chips != 900 || escrow != 100 {
+		t.Errorf("opponent: %d chips / %d escrow, want 900 / 100 — their own game must be left alone", chips, escrow)
+	}
+
+	// 🚫 still works, so the challenger's chips are not stranded.
+	duelPress(t, c, r, sessionID, duelActionDecline, duelOpponent)
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger after the decline: %d chips / %d escrow, want 1000 / 0", chips, escrow)
 	}
 }
 

@@ -39,15 +39,22 @@ const (
 
 // User-facing wording (設計書 C-3b §4.5 / §6).
 const (
-	duelBetRangeMessage      = "❌ ベットは10〜1,000チップです"
-	duelInProgressMessage    = "❌ 進行中のゲームがあります(先に決着してください)"
-	duelSelfMessage          = "❌ 自分自身とは対戦できません"
-	duelBotMessage           = "❌ Bot とは対戦できません"
-	duelNoTargetMessage      = "❌ 対戦相手を指定してください"
-	duelNotYoursMessage      = "❌ この挑戦はあなた宛てではありません"
-	duelChallengeOverMessage = "⌛ この挑戦はもう終了しています"
-	duelStartFailedMessage   = "❌ 挑戦の開始に失敗しました。"
-	duelActionFailedMessage  = "❌ 操作に失敗しました。"
+	duelBetRangeMessage   = "❌ ベットは10〜1,000チップです"
+	duelInProgressMessage = "❌ 進行中のゲームがあります(先に決着してください)"
+	// duelOpponentInProgressFormat is the same refusal seen from the other
+	// side: the challenger is free, the person they aimed at is not. It names
+	// them because "進行中のゲームがあります" alone reads as an accusation
+	// against the presser, who has done nothing wrong and cannot settle
+	// somebody else's hand — so the "先に決着してください" of the message
+	// above is dropped here rather than aimed at the wrong player.
+	duelOpponentInProgressFormat = "❌ <@%s> は進行中のゲームがあります"
+	duelSelfMessage              = "❌ 自分自身とは対戦できません"
+	duelBotMessage               = "❌ Bot とは対戦できません"
+	duelNoTargetMessage          = "❌ 対戦相手を指定してください"
+	duelNotYoursMessage          = "❌ この挑戦はあなた宛てではありません"
+	duelChallengeOverMessage     = "⌛ この挑戦はもう終了しています"
+	duelStartFailedMessage       = "❌ 挑戦の開始に失敗しました。"
+	duelActionFailedMessage      = "❌ 操作に失敗しました。"
 )
 
 // Titles of the three states a challenge message can end in.
@@ -426,6 +433,26 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 	opponentID, opponentIsBot := duelTarget(data)
 	if msg := duelTargetRefusal(challengerID, opponentID, opponentIsBot); msg != "" {
 		return respondVia(r, i.Interaction, messageResponse(msg))
+	}
+
+	// 設計書 §4.5 refuses a duel if EITHER side is mid-game, and only one of
+	// the two is checked by staking: OpenGame below sees the challenger's own
+	// escrow, never the opponent's. Without this read the challenge goes up,
+	// the challenger's chips go into escrow, and the opponent's ⚔️ is refused
+	// by AcceptDuel — leaving the stake locked for the full three minutes over
+	// a game that could never have started. The acceptance keeps its own
+	// check, which is the one that actually guarantees the rule: the opponent
+	// can open a game in the three minutes this read cannot see into.
+	//
+	// An opponent with no account at all is not in a game, and the read does
+	// not open one for them (casino.GameInProgress).
+	opponentBusy, err := c.store.GameInProgress(i.GuildID, opponentID)
+	if err != nil {
+		slog.Error("casino: reading the opponent's escrow failed", "command", "duel", "error", redactInteractionError(err))
+		return respondVia(r, i.Interaction, messageResponse(duelStartFailedMessage))
+	}
+	if opponentBusy {
+		return respondVia(r, i.Interaction, messageResponse(fmt.Sprintf(duelOpponentInProgressFormat, opponentID)))
 	}
 
 	now := time.Now()

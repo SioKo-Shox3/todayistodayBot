@@ -377,4 +377,8 @@ type casinoBank interface {
 	// the same seam — and the same test doubles — as the other two games.
 	AcceptDuel(guildID, challengerID, opponentID, sessionID string, bet int64, challengerWins bool) (casino.DuelSettlement, error)
 	DeclineDuel(guildID, challengerID, sessionID string) error
+	// GameInProgress is the one READ on this interface, and only /duel needs
+	// it: the one-game rule that OpenGame enforces covers the account being
+	// debited, never the opponent a challenge is addressed to.
+	GameInProgress(guildID, userID string) (bool, error)
 }

@@ -1946,6 +1946,79 @@ func assertHoldings(t *testing.T, path, guildID, userID string, wantChips, wantE
 	}
 }
 
+// C3B-15: /duel has to refuse a challenge aimed at somebody already playing,
+// and it has to do that BEFORE it stakes the challenger. GameInProgress is
+// the read it does it with — the escrow of an account it is not debiting.
+func TestGameInProgress_AnswersForAnAccountItDoesNotDebit(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	busy, err := st.GameInProgress(escrowGuild, escrowUser)
+	if err != nil {
+		t.Fatalf("GameInProgress on a free account: %v", err)
+	}
+	if busy {
+		t.Fatal("an account with nothing in escrow reads as in-game")
+	}
+
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 250, fixedNow); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	busy, err = st.GameInProgress(escrowGuild, escrowUser)
+	if err != nil {
+		t.Fatalf("GameInProgress mid-game: %v", err)
+	}
+	if !busy {
+		t.Fatal("an account holding a stake does not read as in-game")
+	}
+
+	if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 0); err != nil {
+		t.Fatalf("SettleGame: %v", err)
+	}
+	busy, err = st.GameInProgress(escrowGuild, escrowUser)
+	if err != nil {
+		t.Fatalf("GameInProgress after the settlement: %v", err)
+	}
+	if busy {
+		t.Fatal("a settled account still reads as in-game")
+	}
+}
+
+// Asking about a stranger must not open an account for them: being named in
+// somebody else's /duel is not a casino interaction, and ensureAccountLocked
+// would hand them the 1,000-chip welcome bonus for it. An unknown guild and
+// an unknown user in a known guild are both "not in a game".
+func TestGameInProgress_DoesNotCreateTheAccountItAsksAbout(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	for _, tc := range []struct{ name, guildID, userID string }{
+		{name: "unknown user in a known guild", guildID: escrowGuild, userID: "stranger"},
+		{name: "unknown guild", guildID: "guild-nobody-plays-in", userID: "stranger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			busy, err := st.GameInProgress(tc.guildID, tc.userID)
+			if err != nil {
+				t.Fatalf("GameInProgress: %v", err)
+			}
+			if busy {
+				t.Fatal("an account that does not exist reads as in-game")
+			}
+		})
+	}
+
+	data, err := New(path).Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if _, created := data["guild-nobody-plays-in"]; created {
+		t.Error("the read created a guild that never played")
+	}
+	if _, created := data[escrowGuild].Users["stranger"]; created {
+		t.Errorf("the read created an account for a stranger: %+v", data[escrowGuild].Users["stranger"])
+	}
+}
+
 func TestOpenGame_StakesTheBetWithoutChangingHoldings(t *testing.T) {
 	st, path := newTempStore(t)
 	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})

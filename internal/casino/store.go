@@ -1194,6 +1194,44 @@ func escrowOwnedByLocked(account *UserAccount, sessionID string) bool {
 	return account.EscrowSession == "" || account.EscrowSession == sessionID
 }
 
+// GameInProgress reports whether guildID/userID is holding a stake right
+// now — the read-only half of the one-game-at-a-time rule (設計書 §4.5), for
+// the caller that has to refuse BEFORE it stakes anybody.
+//
+// /duel is that caller, and the only one. OpenGame enforces the rule for the
+// account it debits, but a challenge debits the CHALLENGER and is answered by
+// the OPPONENT, so an opponent who is already mid-game is not noticed until
+// ⚔️ is pressed — until then the challenger's chips sit locked behind a
+// challenge that can only ever be refused, for the full three minutes.
+//
+// AcceptDuel makes the same check again under the store's lock, and THAT one
+// is the guarantee; this read cannot be, because the opponent is free to open
+// a game in the gap between the two. It buys a refusal at the start instead
+// of a wasted challenge.
+//
+// An account that does not exist is NOT in a game, and asking must not create
+// one: ensureAccountLocked would hand the 1,000-chip welcome bonus to someone
+// for the sole crime of having been named in another player's challenge. The
+// lookup therefore runs on a Snapshot — one read of the file under the lock,
+// creating nothing.
+func (s *Store) GameInProgress(guildID, userID string) (bool, error) {
+	data, err := s.Snapshot()
+	if err != nil {
+		return false, err
+	}
+	economy := data[guildID]
+	if economy == nil {
+		return false, nil
+	}
+	// economy.Users can be nil on a hand-edited file; a read of a nil map is
+	// the zero value, which is the answer this wants anyway.
+	account := economy.Users[userID]
+	if account == nil {
+		return false, nil
+	}
+	return account.Escrow > 0, nil
+}
+
 // OpenGame stakes bet chips on a new game of `game` for guildID/userID,
 // auto-creating the account (welcome bonus) on first ever interaction.
 // Returns ErrGameInProgress if the account already has chips in escrow,
