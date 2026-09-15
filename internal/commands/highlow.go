@@ -567,6 +567,16 @@ func (c *HighLowCommand) handleComponent(r interactionResponder, i *discordgo.In
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
 
+	// This board is only standing because the refund it owes was refused
+	// (C3B-P5). What it pays is already fixed, so a guess taken here would
+	// raise a pot the sweep will never pay: the refund is the whole of what
+	// is left to happen on it. The wording is the one an unpaid settlement
+	// already uses — from the player's side both are "the chips have not
+	// moved yet, it is being retried".
+	if session.RefundPending() {
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+	}
+
 	// The board's last edit never reached Discord, so the message shows the
 	// PREVIOUS card while the game holds the next one. A guess made against
 	// that picture would be decided by odds the player never saw: repair the

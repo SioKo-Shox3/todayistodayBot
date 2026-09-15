@@ -585,6 +585,16 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 	}
 	defer c.sessions.Release(sessionID)
 
+	// A challenge that is only standing because the refund it owes was refused
+	// is not pressable (C3B-P5). /duel writes no such mark today — its sweep is
+	// DeclineDuel, which needs no amount fixed for it — but the question is
+	// asked here, out of the same casino.Session read the other two games use,
+	// so that a marked challenge can never be accepted for a stake that is
+	// already on its way back.
+	if session.RefundPending() {
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+	}
+
 	var board casino.DuelState
 	var refusal string
 	if err := c.sessions.WithSession(sessionID, func(live *casino.Session) (bool, error) {

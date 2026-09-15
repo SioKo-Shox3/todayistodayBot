@@ -323,6 +323,10 @@ func translateBlackjackPressError(err error) string {
 		return fmt.Sprintf("❌ チップが足りません(現在: %d枚)", insufficientChips.Balance)
 	case errors.Is(err, casino.ErrSessionNotFound), errors.Is(err, casino.ErrNoGameInProgress), errors.Is(err, errBlackjackBadState):
 		return blackjackSessionOverMessage
+	case errors.Is(err, casino.ErrRefundPending):
+		// Not "the hand is over": it is standing, and the chips are on their
+		// way back. Same wording as a settlement that has not landed yet.
+		return casinoSettleFailedMessage
 	case errors.Is(err, casino.ErrDoubleUnavailable):
 		return blackjackDoubleOverMessage
 	case errors.Is(err, errBlackjackUnknownAction):
@@ -597,6 +601,15 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 		return respondVia(r, i.Interaction, ephemeralResponse(msg))
 	}
 
+	// This hand is only standing because the refund (or the payout a natural
+	// decided at the deal) was refused (C3B-P5). What it owes is already
+	// fixed, so a hit, a stand or a ⏫ here would move a hand whose number can
+	// no longer change — and ⏫ would stake a second bet the fixed amount will
+	// never return. The wording is the one an unpaid settlement already uses.
+	if session.RefundPending() {
+		return respondVia(r, i.Interaction, ephemeralResponse(casinoSettleFailedMessage))
+	}
+
 	// The hand's last edit never reached Discord, so the message shows the
 	// PREVIOUS cards while the game holds the drawn one. A stand or a ⏫ aimed
 	// at that picture would be decided on a total the player never saw — and
@@ -688,6 +701,13 @@ func (c *BlackjackCommand) stakeDouble(session casino.Session, sessionID string)
 		game, isBlackjack := live.State.(*casino.BlackjackGame)
 		if !isBlackjack {
 			return true, errBlackjackBadState
+		}
+		// Asked of the LIVE hand, not of the copy the press is holding: this
+		// is the only place in the package that adds chips to an escrow that
+		// already exists, so the refusal sits against the write itself rather
+		// than only against the press that reached it (C3B-P5).
+		if live.RefundPending() {
+			return false, casino.ErrRefundPending
 		}
 		if !game.CanDouble() {
 			return false, casino.ErrDoubleUnavailable

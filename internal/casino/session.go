@@ -30,6 +30,12 @@ var ErrSessionNotFound = errors.New("casino: session not found")
 // passes a fixed string cannot silently adopt somebody else's board.
 var ErrSessionIDTaken = errors.New("casino: that session ID is already in use")
 
+// ErrRefundPending means the board is standing only because the refund it owes
+// could not be persisted (Session.RefundPending). Its amount is already fixed,
+// so no move and no further stake may be taken on it — the command layer
+// answers a press with the same wording an unpaid settlement gets.
+var ErrRefundPending = errors.New("casino: this board is waiting for its refund to be retried")
+
 // GameKind names the game a session is running. It is part of the custom_id
 // namespace, so the values are stable strings, not iota.
 type GameKind string
@@ -104,6 +110,23 @@ type Session struct {
 	// not part of the board a caller reads out of Get.
 	busy int
 }
+
+// RefundPending reports that this board owes a refund the store would not
+// take, and is therefore standing for the sweep alone — not for the player.
+//
+// It is THE ONE READ that decides whether a board may still be operated on
+// (C3B-P5). MarkRefundPending fixes what the board pays before it leaves it
+// standing, and fixing the amount is only half of what that means: a board
+// whose payout is already decided must also stop MOVING, or the next press
+// grows a pot (or stakes a second bet) that the fixed amount will never pay
+// out. Every game asks this one question rather than deciding for itself what
+// a marked board is, so a fourth game cannot answer it differently.
+//
+// On a live board PayoutResolved has exactly one writer — MarkRefundPending,
+// which only a holder may call. The sweeper sets it too, but only on a board
+// it has already expired, and an expired board is refused by Get, Hold,
+// WithSession, Touch and Close before this question is ever asked.
+func (s Session) RefundPending() bool { return s.PayoutResolved }
 
 // AutoResolver is the single method the sweeper needs from a game board:
 // settle it the least-favourable-to-nobody way and report the payout to
