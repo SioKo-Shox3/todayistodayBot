@@ -583,3 +583,17 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/commands/... -count=1`
 - paths: internal/commands/blackjack.go, internal/commands/blackjack_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go
 - notes: 危険地帯。C3B-P2 の 3 経路の唯一の不揃いで、そこだけコメントに理由を書いてある(`withdrawUndeliveredHand`)。資金が失われる穴ではない(再起動で全額戻る)ので P2。
+
+## C3B-P3: 開始の間は掃除人を入れない/返金に失敗した盤面は閉じない(C3B-P2 の差し戻し)
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の C3B-P2 差し戻し 2 件を閉じる。**この系統(預かりが取り残される)は今回で閉じきる** — 個別の窓を塞ぐのではなく、下の不変条件をコードとテストで固定する。
+  **不変条件**: 「掃除人に見える盤面は、(a) まだ資金が動いていない(消えても損が出ない)か、(b) 預かりの印が付いていて精算・返金の対象になる、のどちらかである」。
+  (1) **開始処理の間は掃除人を入れない**: 今は `OpenWithID`(登録)と `OpenGame`(預かり)の間に TTL の掃除が割り込め、盤面だけ消えて預かりが残る。開始処理の全体(登録 → 預かり → 初回応答)を**盤面ロック(`Hold`)の内側**で行い、掃除人は `busy` の盤面を対象から外す(`architecture.md` に既に書いてある規律)。`Hold` が取れなかった場合の扱いも決めてテストする。3 ゲーム(H&L・BJ・duel)すべて同じ形に揃える。
+  (2) **返金に失敗した盤面を閉じない**: `blackjack.go` 463 付近は返金の成否に関わらず `Close` する(未送達の手が返金されないまま消える)。返金が成功したときだけ閉じ、失敗したら盤面と「返金待ち」を残して掃除人が**自動スタンドではなく返金を再試行**する(未送達の手は遊ばれていないので、決着させずに返す)。H&L・duel も同じ扱いか確かめ、違えば揃える。**C3B-21 などへの先送りはしない**(先送りは done-when 未達)。
+  回帰テスト: 登録直後(預かり前)に掃除しても盤面が消えない・預かりが残らない / 未送達 + 返金失敗のあと復旧して掃除すると全額戻る(3 ゲーム) / 正常な開始・精算・辞退・時間切れが 3 ゲームとも通る / `Hold` が取れないときの経路。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/casino_shared.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go
+- notes: 危険地帯。**この不変条件を満たさない経路が 1 本でも残るなら、それを見つけて直すまでこのタスクは閉じない。** 3 ゲーム × (開始・受諾・辞退・時間切れ・未送達) の組み合わせを表にして、どの経路がどちらの側(a か b)かを進捗に書く。
