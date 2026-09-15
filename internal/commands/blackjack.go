@@ -372,20 +372,23 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
-	// Stake BEFORE the hand (完了条件の順序), for the reason /highlow states:
-	// Store.OpenGame is the persisted half of "one game per person", so it is
-	// the half that refuses a second bet. ⏫, every press and the sweeper name
-	// sessionID, and nothing else can settle these chips.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), sessionID, bet, now); err != nil {
-		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
-	}
-
 	game := c.newGame(bet)
 	board := snapshotBlackjack(game) // safe without the lock: nobody can reach this hand until Open publishes its ID
 
+	// The HAND is taken FIRST and the chips move afterwards (C3B-P2), for the
+	// reason /highlow states: the hand is memory only, so a refused open here
+	// leaves nothing to give back, and the state "chips are staked but no
+	// board holds them" stops being reachable.
 	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, userID, casino.GameBlackjack, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableHand(i.GuildID, userID, sessionID, bet) // the chips already moved: hand them straight back
+		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
+	}
+
+	// Store.OpenGame is still the persisted half of "one game per person",
+	// and the half that survives a restart. ⏫, every press and the sweeper
+	// name sessionID, and nothing else can settle these chips.
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), sessionID, bet, now); err != nil {
+		c.sessions.Close(sessionID) // nothing was staked: there is no refund to fail
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
@@ -404,7 +407,7 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 	}); err != nil {
 		// The hand never reached Discord, so there is nothing to press and
 		// nothing will ever settle it.
-		c.closeUndeliveredHand(session.ID, i.GuildID, userID, bet)
+		c.withdrawUndeliveredHand(session.ID, i.GuildID, userID, bet)
 		return err
 	}
 
@@ -425,28 +428,40 @@ func (c *BlackjackCommand) settleDealtHand(r interactionResponder, i *discordgo.
 	return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseChannelMessageWithSource)
 }
 
-// closeUndeliveredHand retires a hand whose board never reached the player,
-// and gives the stake back only when Close says the session was still ours:
-// Discord can create the message and still fail the call, so by the time the
-// error lands the hand may have been played out and replaced, in which case
-// the escrow on the account belongs to the game that came after it.
+// withdrawUndeliveredHand retires a hand whose board never reached the
+// player, and gives the stake back only when the hand was still ours: Discord
+// can create the message and still fail the call, so by the time the error
+// lands the hand may have been played out and replaced, in which case the
+// escrow on the account belongs to the game that came after it. A Hold that
+// fails is that answer.
 //
 // It takes THIS BOARD'S LOCK FIRST, for the same reason every press does. ⏫
 // moves its second stake outside the manager's lock (disk I/O never runs
-// inside WithSession), so an unlocked close can land between that stake and
-// the hand that would count it: the refund would return the original bet
+// inside WithSession), so an unlocked withdrawal can land between that stake
+// and the hand that would count it: the refund would return the original bet
 // alone, the raise would sit in an escrow nothing can settle, and the press
 // would then find its session gone. Under the lock the press is over before
 // the decision — a double always finishes the hand, so the session is already
-// gone and Close reports false, and a hit leaves an escrow that is still
+// gone and Hold reports false, and a hit leaves an escrow that is still
 // exactly the bet.
-func (c *BlackjackCommand) closeUndeliveredHand(sessionID, guildID, userID string, bet int64) {
+//
+// The refund goes BEFORE the hand is retired, the order /highlow and /duel
+// keep, so the chips are never in escrow with no board naming them. Unlike
+// those two the hand is retired even when the refund FAILED: blackjack's
+// AutoResolve stands the hand, so leaving this board for the idle sweep would
+// play out — and can lose — a hand the player never saw. A stake left here
+// comes back whole at the next restart (RefundStaleEscrows) instead.
+func (c *BlackjackCommand) withdrawUndeliveredHand(sessionID, guildID, userID string, bet int64) {
 	lock := c.locks.acquire(sessionID)
 	defer c.locks.release(sessionID, lock)
 
-	if c.sessions.Close(sessionID) {
-		c.refundUnplayableHand(guildID, userID, sessionID, bet)
+	if _, held := c.sessions.Hold(sessionID); !held {
+		return
 	}
+	defer c.sessions.Release(sessionID)
+
+	c.refundUnplayableHand(guildID, userID, sessionID, bet)
+	c.sessions.Close(sessionID)
 }
 
 // refundUnplayableHand returns a stake whose hand never became playable.

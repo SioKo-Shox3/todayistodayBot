@@ -472,22 +472,30 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
-	// Stake the challenger BEFORE the board, the order C2-06 settled: the
-	// persisted half of "one game per person" is the half that survives a
-	// restart, so it is the one that must refuse a second bet. 🎲 and 🚫, the
-	// sweeper and this function's own refund all name sessionID, and an
-	// acceptance that names a challenge already withdrawn is refused instead
-	// of paid out of this one.
-	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), sessionID, bet, now); err != nil {
-		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
-	}
-
 	state := &casino.DuelState{ChallengerID: challengerID, OpponentID: opponentID, Bet: bet, Stage: casino.DuelPending}
 	board := *state // safe without the lock: nobody can reach this board until Open publishes its ID
 
+	// The CHALLENGE BOARD is taken FIRST and the challenger is staked
+	// afterwards (C3B-P2). The board is memory only, so a refused open here
+	// leaves no chips to give back — and the refund it used to need was the
+	// one that could fail, stranding a stake that no board, no button and no
+	// sweep could reach. Taking the slot first is also what closes the gap a
+	// withdrawal leaves between its refund and its Close: a second /duel
+	// arriving there is refused by the board still standing, before it can
+	// stake anything.
 	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, challengerID, casino.GameDuel, state, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUndeliveredChallenge(i.GuildID, challengerID, sessionID)
+		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
+	}
+
+	// The persisted half of "one game per person" is the half that survives a
+	// restart, so it still has its say here: an escrow left behind by a
+	// challenge the process lost refuses this bet. 🎲 and 🚫, the sweeper and
+	// the undelivered cleanup all name sessionID, and an acceptance that
+	// names a challenge already withdrawn is refused instead of paid out of
+	// this one.
+	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), sessionID, bet, now); err != nil {
+		c.sessions.Close(sessionID) // nothing was staked: there is no refund to fail
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
@@ -537,18 +545,6 @@ func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessio
 		return
 	}
 	c.sessions.Close(sessionID)
-}
-
-// refundUndeliveredChallenge returns a stake whose challenge never became
-// pressable. It goes through DeclineDuel rather than SettleGame for the
-// reason SettleTimedOutBoard gives, and that call's EscrowGame check is what
-// stops it from refunding some other game's stake if one has opened since —
-// and escrowID, the mark the stake carries at this point of the open, is what
-// stops it when that other game is another DUEL (設計書 C-3b).
-func (c *DuelCommand) refundUndeliveredChallenge(guildID, challengerID, escrowID string) {
-	if err := c.store.DeclineDuel(guildID, challengerID, escrowID); err != nil {
-		slog.Error("casino: refunding an undelivered duel challenge failed", "error", redactInteractionError(err))
-	}
 }
 
 // rememberChallengeMessage fills in the session's MessageRef once Discord has

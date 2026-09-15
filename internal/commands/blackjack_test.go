@@ -657,7 +657,11 @@ func TestBlackjackRetriesOnlyTheSettlementAfterARefusedPayout(t *testing.T) {
 
 // 完了条件の順序: EnsureCasinoAccess → Store.OpenGame → DefaultSessions().Open,
 // and a hand that cannot be opened after the stake moved gives it back.
-func TestBlackjackStakesBeforeTheHandAndRefundsWhenTheHandCannotOpen(t *testing.T) {
+// --- 開始の順序(C3B-P2)----------------------------------------------------
+
+// The hand is registered BEFORE the chips move, so a hand that cannot be
+// registered stakes nothing at all and has nothing to hand back.
+func TestBlackjackTakesTheHandBeforeTheChipsMove(t *testing.T) {
 	seed := blackjackSeedWhere(t, "a playable hand", func(g *casino.BlackjackGame) bool {
 		return g.State() == casino.BlackjackPlaying
 	})
@@ -674,14 +678,45 @@ func TestBlackjackStakesBeforeTheHandAndRefundsWhenTheHandCannotOpen(t *testing.
 	if got, want := r.last(t).Data.Content, blackjackInProgressMessage; got != want {
 		t.Errorf("refusal: got %q, want %q", got, want)
 	}
-	if bank.settles != 1 {
-		t.Fatalf("SettleGame was called %d times, want 1: the stake moved before the hand was opened and must come back", bank.settles)
+	if bank.opens != 0 {
+		t.Fatalf("OpenGame was called %d times, want 0: a hand that cannot be registered must not stake a single chip", bank.opens)
+	}
+	if bank.settles != 0 {
+		t.Errorf("SettleGame was called %d times, want 0: nothing was staked, so there is nothing to refund", bank.settles)
 	}
 	if got := highLowEscrowOf(t, bank); got != 0 {
 		t.Errorf("escrow after the refusal: got %d, want 0", got)
 	}
 	if got := highLowChipsOf(t, bank); got != 1000 {
 		t.Errorf("chips after the refusal: got %d, want the welcome bonus back (1000)", got)
+	}
+}
+
+// And a stake the store refuses leaves no hand standing: a hand with no
+// escrow behind it holds the player's "one game at a time" slot and would be
+// stood by the idle sweep into a settlement with nothing to settle.
+func TestBlackjackLeavesNoHandWhenTheStakeIsRefused(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a playable hand", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying
+	})
+	c, bank := newBlackjackCommandForTest(t, seed)
+	r := &fakeCasinoResponder{}
+	bank.openErr = errors.New("the stake never reached the disk")
+
+	if err := c.handle(r, blackjackSlashInteraction(100)); err != nil {
+		t.Fatalf("/blackjack: %v", err)
+	}
+	if got, want := r.last(t).Data.Content, blackjackStartFailedMessage; got != want {
+		t.Errorf("refusal: got %q, want %q", got, want)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("a refused stake left %d hands standing, want 0", c.sessions.Len())
+	}
+	if bank.settles != 0 {
+		t.Errorf("SettleGame was called %d times, want 0: nothing moved, so there is no refund to make", bank.settles)
+	}
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow after the refusal: got %d, want 0", got)
 	}
 }
 

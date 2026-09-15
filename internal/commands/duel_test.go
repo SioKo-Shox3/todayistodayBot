@@ -963,6 +963,11 @@ type duelBankThatRefusesOneRefund struct {
 	// the window this cleanup shares with ⚔️, and the only way a test gets
 	// to act inside it instead of hoping to hit it by timing.
 	beforeDecline func()
+	// afterDecline runs once, immediately after a refund has LANDED and
+	// before the board it belongs to is closed. That is the interval the
+	// 2 周目 review's reproduction steps into: the escrow is already back and
+	// the old board is still registered.
+	afterDecline func()
 }
 
 func (b *duelBankThatRefusesOneRefund) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
@@ -983,7 +988,14 @@ func (b *duelBankThatRefusesOneRefund) DeclineDuel(guildID, challengerID, sessio
 		b.refuseNextRefund = nil
 		return err
 	}
-	return b.flakyBank.DeclineDuel(guildID, challengerID, sessionID)
+	if err := b.flakyBank.DeclineDuel(guildID, challengerID, sessionID); err != nil {
+		return err
+	}
+	if hook := b.afterDecline; hook != nil {
+		b.afterDecline = nil // once — the hook must not re-enter its own refund
+		hook()
+	}
+	return nil
 }
 
 // newDuelCommandOnRefusingBank is newDuelCommandForTest with a store whose
@@ -1083,6 +1095,105 @@ func TestDuelUndeliveredCleanupAndAcceptanceDoNotBothPay(t *testing.T) {
 	}
 	if got := acceptResponder.last(t).Data.Content; got != duelChallengeOverMessage {
 		t.Errorf("⚔️ answered %q, want %q", got, duelChallengeOverMessage)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges are still live after the withdrawal, want 0", c.sessions.Len())
+	}
+}
+
+// --- 開始の順序(C3B-P2)----------------------------------------------------
+
+// The challenge board is registered BEFORE the challenger is staked, so a
+// challenge that cannot be registered moves no chips and has nothing to give
+// back — the refund it used to need was the one that could fail.
+func TestDuelTakesTheChallengeBoardBeforeTheChipsMove(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	r := &fakeCasinoResponder{}
+
+	// A challenge this user already has: sessions.OpenWithID refuses the new one.
+	if _, err := c.sessions.Open("g1", duelChallenger, casino.GameDuel, &casino.DuelState{}, casino.MessageRef{}); err != nil {
+		t.Fatalf("seeding a live challenge: %v", err)
+	}
+
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err != nil {
+		t.Fatalf("/duel: %v", err)
+	}
+	if got, want := r.last(t).Data.Content, duelInProgressMessage; got != want {
+		t.Errorf("refusal: got %q, want %q", got, want)
+	}
+	if bank.opens != 0 {
+		t.Fatalf("OpenGame was called %d times, want 0: a challenge that cannot be registered must not stake a single chip", bank.opens)
+	}
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow after the refusal, want 1000 / 0", chips, escrow)
+	}
+}
+
+// And a stake the store refuses leaves no challenge standing: a board with no
+// escrow behind it holds the challenger's "one game at a time" slot and would
+// let ⚔️ be pressed on a pot that was never funded.
+func TestDuelLeavesNoChallengeWhenTheStakeIsRefused(t *testing.T) {
+	c, bank := newDuelCommandForTest(t, true)
+	r := &fakeCasinoResponder{}
+	bank.openErr = errors.New("the stake never reached the disk")
+
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err != nil {
+		t.Fatalf("/duel: %v", err)
+	}
+	if got, want := r.last(t).Data.Content, duelStartFailedMessage; got != want {
+		t.Errorf("refusal: got %q, want %q", got, want)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("a refused stake left %d challenges standing, want 0", c.sessions.Len())
+	}
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow after the refusal, want 1000 / 0", chips, escrow)
+	}
+}
+
+// The 2 周目 review's reproduction, end to end. The undelivered cleanup of a
+// first challenge refunds and then closes its board, so between the two there
+// is an instant with an empty escrow and a board still registered. A SECOND
+// /duel arriving exactly there used to stake its chips (the escrow was free),
+// fail to register its board (the first one was still there) and then be
+// unable to give the chips back — an escrow named by a board that was never
+// registered, which no button, no 🚫 and no sweep can reach.
+//
+// With the board taken first the second start is refused before it stakes
+// anything, so the interval carries no money at all. The armed refund below
+// is what makes that a claim and not a coincidence: under the old order the
+// second start's own refund would fail here and strand its 100 chips.
+func TestDuelASecondStartInsideAWithdrawalStrandsNothing(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	c, bank := newDuelCommandOnRefusingBank(t, func() time.Time { return opened })
+	RegisterComponent(c)
+
+	second := &fakeCasinoResponder{}
+	bank.afterDecline = func() {
+		// Any refund the second start needs will fail, exactly as the
+		// reproduction's unsaved I/O error does.
+		bank.refuseNextRefund = errors.New("the refund never reached the disk")
+		if err := c.handle(second, duelSlashInteraction(duelOpponent, false, 100)); err != nil {
+			t.Errorf("the second /duel: %v", err)
+		}
+	}
+
+	r := &fakeCasinoResponder{respondErr: errors.New("the challenge never reached Discord")}
+	if err := c.handle(r, duelSlashInteraction(duelOpponent, false, 100)); err == nil {
+		t.Fatal("/duel reported success although the challenge never reached Discord")
+	}
+
+	if got, want := second.last(t).Data.Content, duelInProgressMessage; got != want {
+		t.Errorf("the second start answered %q, want %q — the first board still holds the slot", got, want)
+	}
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow, want 1000 / 0 — a stake is stranded with no board to reach it", chips, escrow)
+	}
+	if bank.opens != 1 {
+		t.Errorf("OpenGame was called %d times, want 1: the second start staked chips inside the withdrawal", bank.opens)
 	}
 	if c.sessions.Len() != 0 {
 		t.Errorf("%d challenges are still live after the withdrawal, want 0", c.sessions.Len())

@@ -1265,12 +1265,13 @@ func (s *Store) GameInProgress(guildID, userID string) (bool, error) {
 // package-wide convention); no decision here reads it.
 //
 // sessionID is the mark the stake carries (設計書 C-3b): the ID of the board
-// that may settle it, and nothing else. The command layer stakes the chips
-// BEFORE the board exists (C2-06), so it mints the ID itself with
-// NewSessionID and hands the SAME one to SessionManager.OpenWithID — the
-// stake is therefore owned by its board from the very first write, with no
-// window in which some provisional mark has to stand in for one. Every later
-// call names a board this way, and only the named one may touch the chips.
+// that may settle it, and nothing else. The command layer mints the ID with
+// NewSessionID, registers the board with SessionManager.OpenWithID, and only
+// then calls this — so the stake is owned by a board that already exists from
+// its very first write (C3B-P2), with no window in which some provisional
+// mark has to stand in for one and none in which chips are held by nothing.
+// Every later call names a board this way, and only the named one may touch
+// the chips.
 func (s *Store) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)

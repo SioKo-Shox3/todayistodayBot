@@ -170,10 +170,10 @@ func userKey(guildID, userID string) string { return guildID + "\x00" + userID }
 // other half of that defence).
 //
 // It is exported because the command layer needs the ID BEFORE either half
-// of an open exists (設計書 C-3b): the chips are staked first (C2-06), so the
-// mark Store.OpenGame writes has to be the same ID OpenWithID then publishes.
-// Minting it here is what removes the window in which a stake carried a
-// provisional mark that no board could present.
+// of an open exists (設計書 C-3b): the board is registered first (C3B-P2) and
+// the stake Store.OpenGame then writes has to carry that same ID. Minting it
+// here is what removes the window in which a stake carried a provisional mark
+// that no board could present.
 func NewSessionID() (string, error) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
@@ -183,10 +183,11 @@ func NewSessionID() (string, error) {
 }
 
 // Open registers a new board for guild+user. It returns ErrGameInProgress if
-// that pair already has one — the caller must refuse the bet BEFORE moving
-// chips into escrow, because a second OpenGame would strand the first
-// stake (see Store.OpenGame's ErrGameInProgress, the persisted half of the
-// same rule).
+// that pair already has one — and because the command layer now registers the
+// board BEFORE it stakes anything (C3B-P2), this refusal arrives while the
+// chips have not moved, so there is nothing to hand back (see Store.OpenGame's
+// ErrGameInProgress, the persisted half of the same rule, which still has the
+// final say for an escrow whose board died with an earlier process).
 //
 // An EXPIRED board counts as one in progress: its stake is still in escrow
 // until the sweeper's settlement lands, and Store.OpenGame would refuse the
@@ -201,9 +202,14 @@ func (m *SessionManager) Open(guildID, userID string, game GameKind, state any, 
 }
 
 // OpenWithID is Open for a caller that already has the board's ID — every
-// caller in the command layer, because the stake is marked with that ID
-// before the board exists (設計書 C-3b). Open is this function plus a
+// caller in the command layer, because the stake staked right after this call
+// is marked with that ID (設計書 C-3b). Open is this function plus a
 // NewSessionID call, and everything it promises holds here too.
+//
+// Registering the board is memory only: no chips move here, which is what
+// makes it safe to go FIRST (C3B-P2). A caller that gets an error from this
+// function has nothing to refund, so the state "an escrow exists that no
+// board names" can no longer be built by an open.
 //
 // Returns ErrSessionIDTaken if the ID is already live. That cannot happen
 // with a NewSessionID value (16 random bytes), so it is a caller passing a

@@ -800,6 +800,13 @@ type flakyBank struct {
 	*casino.Store
 	settleErr error
 	settles   int
+	// openErr refuses the NEXT stake, and opens counts the stakes that were
+	// asked for at all. The count is what pins the open's ORDER (C3B-P2): a
+	// board that could not be registered must leave opens at zero, which is
+	// a stronger claim than "the escrow is 0" — the latter also holds when
+	// the chips moved and a refund happened to work.
+	openErr error
+	opens   int
 	// afterAddToEscrow runs once, immediately after a stake has landed on
 	// disk. That is the gap 反復 1 の指摘 2 names — AddToEscrow is disk I/O, so
 	// it cannot run inside WithSession — and this is how a test gets to act
@@ -813,6 +820,14 @@ func (b *flakyBank) SettleGame(guildID, userID, sessionID string, payout int64) 
 		return casino.SettleResult{}, b.settleErr
 	}
 	return b.Store.SettleGame(guildID, userID, sessionID, payout)
+}
+
+func (b *flakyBank) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
+	b.opens++
+	if b.openErr != nil {
+		return b.openErr
+	}
+	return b.Store.OpenGame(guildID, userID, game, sessionID, bet, now)
 }
 
 func (b *flakyBank) AddToEscrow(guildID, userID, sessionID string, amount int64) error {
@@ -997,16 +1012,18 @@ func TestHighLowSerializesThePressesOfOneBoard(t *testing.T) {
 	<-second // the second press may only finish once the first has let go
 }
 
-// 完了条件の順序: EnsureCasinoAccess → Store.OpenGame → DefaultSessions().Open.
-// The persisted half of "one game per person" is the half that survives a
-// restart, so it takes the stake first — and a board that cannot be opened
-// after that gives it straight back.
-func TestHighLowStakesBeforeTheBoardAndRefundsWhenTheBoardCannotOpen(t *testing.T) {
+// --- 開始の順序(C3B-P2)----------------------------------------------------
+
+// 完了条件の順序: EnsureCasinoAccess → NewSessionID → OpenWithID →
+// Store.OpenGame. The board is memory only, so taking it first costs nothing
+// and a refusal there leaves NO chips to give back — where the old order
+// staked first and needed a refund that could itself fail.
+func TestHighLowTakesTheBoardBeforeTheChipsMove(t *testing.T) {
 	c, bank := newHighLowCommandOnBank(t)
 	r := &fakeHighLowResponder{}
 	before := highLowChipsOf(t, bank)
 
-	// A board this user already has: sessions.Open will refuse the new one.
+	// A board this user already has: sessions.OpenWithID will refuse the new one.
 	if _, err := c.sessions.Open("g1", "u1", casino.GameHighLow, casino.NewHighLow(10, zeroRng{}), casino.MessageRef{}); err != nil {
 		t.Fatalf("seeding a live board: %v", err)
 	}
@@ -1017,8 +1034,41 @@ func TestHighLowStakesBeforeTheBoardAndRefundsWhenTheBoardCannotOpen(t *testing.
 	if got, want := r.last(t).Data.Content, highLowInProgressMessage; got != want {
 		t.Errorf("refusal: got %q, want %q", got, want)
 	}
-	if bank.settles != 1 {
-		t.Fatalf("SettleGame was called %d times, want 1: the stake moved before the board was opened and must come back", bank.settles)
+	if bank.opens != 0 {
+		t.Fatalf("OpenGame was called %d times, want 0: a board that cannot be registered must not stake a single chip", bank.opens)
+	}
+	if bank.settles != 0 {
+		t.Errorf("SettleGame was called %d times, want 0: nothing was staked, so there is nothing to refund", bank.settles)
+	}
+	if got := highLowEscrowOf(t, bank); got != 0 {
+		t.Errorf("escrow after the refusal: got %d, want 0", got)
+	}
+	if got := highLowChipsOf(t, bank); got != before {
+		t.Errorf("chips after the refusal: got %d, want %d", got, before)
+	}
+}
+
+// The other half of the order: a stake the store refuses must not leave a
+// board standing. A board with no escrow behind it would hold the player's
+// "one game at a time" slot and would be auto-resolved by the idle sweep into
+// a settlement that has nothing to settle.
+func TestHighLowLeavesNoBoardWhenTheStakeIsRefused(t *testing.T) {
+	c, bank := newHighLowCommandOnBank(t)
+	r := &fakeHighLowResponder{}
+	before := highLowChipsOf(t, bank)
+	bank.openErr = errors.New("the stake never reached the disk")
+
+	if err := c.handle(r, highLowSlashInteraction(100)); err != nil {
+		t.Fatalf("/highlow: %v", err)
+	}
+	if got, want := r.last(t).Data.Content, highLowStartFailedMessage; got != want {
+		t.Errorf("refusal: got %q, want %q", got, want)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("a refused stake left %d boards standing, want 0", c.sessions.Len())
+	}
+	if bank.settles != 0 {
+		t.Errorf("SettleGame was called %d times, want 0: nothing moved, so there is no refund to make", bank.settles)
 	}
 	if got := highLowEscrowOf(t, bank); got != 0 {
 		t.Errorf("escrow after the refusal: got %d, want 0", got)
@@ -1152,5 +1202,49 @@ func TestHighLowNamesNoAmountsWhileTheSettlementIsRefused(t *testing.T) {
 	body = highLowBodyOf(t, c.press(t, r, sessionID, casinoActionSettle))
 	if want := casinoPayoutLine(100, 1000); !strings.Contains(body, want) {
 		t.Errorf("the settled retry does not name the money: want %q in\n%s", want, body)
+	}
+}
+
+// A board that never reached Discord has no buttons, so the stake behind it
+// must come back. The board is what the sweeper retries through, so it may
+// only be closed once the refund has actually landed: closing it first leaves
+// a stake in escrow that no button, no sweep and no press can release — the
+// account is "in a game" until the next restart. This is the order /duel
+// already keeps, and an untouched high&low board auto-resolves to a pot that
+// still equals the bet, so the sweep hands back exactly what was staked.
+func TestHighLowUndeliveredBoardKeepsTheBoardUntilTheRefundLands(t *testing.T) {
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &HighLowCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.HighLowGame { return casino.NewHighLow(bet, zeroRng{}) },
+	}
+
+	bank.settleErr = errors.New("the refund never reached the disk")
+	r := &fakeHighLowResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(r, highLowSlashInteraction(100)); err == nil {
+		t.Fatal("/highlow reported success although the board never reached Discord")
+	}
+	bank.settleErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d boards are live after a refused refund, want 1 — a closed board is one nothing can retry", c.sessions.Len())
+	}
+
+	// Three minutes on, the sweeper cashes out the board it can still see.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 1000 || escrow != 0 {
+		t.Errorf("player: %d chips / %d escrow after the sweep, want 1000 / 0 — the stake is stranded", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d boards survived the sweep, want 0", c.sessions.Len())
+	}
+	if bank.settles != 2 {
+		t.Errorf("SettleGame was called %d times, want 2 (the undelivered cleanup, then the sweep's retry)", bank.settles)
 	}
 }

@@ -567,7 +567,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 危険地帯。判断の基準は一つ — **預かりが残る可能性がある限り盤面を消さない**(C2-10 の規律)。閉じたら `NEXT_FINDINGS.md` の当該節を消す。
 
 ## C3B-P2: 盤面枠を先に取り、資金は後から動かす(2 周目 blocking、P1)
-- status: todo
+- status: done
 - done-when: `.harness/reviews/2026-09-15-astra-casino-c3b-round2.md` の blocking を直す。今の開始処理は **「預かる → 盤面を登録する」** の順で、登録に失敗したときの返金が best-effort(失敗するとログだけ)なので、**どの盤面にも紐づかない預かりが残って誰も回収できない**(再現: S1 の後始末が返金済み・`Close` 前の区間に S2 の開始が入り、`OpenWithID(S2)` が `ErrGameInProgress` で失敗し、その返金も失敗する)。親の決定(2026-09-15): **順序を逆にする** — (1) セッション ID を作る、(2) **先に盤面を登録する**(`OpenWithID`。メモリだけで資金は動かない)、(3) `OpenGame(..., sessionID)` で預かる、(4) (3) が失敗したら登録した盤面を消して利用者へ断りを返す(資金は動いていないので返金は要らない)。これで**「預かりがあるのに盤面が無い」状態が構造的に作れなくなる**。`/highlow`・`/blackjack`・`/duel` の 3 経路すべてを同じ順序に揃える(レビューが指摘した H&L・BJ の「先に `Close` して返金失敗なら再起動待ち」という既存経路も、この順序にすれば消える)。回帰テスト: 盤面の登録に失敗させても預かりが 1 枚も動かない / 預かりに失敗したら盤面が残らない / 上の再現手順(S1 の後始末の区間に S2 の開始)で預かりが取り残されない / 3 ゲームの正常な開始・精算・辞退・時間切れが通る。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
@@ -575,3 +575,11 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/commands/duel.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel_test.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/casino_shared.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 危険地帯。**「資金を動かす前に、資金を追える場所を用意する」**が原則 — 預かりの印(C3B-13)と対になる。これで C-2 以来の「開始時の取り残し」の系統が閉じる。
+
+## C3B-21: 未送達のブラックジャックの手を、返金に失敗しても掃除人に任せられるようにする(C3B-P2 の積み残し、P2)
+- status: todo
+- done-when: `/highlow` と `/duel` は「返金 → 成功したら盤面を閉じる」で、返金に失敗した盤面は残り、3 分後の掃除人が同じ額を返す(H&L の `AutoResolve` は手つかずの盤面ではポット = 賭け金のキャッシュアウト、duel の時間切れは `DeclineDuel`)。**ブラックジャックだけは返金に失敗しても盤面を閉じる** — `AutoResolve` がスタンドなので、盤面を残すと**利用者が一度も見ていない手を掃除人が打ち、賭け金を失わせうる**。今は再起動の `RefundStaleEscrows` が全額返すまで、その利用者はカジノ系を一切遊べない。どちらが良いかは製品判断: (a) 現状維持(遅いが必ず全額戻る)、(b) 未送達の印を手に付け、掃除人はその手をスタンドせず返金する、(c) 掃除人に「未プレイの手は返金」の規則を入れる。親が (b)/(c) を選ぶなら `Session` に印を足す設計が要る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- paths: internal/commands/blackjack.go, internal/commands/blackjack_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go
+- notes: 危険地帯。C3B-P2 の 3 経路の唯一の不揃いで、そこだけコメントに理由を書いてある(`withdrawUndeliveredHand`)。資金が失われる穴ではない(再起動で全額戻る)ので P2。

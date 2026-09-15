@@ -407,23 +407,30 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
-	// Stake BEFORE the board (C2-06 の完了条件: EnsureCasinoAccess → OpenGame
-	// → Open). Store.OpenGame is the PERSISTED half of "one game per person",
-	// and it is the half that survives a restart, so it is the one that must
-	// refuse a second bet. The stake is marked with sessionID, which is the
-	// board that will be opened on the next line, so there is no instant at
-	// which some other caller — the idle sweeper included — could find a
-	// stake whose owner has not been decided yet.
-	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), sessionID, bet, now); err != nil {
-		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
-	}
-
 	game := c.newGame(bet)
 	board := snapshotHighLow(game) // safe without the lock: nobody can reach this board until Open publishes its ID
 
+	// The BOARD is taken FIRST and the chips move afterwards (C3B-P2). The
+	// board is memory only, so a refused open here costs nothing and leaves
+	// nothing to give back; staking first meant an open that then failed had
+	// to hand the chips back, and a refund that failed left an escrow no
+	// board could present and no sweep could find. Reversed, the state
+	// "chips are staked but no board holds them" cannot be built at all.
 	session, err := c.sessions.OpenWithID(sessionID, i.GuildID, userID, casino.GameHighLow, game, casino.MessageRef{ChannelID: i.ChannelID})
 	if err != nil {
-		c.refundUnplayableBoard(i.GuildID, userID, sessionID, bet) // the chips already moved: hand them straight back
+		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
+	}
+
+	// Store.OpenGame is still the PERSISTED half of "one game per person",
+	// and it is the half that survives a restart: an escrow left by a board
+	// the process lost refuses this bet even though the manager, whose map
+	// died with that process, does not. The stake is marked with sessionID —
+	// the board opened just above — so it names its own board from its very
+	// first write (設計書 C-3b).
+	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), sessionID, bet, now); err != nil {
+		// Nothing was staked (OpenGame persists nothing on an error), so the
+		// board is simply dropped: there is no refund to fail.
+		c.sessions.Close(sessionID)
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -438,14 +445,13 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 		// nothing will ever settle it: give the stake back now instead of
 		// leaving the account stuck "in a game" until the next restart.
 		//
-		// ONLY if Close says the session was still ours. Discord can create
-		// the message and still fail this call, and the board can then be
-		// played and settled while the error is in flight — at which point
-		// the escrow on the account belongs to whatever game came next, and
-		// refunding "our" bet would pay it out of somebody else's stake.
-		if c.sessions.Close(session.ID) {
-			c.refundUnplayableBoard(i.GuildID, userID, session.ID, bet)
-		}
+		// The refund goes FIRST and the board is closed only once it has
+		// landed — the same order /duel keeps, and the same rule as the open
+		// above: never take away the place that tracks the chips while the
+		// chips are still there. Closing first leaves a refused refund with
+		// no board, no button and no sweep to retry it, so the account is
+		// "in a game" until the next restart.
+		c.withdrawUndeliveredBoard(i.GuildID, userID, session.ID, bet)
 		return err
 	}
 
@@ -453,19 +459,39 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 	return nil
 }
 
-// refundUnplayableBoard returns a stake whose board never became playable.
-// Failing only means the chips stay in escrow until the next restart returns
-// them (RefundStaleEscrows), so it is logged rather than shown to the player,
-// who already has a refusal in front of them.
+// withdrawUndeliveredBoard gives back a stake whose board never reached the
+// player: there is nothing to press, so nothing will ever settle it.
 //
-// escrowID is the board the stake belongs to, which is the same ID from the
-// first write onwards (設計書 C-3b), so a refund can never hand back chips
-// that have meanwhile become another game's (casino.ErrEscrowMismatch
-// refuses that instead).
-func (c *HighLowCommand) refundUnplayableBoard(guildID, userID, escrowID string, bet int64) {
-	if _, err := c.store.SettleGame(guildID, userID, escrowID, bet); err != nil {
-		slog.Error("casino: refunding an undelivered high&low board failed", "error", redactInteractionError(err))
+// It runs where every press runs — inside the SAME per-board lock, under the
+// manager's own Hold — because it is a second presser of a live board:
+// Discord can create the message and still fail the call that sent it. A Hold
+// that fails means the board is already somebody else's (played out, swept,
+// closed), and this path must not hand back a stake that has already been
+// settled or that now belongs to the game which came after it.
+//
+// A refused refund leaves the board STANDING, which is what makes the idle
+// sweep three minutes on the retry: AutoResolve on an untouched high&low
+// board is a cash-out of a pot that still equals the bet, so the sweep hands
+// back exactly what this call could not. The player already has an error in
+// front of them, so the failure is logged rather than shown.
+func (c *HighLowCommand) withdrawUndeliveredBoard(guildID, userID, sessionID string, bet int64) {
+	lock := c.locks.acquire(sessionID)
+	defer c.locks.release(sessionID, lock)
+
+	if _, held := c.sessions.Hold(sessionID); !held {
+		return
 	}
+	defer c.sessions.Release(sessionID)
+
+	// escrowID is the board the stake belongs to, which is the same ID from
+	// the first write onwards (設計書 C-3b), so a refund can never hand back
+	// chips that have meanwhile become another game's (ErrEscrowMismatch
+	// refuses that instead).
+	if _, err := c.store.SettleGame(guildID, userID, sessionID, bet); err != nil {
+		slog.Error("casino: refunding an undelivered high&low board failed, the sweeper retries it", "error", redactInteractionError(err))
+		return
+	}
+	c.sessions.Close(sessionID)
 }
 
 // rememberBoardMessage fills in the session's MessageRef once Discord has
