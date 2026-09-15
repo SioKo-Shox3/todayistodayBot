@@ -576,14 +576,6 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - paths: internal/commands/duel.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel_test.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/casino_shared.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 危険地帯。**「資金を動かす前に、資金を追える場所を用意する」**が原則 — 預かりの印(C3B-13)と対になる。これで C-2 以来の「開始時の取り残し」の系統が閉じる。
 
-## C3B-21: 未送達のブラックジャックの手を、返金に失敗しても掃除人に任せられるようにする(C3B-P2 の積み残し、P2)
-- status: todo
-- done-when: `/highlow` と `/duel` は「返金 → 成功したら盤面を閉じる」で、返金に失敗した盤面は残り、3 分後の掃除人が同じ額を返す(H&L の `AutoResolve` は手つかずの盤面ではポット = 賭け金のキャッシュアウト、duel の時間切れは `DeclineDuel`)。**ブラックジャックだけは返金に失敗しても盤面を閉じる** — `AutoResolve` がスタンドなので、盤面を残すと**利用者が一度も見ていない手を掃除人が打ち、賭け金を失わせうる**。今は再起動の `RefundStaleEscrows` が全額返すまで、その利用者はカジノ系を一切遊べない。どちらが良いかは製品判断: (a) 現状維持(遅いが必ず全額戻る)、(b) 未送達の印を手に付け、掃除人はその手をスタンドせず返金する、(c) 掃除人に「未プレイの手は返金」の規則を入れる。親が (b)/(c) を選ぶなら `Session` に印を足す設計が要る。
-- verify: `go build ./... && go vet ./...`
-- verify: `go test ./internal/commands/... -count=1`
-- paths: internal/commands/blackjack.go, internal/commands/blackjack_test.go, internal/commands/casino_sessions.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go
-- notes: 危険地帯。C3B-P2 の 3 経路の唯一の不揃いで、そこだけコメントに理由を書いてある(`withdrawUndeliveredHand`)。資金が失われる穴ではない(再起動で全額戻る)ので P2。
-
 ## C3B-P3: 開始の間は掃除人を入れない/返金に失敗した盤面は閉じない(C3B-P2 の差し戻し)
 - status: todo
 - done-when: `NEXT_FINDINGS.md` の C3B-P2 差し戻し 2 件を閉じる。**この系統(預かりが取り残される)は今回で閉じきる** — 個別の窓を塞ぐのではなく、下の不変条件をコードとテストで固定する。
@@ -596,4 +588,5 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./internal/commands/... -count=1`
 - verify: `go test ./... -count=1`
 - paths: internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/casino_shared.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go
+- notes: 未送達 BJ の返金(旧 C3B-21)は本タスクの (2) に含まれるので、そちらへ統合済み。二重に実装しない。
 - notes: 危険地帯。**この不変条件を満たさない経路が 1 本でも残るなら、それを見つけて直すまでこのタスクは閉じない。** 3 ゲーム × (開始・受諾・辞退・時間切れ・未送達) の組み合わせを表にして、どの経路がどちらの側(a か b)かを進捗に書く。
