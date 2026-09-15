@@ -520,7 +520,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: **嘘を書かない** — 「必ず一度だけ」とは書かず、再送されうる条件をそのまま書く(C-3a の「精算失敗は手動再試行だけが出口」と同じ扱い)。
 
 ## C3B-17: スロットの配当も上限で切り詰める(C3B-12 で見つけた最後の不揃い、P2)
-- status: todo
+- status: done
 - done-when: C3B-12 で他の精算経路を確認した結果、`Store.Spin`(`store.go` の `creditChipsLocked(account, result.Payout)`)だけが**上限で拒否する**形のまま残っている。設計書 §2 は「上限で入り切らない分は捨てる(**スロット等の配当と同じ**)」と書いており、スロットこそがその例として名指しされているのに実装が唯一の例外になっている。`SettleGame` と同じく `creditChipsCappedLocked` に変え、`SeasonNet` は入った額で数え、`SpinResult` に入った額と払うはずだった額の両方を残す。**ジャックポットは別の判断が要る** — 当たりで `economy.Jackpot = JackpotSeed` と一緒にリセットされるので、上限で入り切らない分をそのまま捨てるとプールの分まで消える。宝くじ(`drawLotteryLocked`)は溢れた分をプールへ戻しており、こちらも同じ形にできるか実装者が決めて理由を進捗に書く。回帰テスト: `MaxChips` 近くの口座がスロットを回すと拒否ではなく入る分だけ入る / `SeasonNet` が入った額で動く / 通常範囲の既存の期待値が 1 つも変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
@@ -546,3 +546,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/announce.go, internal/casino/announce_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
 - notes: 契約は変えない — `at-least-once` のまま。減らすのは重複の頻度だけで、設計書 §4 と `blocked/C3B-07.md` の「重複しないとは書かない」はそのまま生きる。
+
+## C3B-20: 上限で切り詰められたジャックポットを「獲得」と書かない(C3B-17 で開いた表示の穴、P3)
+- status: todo
+- done-when: C3B-17 で `Store.Spin` が入り切る分だけ入れるようになった結果、`SpinResult.JackpotWon` は**払うはずだった額**(火を噴いたプール)であって受け取った額ではなくなった。`slotJackpotLine` の `🎰 JACKPOT!! +%d チップ` と `slotCelebrationMessage` の `ジャックポット %d チップ 獲得!!` は今もその額を印字するので、`MaxChips` 手前の口座が 7️⃣7️⃣7️⃣ を引くと結果行の「40枚 獲得」と祝いの「5,000 チップ 獲得」が食い違う。`SpinResult.Payout` と `Owed` の差(= 上限で入らなかった額)を使って、切り詰められたときだけ実際に入った額を書くか一言添える形にする。回帰テスト: 上限手前の 7️⃣7️⃣7️⃣ の 2 つの文字列が結果行と食い違わない / 通常範囲の文面が 1 文字も変わらない。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/slot.go, internal/commands/slot_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
+- notes: 金額そのものは正しく動いている(入った額は `Payout`、溢れたプールはプールへ戻る)ので表示だけの話。`JackpotWon` の意味は変えない — プールが火を噴いた事実は祝いの条件として要る。

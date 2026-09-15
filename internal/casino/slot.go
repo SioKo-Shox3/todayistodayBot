@@ -68,12 +68,18 @@ const (
 // SpinResult is Spin's outcome — exported because internal/commands/slot.go
 // (a different package) renders it into the Discord response.
 type SpinResult struct {
-	Reels     [3]SlotSymbol
-	Bet       int64
-	Payout    int64 // total chips credited back (jackpot included); 0 on a loss
-	IsJackpot bool  // true iff Reels is 💎💎💎 or 7️⃣7️⃣7️⃣ — triggers the public celebration message
+	Reels [3]SlotSymbol
+	Bet   int64
+	// Payout is what actually reached the account (jackpot included); 0 on a
+	// loss. Owed is what the table said to pay. The two differ only when
+	// MaxChips had no room for all of it — Store.Spin credits what fits and
+	// does not fail — so renderers and 純利 use Payout, the same split
+	// SettleResult makes.
+	Payout    int64
+	Owed      int64
+	IsJackpot bool // true iff Reels is 💎💎💎 or 7️⃣7️⃣7️⃣ — triggers the public celebration message
 	// JackpotWon is the pool paid out on top of the table payout, 0 when the
-	// pool did not fire. It is a COMPONENT of Payout, not an extra amount to
+	// pool did not fire. It is a COMPONENT of Owed, not an extra amount to
 	// credit — a renderer that adds it to Payout double-counts it.
 	JackpotWon int64
 	// JackpotPool is the pool AFTER this spin: the post-reset JackpotSeed on a
@@ -102,10 +108,15 @@ func drawSymbol(rng randSource) SlotSymbol {
 // fill in: everything here depends only on the reels and the bet.
 func spin(bet int64, rng randSource) SpinResult {
 	reels := [3]SlotSymbol{drawSymbol(rng), drawSymbol(rng), drawSymbol(rng)}
+	payout := payoutFor(reels, bet)
+	// Payout and Owed start out equal: nothing has been credited yet, so the
+	// table figure is both. Store.Spin adds the pool to Owed and then
+	// overwrites Payout with what the cap let through.
 	return SpinResult{
 		Reels:     reels,
 		Bet:       bet,
-		Payout:    payoutFor(reels, bet),
+		Payout:    payout,
+		Owed:      payout,
 		IsJackpot: reels == diamondReels || reels == jackpotReels,
 	}
 }

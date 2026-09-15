@@ -1788,20 +1788,112 @@ func TestStore_Spin_BetAtRangeBoundaries_Accepted(t *testing.T) {
 	}
 }
 
-func TestStore_Spin_ChipCapExceeded_NoMutation(t *testing.T) {
+// TestStore_Spin_WinAtTheCapTakesWhatFitsAndSeasonNetCountsThat is the
+// regression for 設計書 C-3b §2's「上限で入り切らない分は捨てる(スロット等の
+// 配当と同じ)」: the slot payout is the example the rule names, so a win that
+// MaxChips cannot hold must land partially, NOT be refused. Spin used to
+// return ErrChipCapExceeded here and roll the whole spin back.
+func TestStore_Spin_WinAtTheCapTakesWhatFitsAndSeasonNetCountsThat(t *testing.T) {
 	st, path := newTempStore(t)
-	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: MaxChips})
-	// 🍒🍒🍒 on a 10 bet pays 70, so the post-bet balance MaxChips-10 plus 70
-	// breaks the cap and the whole transaction must roll back.
+	// 🍒🍒🍒 on a 10 bet pays 70. The bet leaves MaxChips-40, so 40 of the 70
+	// fit and 30 are dropped.
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: MaxChips - 30})
 	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolCherry)}}
 
-	if _, err := st.Spin("guild1", "user-1", 10); !errors.Is(err, ErrChipCapExceeded) {
-		t.Fatalf("Spin = %v, want ErrChipCapExceeded", err)
+	result, err := st.Spin("guild1", "user-1", 10)
+	if err != nil {
+		t.Fatalf("Spin returned %v, want no error — the cap is a property of where the chips go, not a reason to refuse the spin", err)
+	}
+	if result.Owed != 70 {
+		t.Fatalf("result.Owed = %d, want 70 (the table figure survives for the caller)", result.Owed)
+	}
+	if result.Payout != 40 {
+		t.Fatalf("result.Payout = %d, want 40 — Payout is what actually landed", result.Payout)
 	}
 
 	account := readAccount(t, path, "guild1", "user-1")
 	if account.Chips != MaxChips {
-		t.Fatalf("persisted Chips = %d, want %d — a capped-out win must not eat the bet either", account.Chips, MaxChips)
+		t.Fatalf("persisted Chips = %d, want %d (filled to the cap, not left at MaxChips-30)", account.Chips, MaxChips)
+	}
+	if account.SeasonNet != 30 {
+		t.Fatalf("persisted SeasonNet = %d, want 30 (credited 40 − bet 10), not 60 — 設計書 C-3b §3 counts 実際に口座へ入った額", account.SeasonNet)
+	}
+}
+
+// TestStore_Spin_JackpotAtTheCapReturnsTheUndeliveredPoolToThePool pins the
+// decision the capped credit forced: the pool is RESET on 7️⃣7️⃣7️⃣, so a
+// winner with no room would take the players' accrued contributions out of
+// existence. What the winner could not hold goes back to the pool, exactly
+// as drawLotteryLocked sends its own remainder there.
+func TestStore_Spin_JackpotAtTheCapReturnsTheUndeliveredPoolToThePool(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: MaxChips - 30})
+	seedJackpotPool(t, st, "guild1", 5000)
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolSeven)}}
+
+	// 7️⃣7️⃣7️⃣ on a 10 bet pays 10×196 = 1,960 at the table plus the 5,000
+	// pool; the bet leaves room for only 40 of the 6,960.
+	result, err := st.Spin("guild1", "user-1", 10)
+	if err != nil {
+		t.Fatalf("Spin returned %v, want no error", err)
+	}
+	if result.Owed != 1960+5000 {
+		t.Fatalf("result.Owed = %d, want %d (table + pool)", result.Owed, 1960+5000)
+	}
+	if result.Payout != 40 {
+		t.Fatalf("result.Payout = %d, want 40", result.Payout)
+	}
+
+	// Not one chip of the pool reached the account, so the whole 5,000 is
+	// back on top of the fresh seed. Dropping it would have destroyed chips
+	// the buyers' contributions really accrued.
+	wantPool := JackpotSeed + 5000
+	if got := readGuild(t, path, "guild1").Jackpot; got != wantPool {
+		t.Fatalf("persisted Jackpot = %d, want %d (seed + the undelivered pool)", got, wantPool)
+	}
+	if result.JackpotPool != wantPool {
+		t.Fatalf("result.JackpotPool = %d, want %d — the player must be shown the pool the next spin plays for", result.JackpotPool, wantPool)
+	}
+}
+
+// TestStore_Spin_JackpotPartlyFits_ReturnsOnlyTheShareThatMissedTheAccount is
+// the other half: the table payout is credited FIRST (SpinResult.JackpotWon
+// documents the pool as paid on top of it), so the pool's share of the
+// shortfall is min(shortfall, JackpotWon) — returning the whole shortfall
+// would mint table chips into the pool.
+func TestStore_Spin_JackpotPartlyFits_ReturnsOnlyTheShareThatMissedTheAccount(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, "guild1", "user-1", UserAccount{Chips: MaxChips - 1990})
+	seedJackpotPool(t, st, "guild1", 5000)
+	st.rng = &scriptedIntn{t: t, intns: []int{symbolDraw(t, SymbolSeven)}}
+
+	// The bet leaves room for 2,000: the whole 1,960 table payout plus 40 of
+	// the pool. The pool therefore gets 5,000-40 back, not the full 4,960+1,960.
+	result, err := st.Spin("guild1", "user-1", 10)
+	if err != nil {
+		t.Fatalf("Spin returned %v, want no error", err)
+	}
+	if result.Payout != 2000 {
+		t.Fatalf("result.Payout = %d, want 2000", result.Payout)
+	}
+	wantPool := JackpotSeed + 4960
+	if got := readGuild(t, path, "guild1").Jackpot; got != wantPool {
+		t.Fatalf("persisted Jackpot = %d, want %d (seed + the 4,960 of the pool that missed the account)", got, wantPool)
+	}
+	if account := readAccount(t, path, "guild1", "user-1"); account.SeasonNet != 1990 {
+		t.Fatalf("persisted SeasonNet = %d, want 1990 (credited 2000 − bet 10)", account.SeasonNet)
+	}
+}
+
+// seedJackpotPool sets guildID's pool directly, the way a guild that has been
+// spinning for a while would have grown it.
+func seedJackpotPool(t *testing.T, st *Store, guildID string, pool int64) {
+	t.Helper()
+	if err := st.Update(func(d *Data) error {
+		ensureGuildLocked(d, guildID).Jackpot = pool
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding the jackpot pool: %v", err)
 	}
 }
 

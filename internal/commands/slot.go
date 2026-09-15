@@ -108,8 +108,10 @@ func translateSlotError(err error) string {
 		return fmt.Sprintf("❌ チップが足りません(現在: %d枚)", insufficientChips.Balance)
 	case errors.Is(err, casino.ErrBetOutOfRange):
 		return "❌ ベットは10〜1,000チップです" // 設計書と完全一致させる
-	case errors.Is(err, casino.ErrChipCapExceeded):
-		return "❌ チップ残高が上限に達しているため回せません。"
+	// There is deliberately no ErrChipCapExceeded arm: Store.Spin no longer
+	// refuses a win that MaxChips cannot hold, it credits what fits (設計書
+	// C-3b §2). A cap message here would be dead code claiming the spin did
+	// not happen.
 	default:
 		slog.Error("casino: spin failed", "error", redactInteractionError(err))
 		return "❌ スロットの実行に失敗しました。"

@@ -1039,8 +1039,27 @@ func accrueJackpotLocked(economy *GuildEconomy, bet int64) {
 // *rand.Rand is not safe for concurrent use. Does NOT perform the reveal
 // animation (internal/commands/slot.go's job). Returns ErrBetOutOfRange
 // (defense in depth — the command layer's option bounds are a UX nicety, not
-// a guarantee), *ErrInsufficientChips, or ErrChipCapExceeded — in every error
-// case nothing at all is persisted, so the bet is never silently eaten.
+// a guarantee) or *ErrInsufficientChips — in every error case nothing at all
+// is persisted, so the bet is never silently eaten.
+//
+// A payout that does not fit under MaxChips is NOT an error, for the same
+// reason it is not one in SettleGame: 設計書 C-3b §2 names the slot payout as
+// THE example of「上限で入り切らない分は捨てる」, so refusing it made the one
+// path the rule was written about its only exception. The credit goes through
+// creditChipsCappedLocked, SpinResult.Payout is what actually landed and
+// SpinResult.Owed what the table (pool included) said to pay.
+//
+// The dropped remainder is not simply destroyed, because part of it can be
+// POOL money: on 7️⃣7️⃣7️⃣ the pool is reset to JackpotSeed, so a winner at the
+// cap would take the pool's chips out of existence — chips that players'
+// contributions had really accrued, unlike the table payout, which the house
+// mints at the moment it is credited and which therefore costs nothing to
+// leave uncreated. So the shortfall is settled the way drawLotteryLocked
+// settles its own: the part attributable to the pool goes BACK to the pool
+// (creditJackpotCappedLocked), the table part is dropped per 設計書. The
+// table payout is credited first — SpinResult.JackpotWon documents the pool
+// as paid「on top of」it — which is what makes the pool's share of the
+// shortfall min(shortfall, JackpotWon).
 func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 	if bet < 10 || bet > 1000 {
 		return SpinResult{}, ErrBetOutOfRange
@@ -1061,14 +1080,24 @@ func (s *Store) Spin(guildID, userID string, bet int64) (SpinResult, error) {
 			result.Payout += economy.Jackpot
 			economy.Jackpot = JackpotSeed
 		}
-		result.JackpotPool = economy.Jackpot
-		if err := creditChipsLocked(account, result.Payout); err != nil {
-			return err // aborts: the deduction AND the accrual above are discarded with the transaction
+		result.Owed = result.Payout
+		// The bet is already out of Chips at this point, so the headroom the
+		// credit measures is the one the spin itself left behind: a player at
+		// the cap who bets 10 and wins 70 takes 10 of them back, exactly like
+		// SettleGame releasing the escrow before it credits.
+		result.Payout = creditChipsCappedLocked(account, result.Owed)
+		if short := result.Owed - result.Payout; short > 0 && result.JackpotWon > 0 {
+			if short > result.JackpotWon {
+				short = result.JackpotWon
+			}
+			creditJackpotCappedLocked(economy, short)
 		}
-		// The 純利 is booked only after the credit has actually landed.
-		// creditChipsLocked is all-or-nothing, so on the path that reaches
-		// here the credited amount IS result.Payout — 設計書 C-3b §3's
-		// "実際に口座へ入った額" and the owed amount coincide for the slot.
+		// AFTER the return above, so the pool the player is shown is the pool
+		// the next spin will play for.
+		result.JackpotPool = economy.Jackpot
+		// The 純利 is booked from what actually landed, not from what was owed
+		// — 設計書 C-3b §3's「実際に口座へ入った額」. The two differ only at
+		// the cap; below it result.Payout IS the table payout as before.
 		addSeasonNetLocked(account, result.Payout-bet)
 		return nil
 	})
