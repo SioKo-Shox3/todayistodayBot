@@ -590,3 +590,17 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - paths: internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/casino_shared.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 未送達 BJ の返金(旧 C3B-21)は本タスクの (2) に含まれるので、そちらへ統合済み。二重に実装しない。
 - notes: 危険地帯。**この不変条件を満たさない経路が 1 本でも残るなら、それを見つけて直すまでこのタスクは閉じない。** 3 ゲーム × (開始・受諾・辞退・時間切れ・未送達) の組み合わせを表にして、どの経路がどちらの側(a か b)かを進捗に書く。
+
+## C3B-P4: 盤面を閉じる入口を 1 か所に絞り、預かりが残る盤面は閉じられなくする
+- status: todo
+- done-when: 預かりが取り残される欠陥が**同じ型で 5 回**見つかっている(開始の順序 → 未送達の後始末 → 印の紐付け → 未送達 BJ → 配札時決着の BJ)。毎回「名指しした経路」は直るが名指ししなかった兄弟が残るので、**監査ではなく構造で閉じる**。
+  (1) `internal/commands` に**唯一の入口** `closeBoardIfSettled(ctx, sessionID, userID string) error` を作る: 口座を読み、**その口座の預かりの印がこの `sessionID` を指している間は閉じない**(警告を出して盤面を残し、掃除人の再試行に任せる)。印が別の盤面を指しているか、預かりが無いときだけ `sessions.Close` を呼ぶ。
+  (2) `internal/commands/*.go`(テストを除く)から `sessions.Close(` の直接呼び出しを**全て**この入口へ置き換える(現在 10 か所: `blackjack.go` 396/430/481、`duel.go` 503/557/649/656/676、ほか)。「何も預けていないので返金は要らない」経路も、判定を入口に任せる形に揃える。
+  (3) **ソース走査テスト**を足す: `internal/commands` の非テストファイルを読み、`sessions.Close(` / `.Close(sessionID)` に相当する呼び出しが `closeBoardIfSettled` の実装ファイル以外に現れたら落ちる(`go:embed` は使わず `os.ReadDir` + `os.ReadFile` で十分)。これで**新しい経路が増えても同じ穴が開かない**。
+  (4) 今回の再現(配札でナチュラル → `SettleGame` と初回応答を両方失敗 → 復旧して掃除)で預かりが戻ることを回帰テストにする。3 ゲーム × (開始・受諾・辞退・決着・未送達・時間切れ)の経路表を `PROGRESS.md` に書き、**どの経路も (a) 資金が動いていない か (b) 印が付いていて回収できる のどちらかである**ことを示す。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/blackjack.go, internal/commands/highlow.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/blackjack_test.go, internal/commands/highlow_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/casino/store.go, internal/casino/store_test.go
+- notes: 危険地帯。**「まだ遊べる盤面だけ」のような限定を入れない** — 入口の判定は「預かりの印がこの盤面を指しているか」だけで、ゲームの状態を見ない。印を読むための読み取りメソッドが `casino.Store` に無ければ足す(`Update` ではなく `Snapshot` 相当の軽い読み取りでよい)。
