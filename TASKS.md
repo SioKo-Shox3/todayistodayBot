@@ -525,7 +525,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/casino/... -count=1`
 - verify: `go test ./... -count=1`
-- paths: internal/casino/store.go, internal/casino/store_test.go, internal/commands/slot.go, internal/commands/slot_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
+- paths: internal/casino/store.go, internal/casino/store_test.go, internal/commands/slot.go, internal/commands/slot_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, internal/casino/slot.go
 - notes: `SettleGame` と違い**行き詰まりはしない**(取引ごと巻き戻るので賭け金は戻り、預かりも残らない)ので P1 ではない。`slot.go` の `ErrChipCapExceeded` の分岐は変更後に到達不能になるので一緒に消す。`ClaimDaily` と両替は精算ではない(進行中のものが無く、拒否しても利用者は元手を保ったまま)ので厳格なままでよい — 揃えない。
 
 ## C3B-18: 預かりの印を開始前に確定させ、掃除人が印の不一致で盤面を落とさない(C3B-13 の差し戻し)
