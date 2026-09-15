@@ -179,7 +179,7 @@ func TestStartAnnounceScheduler_WaitBlocksUntilCallbackFinishes(t *testing.T) {
 		t.Errorf("no lottery was drawn, so no celebration must be posted; got %q to %q", content, channelID)
 		return nil
 	}
-	wait := startAnnounceScheduler(ctx, store, send, sendText, now, sleep)
+	wait := startAnnounceScheduler(ctx, store, send, sendText, now, sleep, instantMarkRetry)
 	waitDone := make(chan struct{})
 	go func() { wait(); close(waitDone) }()
 
@@ -366,7 +366,7 @@ func runOneAnnouncePass(t *testing.T, store *casino.Store, at time.Time) (embeds
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startAnnounceScheduler(ctx, store, send, sendText, now, sleep)()
+	startAnnounceScheduler(ctx, store, send, sendText, now, sleep, instantMarkRetry)()
 	return embeds, texts, channels
 }
 
@@ -459,7 +459,7 @@ func TestStartAnnounceScheduler_CelebrationFailureStillMarksTheDayAnnounced(t *t
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startAnnounceScheduler(ctx, store, send, sendText, now, sleep)()
+	startAnnounceScheduler(ctx, store, send, sendText, now, sleep, instantMarkRetry)()
 	if embeds != 1 || attempts != 1 {
 		t.Fatalf("first pass: %d embeds / %d celebration attempts, want 1/1", embeds, attempts)
 	}
@@ -467,7 +467,7 @@ func TestStartAnnounceScheduler_CelebrationFailureStillMarksTheDayAnnounced(t *t
 	// A second pass on the same day must find the guild already announced.
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	startAnnounceScheduler(ctx2, store, send, sendText, now, sleep)()
+	startAnnounceScheduler(ctx2, store, send, sendText, now, sleep, instantMarkRetry)()
 	if embeds != 1 {
 		t.Fatalf("the failed celebration re-opened the day: %d embeds posted in total, want 1", embeds)
 	}
@@ -772,7 +772,7 @@ func TestStartAnnounceScheduler_AFailedSeasonResultIsSentAgainNextPass(t *testin
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		startAnnounceScheduler(ctx, store, send, sendText,
-			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, instantMarkRetry)()
 	}
 
 	day1 := announceAt10()
@@ -826,7 +826,7 @@ func TestStartAnnounceScheduler_AFailedSeasonResultSurvivesTheMonthBoundary(t *t
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		startAnnounceScheduler(ctx, store, send, sendText,
-			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, instantMarkRetry)()
 	}
 
 	jst := time.FixedZone("JST", 9*3600)
@@ -939,7 +939,7 @@ func TestStartAnnounceScheduler_AFailedSeasonDoesNotRetireTheOnesBeforeIt(t *tes
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		startAnnounceScheduler(ctx, store, send, sendText,
-			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, instantMarkRetry)()
 	}
 
 	day1 := announceAt10()
@@ -987,7 +987,7 @@ func TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay(t *tes
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		startAnnounceScheduler(ctx, store, send, sendText,
-			func() time.Time { return at }, func(context.Context, time.Time) bool { return false })()
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, instantMarkRetry)()
 	}
 
 	tenAM := announceAt10()
@@ -1010,5 +1010,182 @@ func TestStartAnnounceScheduler_ResendsOnlyTheSeasonResultLaterTheSameDay(t *tes
 	pass(tenAM.Add(2 * time.Hour))
 	if embeds != 1 || len(texts) != 1 {
 		t.Fatalf("12:00 pass: %d embeds / %q results, want 1 embed and the one result", embeds, texts)
+	}
+}
+
+// instantMarkRetry is the tests' markRetryWaiter: it allows exactly the
+// number of retries production does, but does not wait, so no test sits on
+// a real timer. Tests that need to act BETWEEN two attempts bring their own.
+func instantMarkRetry(_ context.Context, attempt int) bool {
+	return attempt <= len(markSeasonRetryDelays)
+}
+
+// breakableStore is a casino store whose file can be made unwritable and
+// writable again from inside a test, which is how these tests fail
+// MarkSeasonAnnounced on demand.
+//
+// The seam is the path itself: a DIRECTORY sitting where casino.json
+// belongs makes readLocked's os.ReadFile fail on every OS (EISDIR on Linux,
+// "Access is denied." on Windows), so Update — and therefore
+// MarkSeasonAnnounced — returns an error without the file being touched.
+// Deleting the file instead would NOT work: a missing file is the
+// pre-first-command state, readLocked returns an empty Data for it and
+// writeLocked re-creates the directory, so the mark would SUCCEED against
+// an empty economy.
+type breakableStore struct {
+	t       *testing.T
+	store   *casino.Store
+	path    string
+	content string
+}
+
+func newBreakableStore(t *testing.T, content string) *breakableStore {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "casino.json")
+	b := &breakableStore{t: t, store: casino.New(path), path: path, content: content}
+	b.heal() // writes the seed for the first time
+	return b
+}
+
+// breakIt replaces the file with a directory: every later Update fails.
+func (b *breakableStore) breakIt() {
+	b.t.Helper()
+	if err := os.RemoveAll(b.path); err != nil {
+		b.t.Fatalf("removing the store file: %v", err)
+	}
+	if err := os.Mkdir(b.path, 0o755); err != nil {
+		b.t.Fatalf("putting a directory in the store's place: %v", err)
+	}
+}
+
+// heal puts the seed file back, so the NEXT Update succeeds. It restores the
+// seed rather than whatever was last written, which is accurate: a failed
+// Update leaves the file untouched, so the seed IS the last committed state.
+func (b *breakableStore) heal() {
+	b.t.Helper()
+	if err := os.RemoveAll(b.path); err != nil {
+		b.t.Fatalf("clearing the store's path: %v", err)
+	}
+	if err := os.WriteFile(b.path, []byte(b.content), 0o600); err != nil {
+		b.t.Fatalf("writing the seed file: %v", err)
+	}
+}
+
+// C3B-16: 記録が 1 回失敗 → 2 回目で成功すると再送されない。
+// The retry is what buys this: without it the first failure would leave the
+// month in the queue and the next pass would post the result — and re-ping
+// its podium — a second time.
+func TestStartAnnounceScheduler_ARetriedMarkKeepsTheResultFromBeingPostedTwice(t *testing.T) {
+	b := newBreakableStore(t, closedJuneSeasonFile)
+	logs := captureSlogOutput(t)
+
+	var embeds int
+	var texts []string
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { embeds++; return nil }
+	// The send lands, and the store goes unwritable right behind it: this is
+	// exactly the window the task is about — posted, not yet recorded.
+	sendText := func(channelID, content string) error {
+		texts = append(texts, content)
+		b.breakIt()
+		return nil
+	}
+	waits := 0
+	// Heal inside the gap, so attempt 1 fails and attempt 2 succeeds.
+	retry := func(_ context.Context, attempt int) bool {
+		waits++
+		b.heal()
+		return attempt <= len(markSeasonRetryDelays)
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, b.store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, retry)()
+	}
+
+	day1 := announceAt10()
+	pass(day1)
+	if len(texts) != 1 || !strings.Contains(texts[0], "2026-06") {
+		t.Fatalf("first pass delivered %q, want the June result", texts)
+	}
+	if waits != 1 {
+		t.Fatalf("the mark was retried after %d gaps, want exactly 1 (fail once, then succeed)", waits)
+	}
+
+	// The mark went through on the retry, so the result is no longer owed.
+	pass(day1.AddDate(0, 0, 1))
+	if len(texts) != 1 {
+		t.Fatalf("the June result was posted again: %q — the retried mark did not stick", texts)
+	}
+	if strings.Contains(logs.String(), "could not be recorded") {
+		t.Errorf("a recovered mark logged the at-least-once warning:\n%s", logs.String())
+	}
+}
+
+// C3B-16: 3 回とも失敗すると警告が出て(再送はされうる)、次の巡回で記録が
+// 成功すれば以後は再送されない。
+//
+// 嘘を書かないための回帰: the contract is at-least-once, and this pins the
+// "at least" half — the duplicate is asserted, not hidden. What the retry
+// buys is that it takes THREE failures to get here, and what the warning
+// buys is that the duplicate is explained in the log before it reaches the
+// channel.
+func TestStartAnnounceScheduler_AnUnrecordedResultWarnsAndIsPostedAgain(t *testing.T) {
+	b := newBreakableStore(t, closedJuneSeasonFile)
+	logs := captureSlogOutput(t)
+
+	var texts []string
+	send := func(channelID string, embed *discordgo.MessageEmbed) error { return nil }
+	broken := true
+	sendText := func(channelID, content string) error {
+		texts = append(texts, content)
+		if broken {
+			b.breakIt()
+		}
+		return nil
+	}
+	waits := 0
+	retry := func(_ context.Context, attempt int) bool {
+		if attempt > len(markSeasonRetryDelays) {
+			return false // out of attempts — this call is the refusal, not a gap
+		}
+		waits++ // no healing: every attempt fails
+		return true
+	}
+	pass := func(at time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startAnnounceScheduler(ctx, b.store, send, sendText,
+			func() time.Time { return at }, func(context.Context, time.Time) bool { return false }, retry)()
+	}
+
+	day1 := announceAt10()
+	pass(day1)
+	if len(texts) != 1 {
+		t.Fatalf("first pass delivered %q, want the June result once", texts)
+	}
+	if waits != len(markSeasonRetryDelays) {
+		t.Fatalf("the mark was retried after %d gaps, want %d (three attempts in total)", waits, len(markSeasonRetryDelays))
+	}
+	if got := logs.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "could not be recorded") {
+		t.Fatalf("no at-least-once warning for a sent-but-unrecorded result:\n%s", got)
+	}
+
+	// The next morning, with the store writable again: the result IS posted
+	// a second time — that is the admitted cost, not a defect.
+	broken = false
+	b.heal()
+	pass(day1.AddDate(0, 0, 1))
+	if len(texts) != 2 {
+		t.Fatalf("second pass delivered %q, want the June result again (at-least-once)", texts)
+	}
+
+	// And now that the mark landed, it stops. A contract that re-posted
+	// forever would not be at-least-once, it would be broken.
+	pass(day1.AddDate(0, 0, 2))
+	if len(texts) != 2 {
+		t.Fatalf("third pass delivered %q, want no further copy once the mark succeeded", texts)
 	}
 }

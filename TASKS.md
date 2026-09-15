@@ -511,7 +511,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 受け手が「口座を持っていない」場合は進行中ではない(拒否しない)。
 
 ## C3B-16: 掲示済みの記録に失敗したときの再送を減らし、契約を明記する(blocking 5、P2)
-- status: todo
+- status: done
 - done-when: `casino_announce.go` 293 付近は結果の送信に成功した後の `MarkSeasonAnnounced` の失敗をログに残して続行するため、**送信済みなのに未送信として次の巡回で再送**される(メンション付きの結果が二度出る)。親の決定(2026-09-15): 完全な一度きりは二相コミットが要るので狙わない — **(a) 記録を短い間隔で数回(3 回まで)再試行し、(b) それでも失敗したら「送信済みだが記録できなかった」ことを警告としてログに残し、(c) 契約を `at-least-once`(記録に失敗した回は再送されうる)として設計書 §4 と `blocked/C3B-07.md` に明記する**。同じ形の記録(`MarkAnnounced`・宝くじの待ち行列)にも同じ再試行を入れるかは実装者が判断し、入れないなら理由を進捗に書く。回帰テスト: 記録が 1 回失敗 → 2 回目で成功すると再送されない / 3 回とも失敗すると警告が出て(再送はされうる)、次の巡回で記録が成功すれば以後は再送されない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`
@@ -537,3 +537,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/commands/casino_shared.go
 - notes: 危険地帯。**差し戻しに置いたままだと 2 回続けて飛ばされたので、タスクにした。** 閉じたら `NEXT_FINDINGS.md` の当該節を消す。
+
+## C3B-18: 日次掲示の記録(`MarkAnnounced`)にも同じ再試行を入れる(C3B-16 の積み残し、P2)
+- status: todo
+- done-when: C3B-16 は `MarkSeasonAnnounced` の失敗に 3 回までの再試行と「送信済みだが記録できなかった」警告を入れたが、`MarkAnnounced`(`internal/casino/announce.go` の `runAnnouncePass`)は `slog.Error` を残して続行するだけのまま。**穴の形も重さも同じ** — `MarkAnnounced` は宝くじの待ち行列も同時に retire するので、記録が書けないと次の巡回で embed と**当選者へのメンション**が両方もう一度出る。C3B-16 で入れなかったのは設計上の理由ではなく、呼び出しが `internal/casino` 側にあって `paths:` の外だったからだけ。`markSeasonAnnouncedWithRetry` と同じ形(3 回・短い間隔・最後は `slog.Warn` で at-least-once を名指し)を `runAnnouncePass` にも入れる。再試行の待ちは `RunAnnounceScheduler` が既に受け取っている `SleepFunc` とは**別の口**にする(9 時までの待ちと再試行の待ちを同じ関数で表すと、テストの stub がどちらを止めているのか区別できない — C3B-16 で `markRetryWaiter` を別の引数にしたのと同じ理由)。回帰テスト: 記録が 1 回失敗 → 2 回目で成功すると embed も当選祝いも再送されない / 3 回とも失敗すると警告が出る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/announce.go, internal/casino/announce_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md, blocked/C3B-07.md
+- notes: 契約は変えない — `at-least-once` のまま。減らすのは重複の頻度だけで、設計書 §4 と `blocked/C3B-07.md` の「重複しないとは書かない」はそのまま生きる。

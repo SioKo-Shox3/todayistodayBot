@@ -224,7 +224,65 @@ func lotteryAnnounceCelebration(draw *casino.LotteryDraw) string {
 // sendText is the second, plain-text sender the lottery celebration needs.
 // It is a separate parameter rather than a second call on one sender
 // because the two have opposite failure semantics, encoded below.
-func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(channelID string, embed *discordgo.MessageEmbed) error, sendText func(channelID, content string) error, now func() time.Time, sleep casino.SleepFunc) (wait func()) {
+// markRetryWaiter blocks before the retry that follows a failed
+// MarkSeasonAnnounced and reports whether that retry should be made.
+// `attempt` is how many tries have already failed (1 after the first).
+// Returning false means "stop trying" — a shutdown, or the attempts are
+// used up.
+//
+// It is injected for the same reason `now` and `sleep` are: a test must be
+// able to step the retries and to heal the store BETWEEN two attempts,
+// which racing a real timer cannot do deterministically.
+type markRetryWaiter func(ctx context.Context, attempt int) bool
+
+// markSeasonRetryDelays are the gaps before the 2nd and 3rd
+// MarkSeasonAnnounced attempts — three tries in total (親の決定 2026-09-15).
+// Short on purpose: this runs INSIDE the announce pass with the guild's
+// remaining results queued behind it, so the wait is only long enough for a
+// transient write failure (a file lock, a scanner holding the temp file) to
+// clear, not a backoff that holds the pass.
+var markSeasonRetryDelays = []time.Duration{50 * time.Millisecond, 150 * time.Millisecond}
+
+// realMarkRetryWait is the production markRetryWaiter — a real, cancellable
+// timer wait over markSeasonRetryDelays.
+func realMarkRetryWait(ctx context.Context, attempt int) bool {
+	if attempt < 1 || attempt > len(markSeasonRetryDelays) {
+		return false // out of attempts
+	}
+	timer := time.NewTimer(markSeasonRetryDelays[attempt-1])
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// markSeasonAnnouncedWithRetry records the month as posted, retrying a
+// failure while `wait` allows it, and returns the LAST error if every try
+// failed.
+//
+// Retrying narrows the duplicate window; it does not close it. The send and
+// the mark are two separate operations with no transaction across them, so
+// a process that dies between them — or a store that stays unwritable —
+// still leaves a result that went out but is not recorded, and the next
+// pass posts it again. That is the contract (設計書 C-3b §4 掲示:
+// at-least-once), not a bug this function hides. Closing it for real needs
+// a two-phase commit, which 親の決定 (2026-09-15) deliberately does not buy.
+func markSeasonAnnouncedWithRetry(ctx context.Context, st *casino.Store, guildID, month string, wait markRetryWaiter) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		if err = st.MarkSeasonAnnounced(guildID, month); err == nil {
+			return nil
+		}
+		if !wait(ctx, attempt) {
+			return err
+		}
+	}
+}
+
+func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(channelID string, embed *discordgo.MessageEmbed) error, sendText func(channelID, content string) error, now func() time.Time, sleep casino.SleepFunc, retryWait markRetryWaiter) (wait func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -290,8 +348,20 @@ func startAnnounceScheduler(ctx context.Context, st *casino.Store, send func(cha
 						return nil // the embed is up; leave the rest for the next pass
 					}
 				}
-				if err := st.MarkSeasonAnnounced(job.GuildID, closed.Month); err != nil {
-					slog.Error("casino: MarkSeasonAnnounced failed", "guild_id", job.GuildID, "error", err)
+				// Retried a few times before giving up: the message is
+				// already out, so an unrecorded mark costs the channel a
+				// DUPLICATE result with its @mentions, and a write that
+				// failed once (a momentary file lock) usually succeeds
+				// milliseconds later.
+				if err := markSeasonAnnouncedWithRetry(ctx, st, job.GuildID, closed.Month, retryWait); err != nil {
+					// Not an Error: nothing was lost. The result reached the
+					// channel; what failed is the note that it did. The cost
+					// is a second copy on a later pass, which is what the
+					// at-least-once contract admits to — say that in the log
+					// rather than leaving a bare "MarkSeasonAnnounced failed"
+					// for someone to work out from the duplicate.
+					slog.Warn("casino: season result was SENT but could not be recorded; a later pass may post it again (at-least-once, 設計書 C-3b §4)",
+						"guild_id", job.GuildID, "month", closed.Month, "attempts", len(markSeasonRetryDelays)+1, "error", err)
 				}
 			}
 			return nil
@@ -331,5 +401,5 @@ func StartCasinoAnnounceScheduler(ctx context.Context, s *discordgo.Session) (wa
 			return errors.New(redactInteractionError(err)) // same redaction, same reason
 		}
 		return nil
-	}, time.Now, casino.RealSleepUntil)
+	}, time.Now, casino.RealSleepUntil, realMarkRetryWait)
 }
