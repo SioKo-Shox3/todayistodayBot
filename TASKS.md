@@ -635,3 +635,12 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/session.go, internal/casino/session_test.go, internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go
 - notes: 危険地帯。**扉が 2 つあるうちは塞ぎ続けても終わらない** — この系統は「盤面を消せる場所が 1 つしかない」状態にして閉じる。`WithSession` の戻り値を変えると呼び出し側が全部コンパイルエラーになるので、移行漏れはコンパイラが教える(それも狙いのうち)。
+
+## C3B-X2: 「返金待ち」の盤面を押したときの案内を実態に合わせる
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の C3B-P5 差し戻し(拒否時の案内)を閉じる。返金待ち(`ErrRefundPending`)の盤面を押すと、既存の `casinoSettleFailedMessage`(「❌ 精算に失敗しました。もう一度お試しください。」= **利用者に手動の再試行を促す**文言)が返るが、実際には掃除人が返金を再試行するので、押しても何も起きない。**返金待ち専用の共有文言**(例「⏳ この盤面は返金の再試行を待っています。完了すると自動でチップが戻ります。」)を `casino_shared.go` に定義し、H&L・BJ・duel の拒否応答と `ErrRefundPending` の変換に使う。既存の回帰テストも待機案内を検査する形に直す。**嘘を書かない** — 待てば戻ることが本当なので、そう書く(C-3a の「手動再試行だけが出口」の逆のケース)。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/commands/casino_shared.go, internal/commands/casino_shared_test.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go
+- notes: 文言だけで、資金の経路は変えない。
