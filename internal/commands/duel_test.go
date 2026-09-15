@@ -1285,3 +1285,56 @@ func TestDuelRefusesAPressWhileItsRefundIsPending(t *testing.T) {
 		t.Errorf("%d challenges survived the sweep, want 0", c.sessions.Len())
 	}
 }
+
+// --- C3B-X1: 押下で決着した挑戦も、返金が通るまで消えない -------------------
+
+// /duel already kept its challenge across a refused withdrawal — it settles
+// outside WithSession, so it never had the done=true door the other two games
+// went through. This pins that, because the shape is the one C3B-X1 is about
+// and a future refactor could just as easily reintroduce it here: 🚫 pressed,
+// the store refusing the refund, and the challenger's stake reachable by the
+// idle sweep afterwards without anybody pressing anything again.
+func TestDuelPressedDeclineKeepsTheChallengeUntilItsRefundLands(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	c, bank := newDuelCommandForTest(t, true)
+	RegisterComponent(c) // the sweeper withdraws through the real settler
+
+	// The manager's clock is frozen at the challenge, so the sweeper's own
+	// clock alone decides what is expired.
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	c.sessions = casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
+
+	r := &fakeCasinoResponder{}
+	sessionID := startDuel(t, c, r, 100)
+
+	bank.declineErr = errors.New("the refund never reached the disk")
+	resp := duelPress(t, c, r, sessionID, duelActionDecline, duelOpponent)
+	if resp.Type == discordgo.InteractionResponseUpdateMessage {
+		t.Error("a refused withdrawal rewrote the challenge as declined, want the board left alone")
+	}
+	bank.declineErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Fatalf("challenger: %d chips / %d escrow after a refused withdrawal, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d challenges are live after a refused withdrawal, want 1 — a retired challenge is one the sweep can never reach", c.sessions.Len())
+	}
+
+	// Three minutes on, with nobody pressing anything.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := duelHoldings(t, bank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow after the sweep, want 1000 / 0 — the stake is stranded until a restart", chips, escrow)
+	}
+	// The opponent staked nothing on a challenge they declined, and the sweep
+	// must not open an account move for them either.
+	if chips, escrow := duelHoldings(t, bank, duelOpponent); chips != 1000 || escrow != 0 {
+		t.Errorf("opponent: %d chips / %d escrow, want 1000 / 0", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges survived the sweep, want 0", c.sessions.Len())
+	}
+}

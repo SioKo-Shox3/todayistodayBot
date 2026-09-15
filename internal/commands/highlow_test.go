@@ -817,6 +817,18 @@ type flakyBank struct {
 	// it cannot run inside WithSession — and this is how a test gets to act
 	// inside it (drive a sweep) instead of hoping to hit it by timing.
 	afterAddToEscrow func()
+	// declineErr refuses /duel's withdrawal. It is the duel's SettleGame:
+	// a challenge is refunded through DeclineDuel rather than through the
+	// capped credit (設計書 C-3b §4.5), so a test that wants "the press
+	// decided, the store said no" on /duel has to fail this one.
+	declineErr error
+}
+
+func (b *flakyBank) DeclineDuel(guildID, challengerID, sessionID string) error {
+	if b.declineErr != nil {
+		return b.declineErr
+	}
+	return b.Store.DeclineDuel(guildID, challengerID, sessionID)
 }
 
 func (b *flakyBank) SettleGame(guildID, userID, sessionID string, payout int64) (casino.SettleResult, error) {
@@ -882,12 +894,13 @@ func highLowChipsOf(t *testing.T, bank *flakyBank) int64 {
 }
 
 // assertNoAutomaticSettlementPromise fixes the WORDING of a refused payout, not
-// only the field it lands in. A settled board has already left the manager
-// (WithSession done=true), so the sweeper never looks at it again: the sole
-// automatic settlement left is RefundStaleEscrows at the next startup, and that
-// returns the escrow rather than paying the pot. A message that told the player
-// to wait would therefore promise something that never arrives — the 🔁 retry
-// is theirs to press. See §9 of the C-2 design.
+// only the field it lands in. The 🔁 retry is the player's own way back to
+// those chips and the one this message is about: it pays now, in front of
+// them, against the board they are looking at. The idle sweep does reach an
+// unpaid board since C3B-X1, but it reaches it three minutes later and says
+// so in its own closing line — naming it here would turn "press this" into
+// "wait", which is neither what the button is for nor what the player wants
+// to read. See §9 of the C-2 design.
 func assertNoAutomaticSettlementPromise(t *testing.T, content string) {
 	t.Helper()
 	for _, promise := range []string{"自動", "次回", "お待ち"} {
@@ -1348,4 +1361,72 @@ func highLowPotOf(t *testing.T, sessions *casino.SessionManager, sessionID strin
 		t.Fatalf("board state is %T, want *casino.HighLowGame", session.State)
 	}
 	return game.Pot()
+}
+// --- C3B-X1: 押下で決着した盤面も、精算が通るまで消えない -------------------
+
+// The press that ENDS a board used to retire it inside WithSession, before
+// anything had been paid: the closure returned done=true and the manager
+// dropped the board under the same lock that applied the move. So when the
+// payout was refused a moment later, the stake sat in escrow named by a board
+// that no longer existed — no button but 🔁 in this one process's memory, and
+// nothing at all for the idle sweep, which only ever sees boards the manager
+// still has. A restart at that point left the chips there until the next one.
+//
+// The board stands now until the chips have moved, and the numbers below are
+// the ones that used to be lost. They are also why the refusal FIXES the
+// amount: a cashed-out high&low board AutoResolves to 0 (CashOut refuses a
+// board that is no longer playing), so a sweep that asked the board again
+// would hand back nothing at all.
+func TestHighLowPressedCashOutKeepsTheBoardUntilItsPayoutLands(t *testing.T) {
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &HighLowCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.HighLowGame { return casino.NewHighLow(bet, zeroRng{}) },
+	}
+
+	r := &fakeHighLowResponder{}
+	if err := c.handle(r, highLowSlashInteraction(100)); err != nil {
+		t.Fatalf("/highlow: %v", err)
+	}
+	_, sessionID, _, ok := ParseCustomID(highLowButtonsOf(t, r.last(t))[0].CustomID)
+	if !ok {
+		t.Fatal("the board's first button does not carry a parsable custom_id")
+	}
+	// The press that decides the board, with the disk refusing the payout.
+	bank.settleErr = errors.New("the payout never reached the disk")
+	resp := c.press(t, r, sessionID, highLowActionCashOut)
+	if resp.Data.Content != casinoSettleFailedMessage {
+		t.Errorf("reply = %q, want the refused-settlement line", resp.Data.Content)
+	}
+	bank.settleErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused payout, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d boards are live after a refused payout, want 1 — a retired board is one the sweep can never reach", c.sessions.Len())
+	}
+	live, ok := c.sessions.Get(sessionID)
+	if !ok {
+		t.Fatal("the board is gone from the manager although its pot is unpaid")
+	}
+	if !live.RefundPending() {
+		t.Error("the board is not marked: the sweep would ask a cashed-out board again and be told 0")
+	}
+
+	// Three minutes on, with nobody pressing 🔁.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank)
+	if escrow != 0 {
+		t.Errorf("escrow = %d after the sweep, want 0 — the stake is stranded until a restart", escrow)
+	}
+	if chips != 1000 {
+		t.Errorf("player: %d chips after the sweep, want 1000 — the 100 the press cashed out. 900 means the sweep asked the board again and a cashed-out board answers 0", chips)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d boards survived the sweep, want 0", c.sessions.Len())
+	}
 }

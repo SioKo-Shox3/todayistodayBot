@@ -367,9 +367,13 @@ func TestRunSessionSweeperSweepsOnEveryTickAndStopsWithTheContext(t *testing.T) 
 }
 
 // A session carrying something that is not a board cannot be resolved, and
-// guessing a payout for it would invent chips. It is dropped — no retry can
-// ever help it — with its stake left for RefundStaleEscrows.
-func TestSweepIdleBoardsPaysNothingForAStateItCannotResolve(t *testing.T) {
+// guessing a payout for it would invent chips. Nothing is settled — and the
+// board STAYS (C3B-X1): it used to be dropped here, which left the 100 chips
+// in escrow with nothing naming them until the next restart. The pass goes to
+// the one door instead, the door reads the account, and the account says the
+// stake is still this board's. A loud line every pass is the cost; a stranded
+// stake was the alternative.
+func TestSweepIdleBoardsKeepsAStateItCannotResolveWhileItStillHoldsTheStake(t *testing.T) {
 	bank, mgr, opened := sweepFixture(t, struct{}{}, 100, casino.MessageRef{ChannelID: "c1", MessageID: "m1"})
 	editor := newRecordingEditor()
 
@@ -381,8 +385,8 @@ func TestSweepIdleBoardsPaysNothingForAStateItCannotResolve(t *testing.T) {
 	if chips, escrow := sweepChipsOf(t, bank); chips != 900 || escrow != 100 {
 		t.Errorf("account: got %d chips / %d escrow, want 900 / 100", chips, escrow)
 	}
-	if mgr.Len() != 0 {
-		t.Errorf("%d boards left, want 0 — an unresolvable board must not be retried forever", mgr.Len())
+	if mgr.Len() != 1 {
+		t.Errorf("%d boards left, want 1 — the board is the only thing that names the 100 chips still in escrow", mgr.Len())
 	}
 	editor.idle(t)
 }

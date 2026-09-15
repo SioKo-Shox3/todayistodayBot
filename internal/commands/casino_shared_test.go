@@ -3,10 +3,12 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -277,12 +279,13 @@ func TestRedactInteractionError_NilError(t *testing.T) {
 // closeBoardSourcePattern matches a call that retires a board directly:
 // `c.sessions.Close(id)`, `sessions.Close(id)`, or any `.Close(sessionID)`.
 // It is deliberately narrow enough not to fire on an io.Closer — a response
-// body in this package must stay closeable — and wide enough to catch the
-// shape every one of the ten replaced call sites had.
-var closeBoardSourcePattern = regexp.MustCompile(`(?i)\bsessions?\.Close\(|\.Close\(\s*(sessionID|session\.ID|id)\s*\)`)
-
-// closeBoardDoorFile is the ONE file allowed to contain that call.
+// closeBoardDoorFile is the ONE file allowed to take a board out of the
+// manager, and managerRetirementMethods are the manager methods that do it.
+// Close is a press's door and Remove is the sweeper's; both are reached from
+// inside closeBoardIfSettled and from nowhere else (C3B-X1).
 const closeBoardDoorFile = "casino_shared.go"
+
+var managerRetirementMethods = map[string]bool{"Close": true, "Remove": true}
 
 // A board must leave the manager through closeBoardIfSettled and nowhere else.
 //
@@ -290,48 +293,179 @@ const closeBoardDoorFile = "casino_shared.go"
 // board while the account still held chips marked with it, and each fix
 // repaired the route it was told about. Reviewing every new route for the same
 // mistake is the thing that kept failing — so this reads the package's own
-// source instead, and a new route that closes a board itself fails here rather
-// than in three months' worth of escrow.
+// source instead, and a new route that retires a board itself fails here
+// rather than in three months' worth of escrow.
 //
-// It reads the sources rather than embedding them (go:embed would put the
-// package's text into the binary for no gain) and skips _test.go: a test may
-// close a board to BUILD the state it is testing.
-func TestOnlyOneEntryPointClosesABoard(t *testing.T) {
+// It reads the sources as a SYNTAX TREE rather than as lines (C3B-X1). The
+// line-wise version it replaces could be walked straight past by splitting the
+// call — gofmt keeps
+//
+//	c.sessions.
+//		Close(sessionID)
+//
+// exactly as written, and no line of it contains both halves. A guard that a
+// formatter-stable rewrite defeats is not a guard. The receiver names are not
+// guessed either: each file is asked which of its identifiers were DECLARED as
+// *casino.SessionManager (fields, parameters, vars), so renaming the field
+// cannot quietly empty the scan.
+//
+// _test.go is skipped: a test may retire a board to BUILD the state it tests.
+func TestOnlyOneEntryPointRetiresABoard(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("reading the package directory: %v", err)
 	}
 
-	scanned, doorSeen := 0, false
+	fset := token.NewFileSet()
+	scanned, doorCalls := 0, map[string]int{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		source, err := os.ReadFile(name)
+		file, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
-			t.Fatalf("reading %s: %v", name, err)
+			t.Fatalf("parsing %s: %v", name, err)
 		}
 		scanned++
-		lines := strings.Split(string(source), "\n")
-		for n, line := range lines {
-			if !closeBoardSourcePattern.MatchString(line) {
-				continue
+
+		managers := sessionManagerNames(file)
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			method, isSelector := call.Fun.(*ast.SelectorExpr)
+			if !isSelector || !managerRetirementMethods[method.Sel.Name] {
+				return true
+			}
+			receiver := trailingIdentOf(method.X)
+			if !managers[receiver] {
+				return true // somebody else's Close: an http body, a file
 			}
 			if name == closeBoardDoorFile {
-				doorSeen = true
-				continue
+				doorCalls[method.Sel.Name]++
+				return true
 			}
-			t.Errorf("%s:%d closes a board directly: %s\n\tuse closeBoardIfSettled — closing a board whose stake is still marked with it strands the chips until the next restart", name, n+1, strings.TrimSpace(line))
-		}
+			t.Errorf("%s: %s.%s retires a board directly\n\tuse closeBoardIfSettled — retiring a board whose stake is still marked with it strands the chips until the next restart",
+				fset.Position(call.Pos()), receiver, method.Sel.Name)
+			return true
+		})
 	}
 
 	if scanned == 0 {
 		t.Fatal("scanned no sources — the guard would pass on an empty read, which is how a scan like this rots")
 	}
-	if !doorSeen {
-		t.Fatalf("%s no longer closes a board: the one door has moved, and this scan is now guarding nothing", closeBoardDoorFile)
+	for method := range managerRetirementMethods {
+		if doorCalls[method] == 0 {
+			t.Errorf("%s no longer calls %s: the one door has moved, and this scan is now guarding nothing", closeBoardDoorFile, method)
+		}
 	}
+}
+
+// The scan has to be able to SEE a call the old line-wise one could not. This
+// is that call, spelled the way gofmt leaves it, fed through the same reader.
+func TestTheBoardScanSeesACallSplitAcrossLines(t *testing.T) {
+	const source = `package commands
+
+import "github.com/SioKo-Shox3/todayistodayBot/internal/casino"
+
+type sneaky struct {
+	sessions *casino.SessionManager
+}
+
+func (c *sneaky) drop(sessionID string) {
+	c.sessions.
+		Close(sessionID)
+}
+`
+	file, err := parser.ParseFile(token.NewFileSet(), "sneaky.go", source, 0)
+	if err != nil {
+		t.Fatalf("parsing the sample: %v", err)
+	}
+
+	managers := sessionManagerNames(file)
+	if !managers["sessions"] {
+		t.Fatalf("the declared manager was not found: got %v", managers)
+	}
+
+	found := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		method, isSelector := call.Fun.(*ast.SelectorExpr)
+		if isSelector && managerRetirementMethods[method.Sel.Name] && managers[trailingIdentOf(method.X)] {
+			found++
+		}
+		return true
+	})
+	if found != 1 {
+		t.Fatalf("the scan found %d retiring calls in the sample, want 1 — a call split across lines walks past it", found)
+	}
+
+	// The same source read a line at a time is what used to be trusted, and
+	// no single line of it carries both halves.
+	for _, line := range strings.Split(source, "\n") {
+		if strings.Contains(line, "sessions") && strings.Contains(line, "Close(") {
+			t.Fatalf("a line-wise scan would have caught this after all: %q", strings.TrimSpace(line))
+		}
+	}
+}
+
+// sessionManagerNames answers which identifiers in this file were declared as
+// *casino.SessionManager — struct fields, function parameters, vars. The scan
+// asks the file rather than carrying a list of names it hopes is current.
+func sessionManagerNames(file *ast.File) map[string]bool {
+	names := map[string]bool{}
+	collect := func(idents []*ast.Ident, typ ast.Expr) {
+		if !isSessionManagerPointer(typ) {
+			return
+		}
+		for _, ident := range idents {
+			names[ident.Name] = true
+		}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch declared := node.(type) {
+		case *ast.Field:
+			collect(declared.Names, declared.Type)
+		case *ast.ValueSpec:
+			collect(declared.Names, declared.Type)
+		}
+		return true
+	})
+	return names
+}
+
+// isSessionManagerPointer reports whether typ is written *casino.SessionManager.
+func isSessionManagerPointer(typ ast.Expr) bool {
+	pointer, isPointer := typ.(*ast.StarExpr)
+	if !isPointer {
+		return false
+	}
+	qualified, isQualified := pointer.X.(*ast.SelectorExpr)
+	if !isQualified || qualified.Sel.Name != "SessionManager" {
+		return false
+	}
+	pkg, isIdent := qualified.X.(*ast.Ident)
+	return isIdent && pkg.Name == "casino"
+}
+
+// trailingIdentOf names the receiver of a call: "sessions" for c.sessions,
+// "mgr" for mgr. Whitespace and line breaks are already gone by the time the
+// tree is built, which is the whole reason this reads a tree.
+func trailingIdentOf(expr ast.Expr) string {
+	switch receiver := expr.(type) {
+	case *ast.Ident:
+		return receiver.Name
+	case *ast.SelectorExpr:
+		return receiver.Sel.Name
+	case *ast.ParenExpr:
+		return trailingIdentOf(receiver.X)
+	}
+	return ""
 }
 
 // The door's whole job: a board whose stake is still marked with it stays.
@@ -394,9 +528,12 @@ func TestCloseBoardIfSettledKeepsABoardWhenTheStoreCannotBeRead(t *testing.T) {
 	}
 }
 
-// An expired board belongs to the sweep goroutine until its settlement lands,
-// so the door leaves it alone — even though its stake is plainly gone.
-func TestCloseBoardIfSettledLeavesAnExpiredBoardToTheSweep(t *testing.T) {
+// The sweeper retires an EXPIRED board through this same door (C3B-X1). It
+// used to call casino.SessionManager.Remove itself, which was a second way
+// out of the manager and asked the account nothing; now the one question —
+// "is the stake still marked with this board" — is asked of the sweep's
+// boards as well, and Remove is reached from inside the door alone.
+func TestCloseBoardIfSettledRetiresAnExpiredBoardWhoseStakeIsGone(t *testing.T) {
 	bank, sessions, sessionID := doorFixture(t, 100)
 	if _, err := bank.SettleGame("g1", "u1", sessionID, 100); err != nil {
 		t.Fatalf("settling the stake: %v", err)
@@ -409,8 +546,27 @@ func TestCloseBoardIfSettledLeavesAnExpiredBoardToTheSweep(t *testing.T) {
 	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", sessionID); err != nil {
 		t.Fatalf("closeBoardIfSettled = %v, want nil", err)
 	}
+	if sessions.Len() != 0 {
+		t.Fatalf("%d boards are left, want 0 — the settlement landed, so the door must retire the sweep's board too", sessions.Len())
+	}
+}
+
+// ...and the account still decides. An expired board whose stake is STILL
+// marked with it is the one the sweep has not managed to pay yet: retiring it
+// here would strand exactly those chips, which is the defect this whole door
+// exists to make unreachable.
+func TestCloseBoardIfSettledKeepsAnExpiredBoardThatStillHoldsItsStake(t *testing.T) {
+	bank, sessions, sessionID := doorFixture(t, 100)
+	sessions.Release(sessionID) // end the open, so the sweep may take the board
+	if expired := sessions.Sweep(time.Now().Add(2 * casino.DefaultSessionTTL)); len(expired) != 1 {
+		t.Fatalf("%d boards expired, want 1", len(expired))
+	}
+
+	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", sessionID); !errors.Is(err, errBoardStillHoldsStake) {
+		t.Fatalf("closeBoardIfSettled = %v, want errBoardStillHoldsStake", err)
+	}
 	if sessions.Len() != 1 {
-		t.Fatalf("%d boards are live, want 1 — Remove is the sweeper's door, not this one", sessions.Len())
+		t.Fatalf("%d boards are left, want 1 — the board is the only thing that names the stake", sessions.Len())
 	}
 }
 

@@ -1264,3 +1264,75 @@ func TestBlackjackRefusesAPressWhileItsRefundIsPending(t *testing.T) {
 		t.Errorf("%d hands survived the sweep, want 0", c.sessions.Len())
 	}
 }
+// --- C3B-X1: 押下で決着した手も、精算が通るまで消えない ---------------------
+
+// The press that ENDS a hand used to retire it inside WithSession, before
+// anything had been paid — see the high&low twin of this test for the shape.
+// The hand stands now until the chips have moved, so a stand whose payout the
+// store refused is still there for the idle sweep three minutes later.
+func TestBlackjackPressedStandKeepsTheHandUntilItsPayoutLands(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	seed := blackjackSeedWhere(t, "a hand that is still playable at the deal", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying
+	})
+	probe := blackjackProbe(100, seed)
+	if err := probe.Stand(); err != nil {
+		t.Fatalf("standing the probe: %v", err)
+	}
+	stood := probe.Settle()
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &BlackjackCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.BlackjackGame { return casino.NewBlackjack(bet, blackjackRngFor(seed)) },
+	}
+	RegisterComponent(c) // the sweeper routes a swept hand through the registry
+
+	r := &fakeCasinoResponder{}
+	if err := c.handle(r, blackjackSlashInteraction(100)); err != nil {
+		t.Fatalf("/blackjack: %v", err)
+	}
+	_, sessionID, _, ok := ParseCustomID(blackjackButtonsOf(t, r.last(t))[0].CustomID)
+	if !ok {
+		t.Fatal("the hand's first button does not carry a parsable custom_id")
+	}
+
+	bank.settleErr = errors.New("the payout never reached the disk")
+	resp := c.press(t, r, sessionID, blackjackActionStand)
+	if resp.Data.Content != casinoSettleFailedMessage {
+		t.Errorf("reply = %q, want the refused-settlement line", resp.Data.Content)
+	}
+	bank.settleErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused payout, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d hands are live after a refused payout, want 1 — a retired hand is one the sweep can never reach", c.sessions.Len())
+	}
+	live, ok := c.sessions.Get(sessionID)
+	if !ok {
+		t.Fatal("the hand is gone from the manager although its payout is unpaid")
+	}
+	if !live.RefundPending() {
+		t.Error("the hand is not marked: the sweep would stand it a second time rather than pay what the press decided")
+	}
+
+	// Three minutes on, with nobody pressing 🔁.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank)
+	if escrow != 0 {
+		t.Errorf("escrow = %d after the sweep, want 0 — the stake is stranded until a restart", escrow)
+	}
+	if want := 900 + stood; chips != want {
+		t.Errorf("player: %d chips after the sweep, want %d — the stand the press decided pays %d", chips, want, stood)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d hands survived the sweep, want 0", c.sessions.Len())
+	}
+}

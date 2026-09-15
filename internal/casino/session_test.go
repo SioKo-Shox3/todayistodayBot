@@ -121,7 +121,15 @@ func TestSessionGetCopiesTheBookkeepingFields(t *testing.T) {
 	}
 }
 
-func TestSessionWithSessionRemovesAFinishedBoard(t *testing.T) {
+// C3B-X1: WithSession is not a way out of the manager. It used to be —
+// a callback reporting done=true removed the board under the same lock that
+// applied the move, so the press that finished a hand retired it before
+// anything had asked the account whether the stake was still there. The one
+// door (closeBoardIfSettled) asks; this did not, and a payout refused right
+// afterwards left chips in escrow that no board named.
+//
+// Whatever fn does, and however it returns, the board must still be here.
+func TestSessionWithSessionNeverRetiresABoard(t *testing.T) {
 	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
 	m := NewSessionManager(clock.Now, time.Minute)
 
@@ -129,67 +137,74 @@ func TestSessionWithSessionRemovesAFinishedBoard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 
-	// A move that does not finish the hand keeps the session addressable.
 	applied := 0
-	if err := m.WithSession(opened.ID, func(s *Session) (bool, error) {
+	if err := m.WithSession(opened.ID, func(s *Session) error {
 		applied++
 		if s.ID != opened.ID {
 			t.Errorf("WithSession handed over session %q, want %q", s.ID, opened.ID)
 		}
-		return false, nil
+		return nil
 	}); err != nil {
-		t.Fatalf("WithSession (not done): %v", err)
+		t.Fatalf("WithSession: %v", err)
 	}
 	if _, ok := m.Get(opened.ID); !ok {
-		t.Fatal("session vanished after a move that returned done=false")
+		t.Fatal("session vanished after a successful move")
 	}
 
 	// A rejected move leaves the board playable: fn's error is returned
 	// verbatim and the session stays.
 	sentinel := errors.New("move rejected")
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
-		return false, sentinel
+	if err := m.WithSession(opened.ID, func(*Session) error {
+		return sentinel
 	}); !errors.Is(err, sentinel) {
 		t.Fatalf("WithSession with a failing fn: got %v, want the fn's error", err)
 	}
 	if _, ok := m.Get(opened.ID); !ok {
-		t.Fatal("session removed although fn returned done=false with an error")
+		t.Fatal("session removed although fn only returned an error")
 	}
 
-	// The finishing move drops it from both maps: pressing the button again
-	// reports ErrSessionNotFound instead of settling the hand twice...
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
+	// The move that FINISHES the hand leaves it exactly as addressable: the
+	// board is what names the stake, and it is the door — after the chips
+	// have moved — that retires it.
+	if err := m.WithSession(opened.ID, func(*Session) error {
 		applied++
-		return true, nil
+		return nil
 	}); err != nil {
-		t.Fatalf("WithSession (done): %v", err)
+		t.Fatalf("WithSession (finishing move): %v", err)
 	}
 	if applied != 2 {
 		t.Fatalf("fn applications: got %d, want 2", applied)
 	}
-	if _, ok := m.Get(opened.ID); ok {
-		t.Fatal("finished session is still addressable")
+	if _, ok := m.Get(opened.ID); !ok {
+		t.Fatal("the finishing move retired the board: WithSession is a second door again")
 	}
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
-		t.Error("fn ran for a finished session")
-		return true, nil
-	}); !errors.Is(err, ErrSessionNotFound) {
-		t.Fatalf("WithSession on a finished session: got %v, want ErrSessionNotFound", err)
+	// Still the sweeper's to settle, too — the board a press could not pay is
+	// exactly the one the idle sweep has to reach.
+	if swept := m.Sweep(clock.Now().Add(time.Hour)); len(swept) != 1 {
+		t.Fatalf("Sweep after the finishing move: got %d boards, want 1", len(swept))
 	}
 
-	// ...and the player may start a new game (the guild+user index was
-	// cleared too, not just the id map).
+	// And the player is still holding that one game until it is closed: the
+	// board stands, so the guild+user index must stand with it.
+	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); !errors.Is(err, ErrGameInProgress) {
+		t.Fatalf("Open while the finished board is unpaid: got %v, want ErrGameInProgress", err)
+	}
+
+	// Close is the way out, and it works on that same board.
+	if !m.Remove(opened.ID) {
+		t.Fatal("Remove could not retire the finished board")
+	}
 	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); err != nil {
-		t.Fatalf("Open after the previous game finished: %v", err)
+		t.Fatalf("Open after the board was retired: %v", err)
 	}
 }
 
-// A board can finish AND fail at the same time (the hand is settled, the
-// follow-up reports an error). done alone decides removal: leaving such a
-// session addressable would let a second press settle the same hand twice
-// and would keep it in the sweeper's queue.
-func TestSessionWithSessionRemovesAFinishedBoardThatAlsoErrored(t *testing.T) {
+// Exists is the door's first question, and it must see what Get hides: an
+// EXPIRED board is still the manager's, and the sweeper retires it through
+// the same door every press uses (C3B-X1).
+func TestSessionExistsSeesAnExpiredBoard(t *testing.T) {
 	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
 	m := NewSessionManager(clock.Now, time.Minute)
 
@@ -197,22 +212,25 @@ func TestSessionWithSessionRemovesAFinishedBoardThatAlsoErrored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 
-	sentinel := errors.New("settled but reporting")
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
-		return true, sentinel
-	}); !errors.Is(err, sentinel) {
-		t.Fatalf("WithSession with done=true and an error: got %v, want the fn's error", err)
+	if !m.Exists(opened.ID) {
+		t.Fatal("Exists denied a live board")
+	}
+	if swept := m.Sweep(clock.Now().Add(time.Hour)); len(swept) != 1 {
+		t.Fatalf("Sweep: got %d boards, want 1", len(swept))
 	}
 	if _, ok := m.Get(opened.ID); ok {
-		t.Fatal("finished session is still addressable after fn returned done=true with an error")
+		t.Fatal("Get answered for an expired board, so the two questions are the same one")
 	}
-	if swept := m.Sweep(clock.Now().Add(time.Hour)); len(swept) != 0 {
-		t.Fatalf("Sweep still sees the finished session: got %d, want 0", len(swept))
+	if !m.Exists(opened.ID) {
+		t.Fatal("Exists denied an expired board: the door could not retire it, and the sweep would never be able to drop it")
 	}
-	// The guild+user index was cleared too, so the player is not locked out.
-	if _, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef); err != nil {
-		t.Fatalf("Open after the errored finish: %v", err)
+	if !m.Remove(opened.ID) {
+		t.Fatal("Remove could not retire the expired board")
+	}
+	if m.Exists(opened.ID) {
+		t.Fatal("Exists answered for a board that is gone")
 	}
 }
 
@@ -227,7 +245,7 @@ func TestSessionWithSessionRefreshesTheIdleDeadline(t *testing.T) {
 	}
 
 	clock.advance(2 * time.Minute)
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) { return false, nil }); err != nil {
+	if err := m.WithSession(opened.ID, func(*Session) error { return nil }); err != nil {
 		t.Fatalf("WithSession: %v", err)
 	}
 
@@ -382,9 +400,9 @@ func TestSessionExpiredBoardIsRefusedByEveryPressPath(t *testing.T) {
 	if _, ok := m.Hold(opened.ID); ok {
 		t.Error("Hold accepted an expired board, so a press would play a hand the sweeper is settling")
 	}
-	if err := m.WithSession(opened.ID, func(*Session) (bool, error) {
+	if err := m.WithSession(opened.ID, func(*Session) error {
 		t.Error("WithSession ran fn on an expired board")
-		return true, nil
+		return nil
 	}); !errors.Is(err, ErrSessionNotFound) {
 		t.Errorf("WithSession on an expired board: got %v, want ErrSessionNotFound", err)
 	}
@@ -489,10 +507,10 @@ func TestSessionWithSessionSerializesConcurrentPresses(t *testing.T) {
 		go func() {
 			defer done.Done()
 			start.Wait()
-			err := m.WithSession(opened.ID, func(s *Session) (bool, error) {
+			err := m.WithSession(opened.ID, func(s *Session) error {
 				b := s.State.(*board)
 				b.moves++
-				return false, nil
+				return nil
 			})
 			if err != nil {
 				errMu.Lock()
@@ -509,9 +527,9 @@ func TestSessionWithSessionSerializesConcurrentPresses(t *testing.T) {
 	}
 
 	var moves int
-	if err := m.WithSession(opened.ID, func(s *Session) (bool, error) {
+	if err := m.WithSession(opened.ID, func(s *Session) error {
 		moves = s.State.(*board).moves
-		return true, nil
+		return nil
 	}); err != nil {
 		t.Fatalf("final WithSession: %v", err)
 	}

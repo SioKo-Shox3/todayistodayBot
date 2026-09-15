@@ -93,3 +93,36 @@ c.sessions.
 - `go test ./internal/casino/... -count=1`
 - `go test ./internal/commands/... -count=1`
 - `go test ./... -count=1`
+
+## 反復 3 — 評価者(codex)の判定: NEEDS_WORK
+
+対象: C3B-X1 盤面を消す機構を 1 つだけにし、走査を構文木で行う(C3B-P4 の差し戻し)
+
+対象HEADは `406f99a`。以下が未完了です。未コミットの変更は判定に含めていません。
+
+1. **テストのAPI移行漏れ — 条件(1)・verify**
+   `WithSession` は `func(*Session) error` に変わりましたが、HEAD版の [session_test.go](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/casino/session_test.go:135) には `(bool, error)` を返す呼び出しが9か所残り、型が一致しません。また、期限切れ盤面を共通入口で削除する変更に対して、既存テストは保持を期待しています。
+   **修正:** コールバックと旧仕様の期待値を移行し、成功・失敗のどちらでも `WithSession` が盤面を削除しないことを検証してください。
+
+2. **構文木走査が未実装 — 条件(3)**
+   [casino_shared_test.go](/C:/Users/KINGkawamura/Documents/todayistodayBot/internal/commands/casino_shared_test.go:282) は依然として正規表現と行分割による走査です。`c.sessions.` の次行に `Close(id)` を置く呼び出しや、`mgr.Remove(id)` を検出できません。
+   **修正:** `go/parser`・`go/ast` でセッションマネージャの削除メソッド呼び出しを検査してください。
+
+3. **指定された回帰テスト3本と経路表が未更新 — 条件(4)**
+   押下決着の精算失敗から、盤面保持・復旧後の掃除・残高回復までを検証する3ゲームのテストがありません。既存の押下失敗テストは手動再試行、掃除テストは未送達や配札時決着などを扱っています。[PROGRESS.md](/C:/Users/KINGkawamura/Documents/todayistodayBot/PROGRESS.md:839) も「`WithSession` が先に外す」「掃除人の `Remove` は入口を通らない」のままです。
+   **修正:** 指定の3経路を追加し、確定配当・預かり・盤面数を検証して経路表を更新してください。
+
+4. **C3B-X1に対応する合格証拠がありません**
+   指定ディレクトリの検証ログ8本を開きました。すべてC3B-P5用で、`verify-*` は `HEAD=7da6edf` と明記されています。`blocked-C3B-X1-evidence.txt` はプロセス一覧と作業状態の記録です。
+   **修正:** 完成した対象コミットに対して4ゲートを実行し、出力を保存してください。
+
+範囲外の実装変更、対象差分でのテスト削除・無効化はありません。
+
+**独立再実行できなかったコマンド**
+
+すべて `go: creating work dir: … Access is denied.` で停止し、未実行です。`go vet` には到達していません。
+
+- `go build ./... && go vet ./...`
+- `go test ./internal/casino/... -count=1`
+- `go test ./internal/commands/... -count=1`
+- `go test ./... -count=1`
