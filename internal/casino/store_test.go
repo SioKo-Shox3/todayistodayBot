@@ -4639,8 +4639,14 @@ func TestDeclineDuel_RefusesASecondRefundAndAnotherGamesStake(t *testing.T) {
 			t.Fatalf("OpenGame(blackjack) returned error: %v", err)
 		}
 
-		if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); !errors.Is(err, ErrNoGameInProgress) {
-			t.Fatalf("DeclineDuel error = %v, want ErrNoGameInProgress", err)
+		// ErrEscrowMismatch, not ErrNoGameInProgress: the account IS holding
+		// a stake and it is somebody else's. That is the same situation as a
+		// stake marked for another DUEL board, and the sweeper acts on the
+		// difference — ErrNoGameInProgress drops the board, which here would
+		// drop it while the blackjack stake it cannot touch is still on the
+		// account.
+		if err := st.DeclineDuel(escrowGuild, escrowUser, escrowSession); !errors.Is(err, ErrEscrowMismatch) {
+			t.Fatalf("DeclineDuel error = %v, want ErrEscrowMismatch", err)
 		}
 		// The blackjack stake survives for its own board to settle.
 		assertHoldings(t, path, escrowGuild, escrowUser, 800, 200, "blackjack")

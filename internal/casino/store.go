@@ -914,7 +914,7 @@ func (s *Store) ViewAccount(guildID, userID string, now time.Time) (AccountView,
 	return result, err
 }
 
-// --- the slot jackpot pool (設計書 C-3a §2) -------------------------------
+// — the slot jackpot pool (設計書 C-3a §2) -------------------------------
 //
 // The pool is HOUSE money, not anyone's balance: it is funded from the edge
 // the payout table already keeps, so it takes part in no account's
@@ -1136,7 +1136,7 @@ func (s *Store) RecentRates(guildID string, now time.Time, limit int) ([]DailyRa
 	return result, err
 }
 
-// --- escrow: chips staked on an in-flight button game (設計書 §3) ---------
+// — escrow: chips staked on an in-flight button game (設計書 §3) ---------
 //
 // A button game's BOARD lives in memory (the session manager); only the
 // STAKE is persisted, as account.Escrow. That split is what makes the money
@@ -1773,24 +1773,35 @@ func (s *Store) AcceptDuel(guildID, challengerID, opponentID, sessionID string, 
 // SeasonNet is untouched: a declined challenge is not a game result, and §3
 // counts only 勝敗.
 //
-// Returns ErrNoGameInProgress when the challenger holds no duel stake, which
-// is both halves of the double-refund guard: a 🚫 pressed twice, and — the
-// case that actually moves chips — a stale duel button pressed after the
-// challenger has opened some other game, which without the EscrowGame check
-// would refund that game's stake out from under its own board.
+// Returns ErrNoGameInProgress ONLY when the account holds no stake at all:
+// there is nothing left to give back, no later call could find any, and the
+// sweeper is free to drop the board. That is both halves of the
+// double-refund guard for this board's own stake.
 //
-// ErrEscrowMismatch covers the case EscrowGame cannot see (設計書 C-3b): the
-// challenger's NEXT game is another duel. sessionID is the challenge board
-// this withdrawal belongs to, so a 🚫 or a sweep that arrives after its own
-// challenge has already been refunded cannot take the new one back instead.
+// Every other refusal is ErrEscrowMismatch, because it means the same thing:
+// the account IS holding a stake and it is not this challenge's. Two shapes
+// reach it, and they are one situation seen from two angles — the escrow
+// names another game (the challenger opened blackjack since), or it names
+// another duel board (EscrowGame cannot tell two challenges apart, so the
+// mark is what stops a withdrawal in flight from taking the NEXT challenge's
+// stake back). Either way the chips on the account belong to a board that is
+// not this one, and refunding them would take them out from under it.
+//
+// Telling the two shapes apart by the error would be a distinction without a
+// difference for the one caller that acts on it: the sweeper drops a board on
+// ErrNoGameInProgress and keeps it on ErrEscrowMismatch, and dropping a board
+// whose account is still staked for somebody throws away the withdrawal AND
+// leaves the stake behind. Both shapes clear themselves the same way, too —
+// once the board that owns those chips settles, the escrow is 0 and the next
+// sweep gets ErrNoGameInProgress and drops this board.
 func (s *Store) DeclineDuel(guildID, challengerID, sessionID string) error {
 	return s.Update(func(d *Data) error {
 		economy := ensureGuildLocked(d, guildID)
 		account := ensureAccountLocked(economy, challengerID)
-		if account.Escrow == 0 || account.EscrowGame != string(GameDuel) {
+		if account.Escrow == 0 {
 			return ErrNoGameInProgress
 		}
-		if !escrowOwnedByLocked(account, sessionID) {
+		if account.EscrowGame != string(GameDuel) || !escrowOwnedByLocked(account, sessionID) {
 			return ErrEscrowMismatch
 		}
 		moveFromEscrowLocked(account)
@@ -1853,7 +1864,7 @@ func (s *Store) RefundStaleEscrows(now time.Time) (int, error) {
 	return refunded, nil
 }
 
-// --- the daily lottery (設計書 C-3a §3) -----------------------------------
+// — the daily lottery (設計書 C-3a §3) -----------------------------------
 //
 // The pot is PLAYERS' money in transit, unlike the jackpot pool: chips leave
 // the buyers' balances at purchase and come back to exactly one of them at

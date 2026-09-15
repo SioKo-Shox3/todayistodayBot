@@ -782,11 +782,18 @@ func TestSweepKeepsABoardWhoseStakeBelongsToAnotherBoard(t *testing.T) {
 		t.Fatalf("opening the board: %v", err)
 	}
 
+	logs := captureSlogOutput(t)
 	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
 
 	if mgr.Len() != 1 {
 		t.Fatalf("%d boards survived the mismatch, want 1 — dropping it loses the resolved payout and strands the stake", mgr.Len())
 	}
+	// Keeping the board is silent by itself: nothing in the channel changes
+	// and the retry looks like any other pass. The line is the only way an
+	// operator learns that an account disagrees with its board about who owns
+	// the chips — a state the open can no longer produce (設計書 C-3b), so one
+	// that means a real inconsistency.
+	assertSweepLoggedTheStakeMismatch(t, logs.String(), "stranded-board")
 	if _, escrow := sweepChipsOf(t, bank); escrow != 100 {
 		t.Errorf("escrow = %d, want 100 — a refused settlement must not move chips", escrow)
 	}
@@ -810,5 +817,90 @@ func TestSweepKeepsABoardWhoseStakeBelongsToAnotherBoard(t *testing.T) {
 	}
 	if _, escrow := sweepChipsOf(t, bank); escrow != 0 {
 		t.Errorf("escrow = %d after the retry, want 0", escrow)
+	}
+}
+
+// assertSweepLoggedTheStakeMismatch checks that the pass said WHY it kept the
+// board. sweepIdleBoards logs at Error level and names the board, so an
+// operator reading the file can find the account without reproducing the
+// sweep.
+func assertSweepLoggedTheStakeMismatch(t *testing.T, logged, sessionID string) {
+	t.Helper()
+	line := ""
+	for _, candidate := range strings.Split(logged, "\n") {
+		if strings.Contains(candidate, "belongs to another board") {
+			line = candidate
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("the sweep kept the board without logging why; log was:\n%s", logged)
+	}
+	if !strings.Contains(line, "level=ERROR") {
+		t.Errorf("the mismatch was logged below ERROR, so it is lost at the default level: %q", line)
+	}
+	if !strings.Contains(line, sessionID) {
+		t.Errorf("the mismatch line does not name the board %q: %q", sessionID, line)
+	}
+}
+
+// --- the same mismatch, reached through the duel (反復 7 の所見 1) ----------
+
+// The duel withdraws through casino.DeclineDuel rather than SettleGame, and
+// that call used to answer ErrNoGameInProgress — "there is nothing left to
+// pay", which the sweeper drops the board on — whenever the escrow named
+// ANOTHER GAME, even though the account was still holding 100 chips for it.
+// Structurally that is the same situation as a stake marked for another duel
+// board: somebody else owns the chips. Dropping the challenge on it threw
+// away the withdrawal and left the stake behind, which is exactly what C2-10
+// forbids.
+func TestSweepKeepsADuelWhoseChallengerIsStakedForAnotherGame(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := bank.EnsureCasinoAccess("g1", "u1", opened); err != nil {
+		t.Fatalf("EnsureCasinoAccess: %v", err)
+	}
+	// The challenger's chips are staked for a HIGH&LOW board. The duel below
+	// may not take them back: that board is still live and will settle them.
+	if err := bank.OpenGame("g1", "u1", string(casino.GameHighLow), "some-other-board", 100, opened); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+
+	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
+	RegisterComponent(&DuelCommand{store: bank, sessions: mgr, flip: func() bool { return true }})
+	if _, err := mgr.OpenWithID("stranded-duel", "g1", "u1", casino.GameDuel,
+		&casino.DuelState{ChallengerID: "u1", OpponentID: "u2", Bet: 100, Stage: casino.DuelPending},
+		casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
+		t.Fatalf("opening the challenge: %v", err)
+	}
+
+	logs := captureSlogOutput(t)
+	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if mgr.Len() != 1 {
+		t.Fatalf("%d challenges survived the mismatch, want 1 — dropping it strands the stake it could not return", mgr.Len())
+	}
+	chips, escrow := sweepChipsOf(t, bank)
+	if escrow != 100 {
+		t.Errorf("escrow = %d, want 100 — the other board's stake must not move", escrow)
+	}
+	if chips != 900 {
+		t.Errorf("chips = %d, want 900 — a refused withdrawal must not refund anything", chips)
+	}
+	assertSweepLoggedTheStakeMismatch(t, logs.String(), "stranded-duel")
+
+	// The state clears itself: once the board that owns those chips settles,
+	// the account holds nothing and the next pass drops the challenge.
+	if _, err := bank.SettleGame("g1", "u1", "some-other-board", 100); err != nil {
+		t.Fatalf("clearing the other board's stake: %v", err)
+	}
+	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(2*casino.DefaultSessionTTL))
+
+	if mgr.Len() != 0 {
+		t.Errorf("%d challenges survived the retry, want 0 — an empty escrow is nothing left to return", mgr.Len())
 	}
 }
