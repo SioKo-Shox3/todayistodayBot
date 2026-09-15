@@ -380,8 +380,9 @@ func translateDuelPressError(err error) string {
 }
 
 // translateDuelAcceptError renders the refusals of ⚔️. The first two leave
-// the challenge standing (see duelAcceptDropsTheChallenge) and are answered
-// privately, so the board in the channel is untouched.
+// the challenge standing — the stake is still in escrow, so closeBoardIfSettled
+// keeps the board — and are answered privately, so the board in the channel is
+// untouched.
 func translateDuelAcceptError(err error) string {
 	var insufficientChips *casino.ErrInsufficientChips
 	switch {
@@ -392,22 +393,6 @@ func translateDuelAcceptError(err error) string {
 	default:
 		return translateDuelPressError(err)
 	}
-}
-
-// duelAcceptDropsTheChallenge reports whether a refused acceptance leaves no
-// stake for this challenge to release. Only ErrNoGameInProgress says that:
-// the challenger's escrow is empty, or it now belongs to another game, and
-// either way this board can neither settle nor refund anything.
-//
-// Every other refusal keeps the challenge standing, and the default side of
-// the test is the important one. An I/O failure inside Store.Update writes
-// nothing, so the stake is still in escrow; closing the session on it would
-// take away the 🚫 button AND hide the board from the sweeper, stranding the
-// chips until the next restart. An opponent who cannot cover the bet — or who
-// is in a game of their own — has simply not answered yet, and 設計書 §4.5
-// keeps the board alive for them (nobody else can take it anyway).
-func duelAcceptDropsTheChallenge(err error) bool {
-	return errors.Is(err, casino.ErrNoGameInProgress)
 }
 
 // --- /duel -----------------------------------------------------------------
@@ -500,7 +485,9 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 	// names a challenge already withdrawn is refused instead of paid out of
 	// this one.
 	if err := c.store.OpenGame(i.GuildID, challengerID, string(casino.GameDuel), sessionID, bet, now); err != nil {
-		c.sessions.Close(sessionID) // nothing was staked: there is no refund to fail
+		// Nothing was staked, so the challenge can go — asked of the account
+		// rather than assumed here (C3B-P4).
+		closeBoardIfSettled(c.store, c.sessions, i.GuildID, challengerID, sessionID)
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
 
@@ -554,7 +541,7 @@ func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessio
 		// decision (設計書 C-3b §4.5).
 		return
 	}
-	c.sessions.Close(sessionID)
+	closeBoardIfSettled(c.store, c.sessions, guildID, challengerID, sessionID)
 }
 
 // rememberChallengeMessage fills in the session's MessageRef once Discord has
@@ -643,17 +630,21 @@ func (c *DuelCommand) handleComponent(r interactionResponder, i *discordgo.Inter
 func (c *DuelCommand) accept(r interactionResponder, i *discordgo.InteractionCreate, sessionID, guildID string, board casino.DuelState) error {
 	settlement, err := c.store.AcceptDuel(guildID, board.ChallengerID, board.OpponentID, sessionID, board.Bet, c.flip())
 	if err != nil {
-		if duelAcceptDropsTheChallenge(err) {
-			// The stake behind this challenge is gone, so the board can never
-			// settle: drop it rather than leave a button that only ever fails.
-			c.sessions.Close(sessionID)
-		}
+		// A refusal says nothing reliable about the chips, so the door reads
+		// them (C3B-P4). A challenge whose stake is gone can never settle and
+		// is dropped rather than left behind a button that only ever fails;
+		// one whose stake is still there — an acceptance that failed before
+		// it wrote anything, an opponent already mid-game — stays, because
+		// its stake has no other way back than 🚫 or the idle sweep.
+		closeBoardIfSettled(c.store, c.sessions, guildID, board.ChallengerID, sessionID)
 		return respondVia(r, i.Interaction, ephemeralResponse(translateDuelAcceptError(err)))
 	}
 
-	// The challenge is spent. Closing it BEFORE the edit is what stops the
-	// sweeper from later "withdrawing" a duel that has already paid.
-	c.sessions.Close(sessionID)
+	// The challenge is spent — AcceptDuel settled both sides in one
+	// transaction, so the challenger's escrow is gone. Retiring it BEFORE the
+	// edit is what stops the sweeper from later "withdrawing" a duel that has
+	// already paid.
+	closeBoardIfSettled(c.store, c.sessions, guildID, board.ChallengerID, sessionID)
 	return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
@@ -673,7 +664,7 @@ func (c *DuelCommand) decline(r interactionResponder, i *discordgo.InteractionCr
 		return respondVia(r, i.Interaction, ephemeralResponse(translateDuelPressError(err)))
 	}
 
-	c.sessions.Close(sessionID)
+	closeBoardIfSettled(c.store, c.sessions, guildID, board.ChallengerID, sessionID)
 	return respondVia(r, i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{

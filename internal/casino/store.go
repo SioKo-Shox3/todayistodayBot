@@ -1247,6 +1247,44 @@ func (s *Store) GameInProgress(guildID, userID string) (bool, error) {
 	return account.Escrow > 0, nil
 }
 
+// EscrowHeldBy reports whether guildID/userID is holding a stake that carries
+// sessionID's mark — "are there chips on this account that only THIS board can
+// release". It is the read the command layer needs before it drops a board
+// (closeBoardIfSettled): a board whose stake is still marked with its own ID
+// is the only thing that can ever hand those chips back, so it must not be
+// dropped, and one that is not is free to go.
+//
+// The mark must match EXACTLY, unlike escrowOwnedByLocked's settle-side rule
+// where an empty mark belongs to everybody. The two are asking different
+// questions: the settle side asks "may this board be paid out of the stake"
+// and errs towards paying (a pre-C-3b escrow read off disk carries no mark and
+// its owner would otherwise be stranded), while this asks "would dropping the
+// board strand the stake" and errs towards dropping. Every stake opened since
+// C-3b names its board from its first write, so an unmarked escrow cannot be
+// this board's — it is the leftover RefundStaleEscrows returns at startup, and
+// holding a board open for it would only wedge the board.
+//
+// Like GameInProgress this runs on a Snapshot: asking a question must not
+// create an account (nor hand out its welcome bonus), and the answer is a
+// plain read.
+func (s *Store) EscrowHeldBy(guildID, userID, sessionID string) (bool, error) {
+	data, err := s.Snapshot()
+	if err != nil {
+		return false, err
+	}
+	economy := data[guildID]
+	if economy == nil {
+		return false, nil
+	}
+	// economy.Users can be nil on a hand-edited file; reading a nil map gives
+	// the zero value, which is the answer this wants anyway.
+	account := economy.Users[userID]
+	if account == nil {
+		return false, nil
+	}
+	return account.Escrow > 0 && account.EscrowSession == sessionID, nil
+}
+
 // OpenGame stakes bet chips on a new game of `game` for guildID/userID,
 // auto-creating the account (welcome bonus) on first ever interaction.
 // Returns ErrGameInProgress if the account already has chips in escrow,

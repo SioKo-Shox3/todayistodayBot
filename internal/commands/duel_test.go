@@ -875,14 +875,25 @@ func TestDuelAcceptFailingWithoutWritingKeepsTheChallengeRefundable(t *testing.T
 	}
 }
 
-// The other side of the same test: ErrNoGameInProgress is the one refusal
-// that says there is no stake left to release — that board must go, or it
-// keeps a button that can only ever fail.
+// The other side of the same test: a challenge with no stake left to release
+// must go, or it keeps a button that can only ever fail.
+//
+// The stake is taken off the account for REAL — rather than by a bank that
+// answers ErrNoGameInProgress while the chips are still in escrow — because
+// the door a board leaves through reads the account rather than the refusal
+// (C3B-P4). A double whose error and whose escrow disagree would be pinning a
+// state the store cannot produce, and the real store produces this one:
+// AcceptDuel refuses an empty escrow with exactly that error.
 func TestDuelAcceptWithoutAStakeDropsTheChallenge(t *testing.T) {
 	c, bank := newDuelCommandForTest(t, true)
-	c.store = &duelFailingBank{flakyBank: bank, acceptErr: casino.ErrNoGameInProgress}
 	r := &fakeCasinoResponder{}
 	sessionID := startDuel(t, c, r, 100)
+
+	// Whatever took it — a restart's RefundStaleEscrows, a settlement this
+	// board never saw — the stake behind this challenge is gone.
+	if _, err := bank.SettleGame("g1", duelChallenger, sessionID, 100); err != nil {
+		t.Fatalf("clearing the challenger's stake: %v", err)
+	}
 
 	resp := duelPress(t, c, r, sessionID, duelActionAccept, duelOpponent)
 

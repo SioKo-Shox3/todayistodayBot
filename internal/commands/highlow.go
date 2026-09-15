@@ -436,8 +436,9 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 	// first write (設計書 C-3b).
 	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameHighLow), sessionID, bet, now); err != nil {
 		// Nothing was staked (OpenGame persists nothing on an error), so the
-		// board is simply dropped: there is no refund to fail.
-		c.sessions.Close(sessionID)
+		// board can go — but that is the ACCOUNT's answer to give, not this
+		// path's (C3B-P4). The one door checks it and drops the board.
+		closeBoardIfSettled(c.store, c.sessions, i.GuildID, userID, sessionID)
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
 
@@ -505,7 +506,7 @@ func (c *HighLowCommand) withdrawUndeliveredBoard(guildID, userID, sessionID str
 		c.sessions.MarkRefundPending(sessionID, bet)
 		return
 	}
-	c.sessions.Close(sessionID)
+	closeBoardIfSettled(c.store, c.sessions, guildID, userID, sessionID)
 }
 
 // rememberBoardMessage fills in the session's MessageRef once Discord has

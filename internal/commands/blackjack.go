@@ -393,7 +393,9 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 	// and the half that survives a restart. ⏫, every press and the sweeper
 	// name sessionID, and nothing else can settle these chips.
 	if err := c.store.OpenGame(i.GuildID, userID, string(casino.GameBlackjack), sessionID, bet, now); err != nil {
-		c.sessions.Close(sessionID) // nothing was staked: there is no refund to fail
+		// Nothing was staked, so the hand can go — asked of the account
+		// rather than assumed here (C3B-P4).
+		closeBoardIfSettled(c.store, c.sessions, i.GuildID, userID, sessionID)
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
 
@@ -420,17 +422,37 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 	return nil
 }
 
-// settleDealtHand closes and pays a hand that never took a press. The session
-// is removed first, exactly as WithSession removes a finished board, so the
-// settlement below is the only one this hand can ever get.
+// settleDealtHand pays a hand that never took a press — a natural, settled at
+// the deal — and retires it once the chips have landed.
+//
+// The hand used to be removed FIRST, which was the last of the five stranded
+// stakes (反復 1 の指摘 1): when the payout was refused AND the reply that
+// carries the 🔁 button never reached Discord, the stake sat in escrow with no
+// board, no button and no sweep, until the next restart. Settling first and
+// closing through the one door (C3B-P4) removes the trade — a refused payout
+// leaves the hand standing for the idle sweep, and a payout that lands takes
+// the hand with it.
+//
+// Nothing can settle this hand twice in the meantime. The caller holds the
+// board for the whole open (Release is deferred in handle), so the sweep skips
+// it, and this path holds the board lock, so no press can be inside settle at
+// the same time.
 func (c *BlackjackCommand) settleDealtHand(r interactionResponder, i *discordgo.InteractionCreate, sessionID string, board blackjackBoard, payout int64) error {
 	lock := c.locks.acquire(sessionID)
 	defer c.locks.release(sessionID, lock)
 
-	c.sessions.Close(sessionID)
-	pending := &blackjackPending{GuildID: i.GuildID, UserID: resolveUserID(i), Payout: payout, Board: board}
+	userID := resolveUserID(i)
+	pending := &blackjackPending{GuildID: i.GuildID, UserID: userID, Payout: payout, Board: board}
 	lock.pending = pending
-	return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseChannelMessageWithSource)
+	// What this hand owes is already decided — the deal decided it — so the
+	// sweep must pay exactly that rather than ask the hand again. The mark is
+	// what keeps a hand that is standing only because its payout failed from
+	// being re-derived by AutoResolve.
+	c.sessions.MarkRefundPending(sessionID, payout)
+
+	err := c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseChannelMessageWithSource)
+	closeBoardIfSettled(c.store, c.sessions, i.GuildID, userID, sessionID)
+	return err
 }
 
 // withdrawUndeliveredHand retires a hand whose board never reached the
@@ -478,7 +500,7 @@ func (c *BlackjackCommand) withdrawUndeliveredHand(sessionID, guildID, userID st
 		c.sessions.MarkRefundPending(sessionID, bet)
 		return
 	}
-	c.sessions.Close(sessionID)
+	closeBoardIfSettled(c.store, c.sessions, guildID, userID, sessionID)
 }
 
 // refundUnplayableHand returns a stake whose hand never became playable and
@@ -550,7 +572,13 @@ func (c *BlackjackCommand) handleComponent(r interactionResponder, i *discordgo.
 		if msg := requireSessionOwner(i, pending.UserID); msg != "" {
 			return respondVia(r, i.Interaction, ephemeralResponse(msg))
 		}
-		return c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseUpdateMessage)
+		err := c.settle(r, i, sessionID, lock, pending, discordgo.InteractionResponseUpdateMessage)
+		// A hand that ended at the deal is still standing while its payout is
+		// unpaid (settleDealtHand), so the retry that finally pays it is what
+		// retires it. Every other retry finds the hand already gone, and the
+		// door answers that with nothing.
+		closeBoardIfSettled(c.store, c.sessions, pending.GuildID, pending.UserID, sessionID)
+		return err
 	}
 
 	// Hold, not Get: the board lock above serializes PRESSES, but the idle

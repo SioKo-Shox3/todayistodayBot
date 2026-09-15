@@ -4,8 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SioKo-Shox3/todayistodayBot/internal/casino"
 	"github.com/bwmarrin/discordgo"
@@ -266,4 +270,198 @@ func TestRedactInteractionError_NilError(t *testing.T) {
 	if got := redactInteractionError(nil); got != "<nil>" {
 		t.Fatalf("redactInteractionError(nil) = %q, want \"<nil>\"", got)
 	}
+}
+
+// --- the one door out of the manager (C3B-P4) -------------------------------
+
+// closeBoardSourcePattern matches a call that retires a board directly:
+// `c.sessions.Close(id)`, `sessions.Close(id)`, or any `.Close(sessionID)`.
+// It is deliberately narrow enough not to fire on an io.Closer — a response
+// body in this package must stay closeable — and wide enough to catch the
+// shape every one of the ten replaced call sites had.
+var closeBoardSourcePattern = regexp.MustCompile(`(?i)\bsessions?\.Close\(|\.Close\(\s*(sessionID|session\.ID|id)\s*\)`)
+
+// closeBoardDoorFile is the ONE file allowed to contain that call.
+const closeBoardDoorFile = "casino_shared.go"
+
+// A board must leave the manager through closeBoardIfSettled and nowhere else.
+//
+// Five stranded stakes were found one at a time, each on a route that closed a
+// board while the account still held chips marked with it, and each fix
+// repaired the route it was told about. Reviewing every new route for the same
+// mistake is the thing that kept failing — so this reads the package's own
+// source instead, and a new route that closes a board itself fails here rather
+// than in three months' worth of escrow.
+//
+// It reads the sources rather than embedding them (go:embed would put the
+// package's text into the binary for no gain) and skips _test.go: a test may
+// close a board to BUILD the state it is testing.
+func TestOnlyOneEntryPointClosesABoard(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	scanned, doorSeen := 0, false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		scanned++
+		lines := strings.Split(string(source), "\n")
+		for n, line := range lines {
+			if !closeBoardSourcePattern.MatchString(line) {
+				continue
+			}
+			if name == closeBoardDoorFile {
+				doorSeen = true
+				continue
+			}
+			t.Errorf("%s:%d closes a board directly: %s\n\tuse closeBoardIfSettled — closing a board whose stake is still marked with it strands the chips until the next restart", name, n+1, strings.TrimSpace(line))
+		}
+	}
+
+	if scanned == 0 {
+		t.Fatal("scanned no sources — the guard would pass on an empty read, which is how a scan like this rots")
+	}
+	if !doorSeen {
+		t.Fatalf("%s no longer closes a board: the one door has moved, and this scan is now guarding nothing", closeBoardDoorFile)
+	}
+}
+
+// The door's whole job: a board whose stake is still marked with it stays.
+func TestCloseBoardIfSettledKeepsABoardThatStillHoldsItsStake(t *testing.T) {
+	bank, sessions, sessionID := doorFixture(t, 100)
+
+	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", sessionID); !errors.Is(err, errBoardStillHoldsStake) {
+		t.Fatalf("closeBoardIfSettled = %v, want errBoardStillHoldsStake", err)
+	}
+	if sessions.Len() != 1 {
+		t.Fatalf("%d boards are live, want 1 — the board is the only thing that can give the stake back", sessions.Len())
+	}
+}
+
+// ...and one whose stake has been settled goes.
+func TestCloseBoardIfSettledDropsABoardWhoseStakeIsGone(t *testing.T) {
+	bank, sessions, sessionID := doorFixture(t, 100)
+	if _, err := bank.SettleGame("g1", "u1", sessionID, 100); err != nil {
+		t.Fatalf("settling the stake: %v", err)
+	}
+
+	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", sessionID); err != nil {
+		t.Fatalf("closeBoardIfSettled = %v, want nil", err)
+	}
+	if sessions.Len() != 0 {
+		t.Fatalf("%d boards are live, want 0 — a paid board has nothing left to release", sessions.Len())
+	}
+}
+
+// A stake that names ANOTHER board is not this board's to wait for: this one
+// can never settle it (every call names its board, and the store answers
+// ErrEscrowMismatch), so holding the board open would only keep its owner out
+// of new games without ever releasing a chip.
+func TestCloseBoardIfSettledDropsABoardWhoseStakeNamesAnotherBoard(t *testing.T) {
+	bank, sessions := doorStore(t)
+	boardID, escrowID := doorSessionID(t), doorSessionID(t)
+	doorBoard(t, sessions, boardID)
+	if err := bank.OpenGame("g1", "u1", string(casino.GameBlackjack), escrowID, 100, time.Now()); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+
+	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", boardID); err != nil {
+		t.Fatalf("closeBoardIfSettled = %v, want nil", err)
+	}
+	if sessions.Len() != 0 {
+		t.Fatalf("%d boards are live, want 0", sessions.Len())
+	}
+}
+
+// An account that cannot be read is not evidence that dropping is safe.
+func TestCloseBoardIfSettledKeepsABoardWhenTheStoreCannotBeRead(t *testing.T) {
+	bank, sessions, sessionID := doorFixture(t, 100)
+	unreadable := &escrowBlindBank{flakyBank: bank, escrowErr: errors.New("casino: read casino.json: i/o error")}
+
+	if err := closeBoardIfSettled(unreadable, sessions, "g1", "u1", sessionID); err == nil {
+		t.Fatal("closeBoardIfSettled = nil, want the store's error")
+	}
+	if sessions.Len() != 1 {
+		t.Fatalf("%d boards are live, want 1 — an unreadable account decides nothing", sessions.Len())
+	}
+}
+
+// An expired board belongs to the sweep goroutine until its settlement lands,
+// so the door leaves it alone — even though its stake is plainly gone.
+func TestCloseBoardIfSettledLeavesAnExpiredBoardToTheSweep(t *testing.T) {
+	bank, sessions, sessionID := doorFixture(t, 100)
+	if _, err := bank.SettleGame("g1", "u1", sessionID, 100); err != nil {
+		t.Fatalf("settling the stake: %v", err)
+	}
+	sessions.Release(sessionID) // end the open, so the sweep may take the board
+	if expired := sessions.Sweep(time.Now().Add(2 * casino.DefaultSessionTTL)); len(expired) != 1 {
+		t.Fatalf("%d boards expired, want 1", len(expired))
+	}
+
+	if err := closeBoardIfSettled(bank, sessions, "g1", "u1", sessionID); err != nil {
+		t.Fatalf("closeBoardIfSettled = %v, want nil", err)
+	}
+	if sessions.Len() != 1 {
+		t.Fatalf("%d boards are live, want 1 — Remove is the sweeper's door, not this one", sessions.Len())
+	}
+}
+
+// doorFixture stakes `bet` chips on a live blackjack board and hands back the
+// three things the door needs. The board is left HELD, exactly as it is during
+// an open, which is when most of the door's callers run.
+func doorFixture(t *testing.T, bet int64) (*flakyBank, *casino.SessionManager, string) {
+	t.Helper()
+	bank, sessions := doorStore(t)
+	sessionID := doorSessionID(t)
+	doorBoard(t, sessions, sessionID)
+	if err := bank.OpenGame("g1", "u1", string(casino.GameBlackjack), sessionID, bet, time.Now()); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	return bank, sessions, sessionID
+}
+
+// doorStore is one test's own store and board registry — never
+// casino.Default()/DefaultSessions(), which point at the production file.
+func doorStore(t *testing.T) (*flakyBank, *casino.SessionManager) {
+	t.Helper()
+	return &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))},
+		casino.NewSessionManager(time.Now, casino.DefaultSessionTTL)
+}
+
+func doorSessionID(t *testing.T) string {
+	t.Helper()
+	id, err := casino.NewSessionID()
+	if err != nil {
+		t.Fatalf("NewSessionID: %v", err)
+	}
+	return id
+}
+
+// doorBoard registers a blackjack board under id. The hand itself never
+// matters here: the door decides from the ACCOUNT, and reading the game is
+// exactly what it must not do.
+func doorBoard(t *testing.T, sessions *casino.SessionManager, id string) {
+	t.Helper()
+	if _, err := sessions.OpenWithID(id, "g1", "u1", casino.GameBlackjack, casino.NewBlackjack(100, zeroRng{}), casino.MessageRef{ChannelID: "c1"}); err != nil {
+		t.Fatalf("OpenWithID: %v", err)
+	}
+}
+
+// escrowBlindBank is a store whose escrow READ fails while everything else
+// works — the one state that must not be read as "dropping is safe".
+type escrowBlindBank struct {
+	*flakyBank
+	escrowErr error
+}
+
+func (b *escrowBlindBank) EscrowHeldBy(guildID, userID, sessionID string) (bool, error) {
+	return false, b.escrowErr
 }

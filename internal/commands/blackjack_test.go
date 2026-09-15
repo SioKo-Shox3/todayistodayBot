@@ -1091,3 +1091,93 @@ func TestBlackjackUndeliveredHandIsKeptAndRefundedWholeRatherThanStood(t *testin
 		t.Errorf("SettleGame was called %d times, want 2 (the undelivered cleanup, then the sweep's retry)", bank.settles)
 	}
 }
+
+// --- 反復 1 の差し戻し 1(C3B-P4)------------------------------------------
+
+// A hand that is over at the deal — a natural — used to be REMOVED before its
+// payout was even attempted, and that was the fifth stranded stake of the same
+// shape. When the store refused the payout and the reply that carries the 🔁
+// button never reached Discord, the stake sat in escrow with no hand, no
+// button and no sweep that could reach it: the account was "in a game" until
+// the process was restarted.
+//
+// The hand now leaves through the one door (closeBoardIfSettled), which reads
+// the account rather than the caller's belief that a dealt hand is finished
+// business. A payout that was refused leaves the stake marked with this hand,
+// so the hand stays and the sweep three minutes on pays it.
+//
+// The sweep must pay the NATURAL, not re-derive something from the cards: what
+// this hand owes was decided by the deal, and the seed below makes the two
+// numbers different enough to tell apart (a natural pays 2.5x the bet, and no
+// hand that is merely stood can).
+func TestBlackjackHandSettledAtTheDealIsKeptUntilItsPayoutLands(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	seed := blackjackSeedWhere(t, "a natural at the deal", func(g *casino.BlackjackGame) bool {
+		return g.Result() == casino.BlackjackNatural
+	})
+	natural := blackjackProbe(100, seed).Settle()
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &BlackjackCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.BlackjackGame { return casino.NewBlackjack(bet, blackjackRngFor(seed)) },
+	}
+	RegisterComponent(c) // the sweeper routes a swept hand through the registry
+
+	// The two failures that used to combine into a stranded stake: the payout
+	// is refused, and the reply that would have carried the 🔁 button — the
+	// only other way back to those chips — never reaches Discord.
+	bank.settleErr = errors.New("the payout never reached the disk")
+	r := &fakeCasinoResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(r, blackjackSlashInteraction(100)); err == nil {
+		t.Fatal("/blackjack reported success although the natural's board never reached Discord")
+	}
+	bank.settleErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused payout, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d hands are live after a refused payout, want 1 — a retired hand is one nothing can retry", c.sessions.Len())
+	}
+
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank)
+	if escrow != 0 {
+		t.Errorf("escrow = %d after the sweep, want 0 — the stake is stranded until a restart", escrow)
+	}
+	if want := 900 + natural; chips != want {
+		t.Errorf("player: %d chips after the sweep, want %d — the deal decided a natural (%d back on a 100 stake)", chips, want, natural)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d hands survived the sweep, want 0", c.sessions.Len())
+	}
+}
+
+// The same hand when everything works: the payout lands, and the hand is gone
+// — keeping a settled board would leave the sweeper a second settlement to
+// attempt and the player a board that outlives their hand.
+func TestBlackjackHandSettledAtTheDealIsRetiredOnceItsPayoutLands(t *testing.T) {
+	seed := blackjackSeedWhere(t, "a natural at the deal", func(g *casino.BlackjackGame) bool {
+		return g.Result() == casino.BlackjackNatural
+	})
+	natural := blackjackProbe(100, seed).Settle()
+
+	c, bank := newBlackjackCommandForTest(t, seed)
+	r := &fakeCasinoResponder{}
+	if err := c.handle(r, blackjackSlashInteraction(100)); err != nil {
+		t.Fatalf("/blackjack: %v", err)
+	}
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900+natural || escrow != 0 {
+		t.Errorf("player: %d chips / %d escrow, want %d / 0", chips, escrow, 900+natural)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d hands are live after a hand that ended at the deal, want 0", c.sessions.Len())
+	}
+}

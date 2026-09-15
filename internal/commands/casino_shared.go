@@ -381,4 +381,68 @@ type casinoBank interface {
 	// it: the one-game rule that OpenGame enforces covers the account being
 	// debited, never the opponent a challenge is addressed to.
 	GameInProgress(guildID, userID string) (bool, error)
+	// EscrowHeldBy is the read closeBoardIfSettled runs before it drops a
+	// board: "is the stake on this account still marked with this board".
+	EscrowHeldBy(guildID, userID, sessionID string) (bool, error)
+}
+
+// --- the one door out of the manager (C3B-P4) -------------------------------
+//
+// A stake is stranded whenever a board is dropped while the account is still
+// holding chips marked with that board's ID: the board is the only thing that
+// carries a button, and the idle sweep only ever sees boards the manager still
+// has. Five defects of that exact shape have been found and fixed one at a
+// time — the open's order, the undelivered cleanup, the stake's mark, an
+// undelivered hand, a hand that settled at the deal — and each fix repaired
+// the route it was told about while its siblings kept the hole open.
+//
+// closeBoardIfSettled ends that by construction rather than by audit: it is
+// the ONLY place in this package that closes a board, it decides from the
+// ACCOUNT (not from the caller's belief about it) whether dropping is safe,
+// and casino_shared_test.go's source scan fails the build of any new route
+// that calls casino.SessionManager.Close itself.
+
+// errBoardStillHoldsStake is what closeBoardIfSettled answers when the account
+// is still holding this board's stake. The board stays exactly where it is, so
+// the idle sweep can settle it at the next pass; the callers have nothing left
+// to do about it, which is why every one of them ignores this.
+var errBoardStillHoldsStake = errors.New("commands: the account is still holding this board's stake")
+
+// closeBoardIfSettled retires sessionID's board unless the account is still
+// holding the stake that names it.
+//
+// It asks ONE question — does the escrow on guildID/userID carry this board's
+// mark — and it asks it of the store. It deliberately does NOT look at the
+// game: "the hand is over", "nothing was ever staked", "the refund said it
+// worked" are all beliefs of the caller, and every one of the five defects
+// above was a caller whose belief was true on the route it was written for and
+// false on the route next to it. Chips on the account are not a belief.
+//
+// A board is left standing when the stake is still marked with it, and when
+// the store cannot be read at all (an unreadable account is not evidence that
+// dropping is safe). Both leave the board for the idle sweep, which pays its
+// settlement and removes it — three minutes, rather than until the next
+// restart. An unknown or expired board is already somebody else's and is left
+// alone: expired belongs to the sweep goroutine until its settlement lands.
+//
+// Callers hold the board's per-board lock, the same as any other write to a
+// live board. Holding the board itself (Hold) is not required: a sweep that
+// takes the board while this is deciding wins it outright, because Close
+// refuses an expired board — so the worst case is that the sweeper, not this
+// call, is the one that retires it.
+func closeBoardIfSettled(bank casinoBank, sessions *casino.SessionManager, guildID, userID, sessionID string) error {
+	if _, live := sessions.Get(sessionID); !live {
+		return nil
+	}
+	held, err := bank.EscrowHeldBy(guildID, userID, sessionID)
+	if err != nil {
+		slog.Error("casino: reading the stake of a finished board failed, leaving it for the idle sweep", "session", sessionID, "error", redactInteractionError(err))
+		return err
+	}
+	if held {
+		slog.Warn("casino: a board still holds its stake and will not be closed, the idle sweep settles it", "session", sessionID)
+		return errBoardStillHoldsStake
+	}
+	sessions.Close(sessionID)
+	return nil
 }

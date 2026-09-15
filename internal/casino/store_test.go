@@ -2076,6 +2076,94 @@ func TestGameInProgress_AnswersForAnAccountItDoesNotDebit(t *testing.T) {
 	}
 }
 
+// C3B-P4: the command layer must not drop a board while the account is still
+// holding the stake that names it — the board is the only thing that can hand
+// those chips back. EscrowHeldBy is the read it decides with, and the mark has
+// to be exact: "some stake is held" (GameInProgress) would keep a board alive
+// for chips belonging to another game, and "no mark at all" must not be read
+// as this board's.
+func TestEscrowHeldBy_AnswersForTheBoardThatNamesTheStake(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	held, err := st.EscrowHeldBy(escrowGuild, escrowUser, escrowSession)
+	if err != nil {
+		t.Fatalf("EscrowHeldBy on a free account: %v", err)
+	}
+	if held {
+		t.Fatal("an account with nothing in escrow holds a board's stake")
+	}
+
+	if err := st.OpenGame(escrowGuild, escrowUser, "highlow", escrowSession, 250, fixedNow); err != nil {
+		t.Fatalf("OpenGame: %v", err)
+	}
+	if held, err = st.EscrowHeldBy(escrowGuild, escrowUser, escrowSession); err != nil || !held {
+		t.Fatalf("EscrowHeldBy = %v, %v for the board that opened the stake, want true, nil", held, err)
+	}
+	if held, err = st.EscrowHeldBy(escrowGuild, escrowUser, "board-2"); err != nil || held {
+		t.Fatalf("EscrowHeldBy = %v, %v for another board, want false, nil — this stake is not theirs to wait for", held, err)
+	}
+
+	if _, err := st.SettleGame(escrowGuild, escrowUser, escrowSession, 0); err != nil {
+		t.Fatalf("SettleGame: %v", err)
+	}
+	if held, err = st.EscrowHeldBy(escrowGuild, escrowUser, escrowSession); err != nil || held {
+		t.Fatalf("EscrowHeldBy = %v, %v after the settlement, want false, nil", held, err)
+	}
+}
+
+// A stake with no mark is the one a pre-C-3b file leaves behind, and it is NOT
+// this board's: every stake opened since names its board from its first write,
+// so a board kept alive for an unmarked escrow would never be released by
+// anything. (SettleGame's own rule is the opposite — see escrowOwnedByLocked —
+// because it is answering the other question: may this board be PAID.)
+func TestEscrowHeldBy_DoesNotClaimAnUnmarkedStake(t *testing.T) {
+	st, _ := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 750, Escrow: 250, EscrowGame: "highlow"})
+
+	held, err := st.EscrowHeldBy(escrowGuild, escrowUser, escrowSession)
+	if err != nil {
+		t.Fatalf("EscrowHeldBy: %v", err)
+	}
+	if held {
+		t.Fatal("an unmarked stake reads as this board's — a board would be kept alive for chips it can never release")
+	}
+}
+
+// Asking must not open an account, for the reason GameInProgress states: the
+// command layer asks this about every board it retires, including ones whose
+// account a failed open never created.
+func TestEscrowHeldBy_DoesNotCreateTheAccountItAsksAbout(t *testing.T) {
+	st, path := newTempStore(t)
+	seedAccount(t, st, escrowGuild, escrowUser, UserAccount{Chips: 1000})
+
+	for _, tc := range []struct{ name, guildID, userID string }{
+		{name: "unknown user in a known guild", guildID: escrowGuild, userID: "stranger"},
+		{name: "unknown guild", guildID: "guild-nobody-plays-in", userID: "stranger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			held, err := st.EscrowHeldBy(tc.guildID, tc.userID, escrowSession)
+			if err != nil {
+				t.Fatalf("EscrowHeldBy: %v", err)
+			}
+			if held {
+				t.Fatal("an account that does not exist holds a stake")
+			}
+		})
+	}
+
+	data, err := New(path).Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if _, created := data["guild-nobody-plays-in"]; created {
+		t.Error("the read created a guild that never played")
+	}
+	if _, created := data[escrowGuild].Users["stranger"]; created {
+		t.Error("the read created an account for a stranger")
+	}
+}
+
 // Asking about a stranger must not open an account for them: being named in
 // somebody else's /duel is not a casino interaction, and ensureAccountLocked
 // would hand them the 1,000-chip welcome bonus for it. An unknown guild and
