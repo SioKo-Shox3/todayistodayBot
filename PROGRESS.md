@@ -632,3 +632,52 @@
 - **テストの下準備も本番と同じ 1 回書きに直した**: `sweepFixtureFor` と duel の 3 箇所は
   `NewSessionID` → `OpenGame` → `OpenWithID`。`duelBankThatRefusesOneRefund` は
   `BindEscrowSession` ではなく `OpenGame` を包んで盤面 ID を覚える(`bound` → `board`)。
+## 反復 8(C3B-P1 → C3B-19) — 2026-09-15
+
+- **Done (先に差し戻し)**: C3B-P1。`DeclineDuel` の拒否を「預かりがそもそも無い(`ErrNoGameInProgress`)」と
+  「預かりが他人のもの(`ErrEscrowMismatch`)」の 2 つに割った。前は `Escrow == 0 || EscrowGame != duel` を
+  ひとまとめに `ErrNoGameInProgress` にしていたので、**H&L の預かり 100 を抱えた口座の duel 盤面**を掃除人が
+  「払うものが無い」と読んで削除していた。回帰 2 本(`TestSweepKeepsADuelWhoseChallengerIsStakedForAnotherGame`、
+  既存の H&L 版へ**ログ検査**を追加)。ゲート 4 本とも exit=0
+  (`.harness/runs/20260915-080323/verify-C3B-P1-{1,2,3,4}.txt`、`mutation-findings-7.txt`)。
+- **Done**: C3B-19。`runAnnouncePass` の `MarkAnnounced` を `markAnnouncedWithRetry` にした。
+  3 回・50ms/150ms、3 回とも失敗したら `slog.Warn` で「送信済みだが記録できなかった」と at-least-once を名指しする。
+  ゲート 3 本とも exit=0・全 8 パッケージ ok(`.harness/runs/20260915-080323/verify-C3B-19-{1,2,3}.txt`)。
+- **Next**: C3B-20(上限で切り詰められたジャックポットを「獲得」と書かない、P3)。未完は C3B-20 の 1 件のみ。
+
+### C3B-P1 — 「預かりが残る可能性がある限り盤面を消さない」に 3 経路とも揃えた
+
+- **同じ状況を 2 通りに扱っていた**。`SettleGame`(H&L・BJ)は `Escrow == 0` と印の不一致を分けていたのに、
+  `DeclineDuel` だけが「ゲーム種別が違う」も `ErrNoGameInProgress` に混ぜていた。掃除人はこの 2 つで
+  **盤面を落とすか保つか**を決めるので、混ぜた側だけが C2-10 を破っていた。
+- **永久に居座る盤面にはならない**。保持した duel 盤面は、そのチップを持つ盤面が精算した時点で
+  `Escrow == 0` になり、次の巡回が `ErrNoGameInProgress` で落とす。盤面の滞留自体は新しいゲームを
+  塞がない(塞いでいるのは預かりの方で、それは元から)。
+- **🚫 ボタンの文面が変わる**のは承知の上。この状態は「開始の隙間」ではなく実際の不整合なので、
+  `translateDuelPressError` の default(`slog.Error` + 汎用の失敗文言)に落ちるのが `ErrEscrowMismatch` の
+  扱いとして正しい。盤面は残るので、チップは次の巡回が返す。
+- **ログ検査を回帰に足した**(差し戻し 2 件目)。`assertSweepLoggedTheStakeMismatch` が
+  「`level=ERROR` で盤面 ID を名指す行」を要求する。保持は静かな挙動で、この行だけが運用者への唯一の通知。
+- **効き目の確認**: `DeclineDuel` を元の 1 本の条件に戻すと store 側とスイープ側の 2 本が落ち、
+  `slog.Error` を消すと H&L・duel の両方が落ちる(`mutation-findings-7.txt`)。
+
+### C3B-19 — 待ちを 2 つに分けた理由と、テストが「重複」を見られるようにした工夫
+
+- **`RunAnnounceScheduler` の署名は変えていない**。再試行の待ちは非公開の `runAnnouncePass` の
+  最後の引数(`markRetryWaiter`)として受け、`RunAnnounceScheduler` は本番の
+  `realMarkAnnouncedRetryWait` を渡すだけ。`SleepFunc`(翌朝 9 時までの待ち)と同じ関数にすると、
+  テストの stub が答えた `false` が「再試行を打ち切った」のか「スケジューラを止めた」のか区別できない。
+- **`healIfBroken` が無いと回帰が空振りする**。壊した store は `collectDailyAnnouncements` も落とすので、
+  2 巡目が**掲示にたどり着く前に**戻ってしまい、肝心の「もう一度出る」が観測できない。
+  壊れているときだけ種ファイルへ戻す(書けている store は触らない — 成功した記録を巻き戻さないため)。
+  これを入れて初めて、再試行を外す変異が「the day was posted 2 times」で落ちるようになった。
+- **2 巡目は翌日ではなく同じ日**。翌日は翌日で掲示を負っているので、再送の有無を測れない。
+  同じ日をもう一度巡回させる(再起動・9 時前後の起床)形にして、`LastAnnounced` が立ったかどうかだけを見る。
+- **回数の検査は最後**。`waits != 1` を先に置くと、変異が「仕組みが違う」で落ちて
+  「embed と当選祝いがもう一度出る」という**結果**で落ちなくなる。
+- **効き目の確認(mutation)**: 3 つの変異がそれぞれ落ちる(`mutation-C3B-19.txt`)。再試行ごと戻すと
+  「the day was posted 2 times ... u9」、`markAnnouncedWithRetry` が待ち手を無視すると同じ形、
+  `slog.Warn` だけ消すと「no at-least-once warning」。
+- **契約は変えていない**。`at-least-once` のまま。3 回とも失敗した後の巡回では embed も u9 への
+  メンションも本当にもう一度出ることを `TestRunAnnouncePass_AnUnrecordedAnnouncementWarnsAndIsPostedAgain` が
+  そのまま検査している(隠していない)。
