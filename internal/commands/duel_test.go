@@ -1214,3 +1214,74 @@ func TestDuelASecondStartInsideAWithdrawalStrandsNothing(t *testing.T) {
 		t.Errorf("%d challenges are still live after the withdrawal, want 0", c.sessions.Len())
 	}
 }
+
+// --- C3B-P5: 返金待ちの挑戦は受けられない -----------------------------------
+
+// A refund DeclineDuel would not take leaves the challenge STANDING (C3B-P3)
+// so the idle sweep can hand the stake back. Until C3B-P5 it was left standing
+// and still pressable, and /duel is the game where that costs a SECOND player:
+// ⚔️ stakes the opponent's own 100 and flips a coin for a challenge whose
+// chips are already on their way back to the challenger.
+//
+// /duel needs no payout fixed for its sweep — SettleTimedOutBoard is that same
+// DeclineDuel — but it records the mark anyway, because the mark is also what
+// casino.Session.RefundPending answers, and that one read is what all three
+// games ask before they take a press.
+func TestDuelRefusesAPressWhileItsRefundIsPending(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	c, bank := newDuelCommandOnRefusingBank(t, func() time.Time { return opened })
+	RegisterComponent(c) // the real settler, so the sweep withdraws like production
+
+	bank.refuseNextRefund = errors.New("the refund never reached the disk")
+	opener := &fakeCasinoResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(opener, duelSlashInteraction(duelOpponent, false, 100)); err == nil {
+		t.Fatal("/duel reported success although the challenge never reached Discord")
+	}
+
+	sessionID := bank.board
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Fatalf("challenger: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	if session, live := c.sessions.Get(sessionID); !live || !session.RefundPending() {
+		t.Fatal("the challenge whose refund was refused is not marked, so every gate below reads false")
+	}
+
+	presser := &fakeCasinoResponder{}
+	for _, action := range []string{duelActionAccept, duelActionDecline} {
+		customID := BuildCustomID(c.Prefix(), sessionID, action)
+		if err := c.handleComponent(presser, duelButtonInteraction(customID, duelOpponent), sessionID, action); err != nil {
+			t.Fatalf("press %q: %v", action, err)
+		}
+		if got := presser.last(t).Data.Content; got != casinoSettleFailedMessage {
+			t.Errorf("%q on a challenge awaiting its refund answered %q, want %q", action, got, casinoSettleFailedMessage)
+		}
+	}
+
+	// Neither side moved a chip: the coin was never flipped, and the stake is
+	// still where the sweep will find it.
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 900 || escrow != 100 {
+		t.Errorf("challenger: %d chips / %d escrow after the presses, want 900 / 100 unchanged", chips, escrow)
+	}
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelOpponent); chips != 1000 || escrow != 0 {
+		t.Errorf("opponent: %d chips / %d escrow after the presses, want 1000 / 0 — ⚔️ staked them on a challenge being refunded", chips, escrow)
+	}
+	if bank.declines != 1 {
+		t.Errorf("DeclineDuel was called %d times, want 1 (the undelivered cleanup alone) — a refused press must not refund either", bank.declines)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d challenges are live after the presses, want 1 — the sweep is what pays this one", c.sessions.Len())
+	}
+
+	// Three minutes on, the sweeper withdraws the stake it can still see.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := duelHoldings(t, bank.flakyBank, duelChallenger); chips != 1000 || escrow != 0 {
+		t.Errorf("challenger: %d chips / %d escrow after the sweep, want 1000 / 0", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d challenges survived the sweep, want 0", c.sessions.Len())
+	}
+}

@@ -1257,3 +1257,95 @@ func TestHighLowUndeliveredBoardKeepsTheBoardUntilTheRefundLands(t *testing.T) {
 		t.Errorf("SettleGame was called %d times, want 2 (the undelivered cleanup, then the sweep's retry)", bank.settles)
 	}
 }
+
+// --- C3B-P5: 返金待ちの盤面はプレイできない ---------------------------------
+
+// A refund the store refused leaves the board STANDING (C3B-P3), so the idle
+// sweep can still find the stake, and fixes the amount that sweep must pay.
+// Fixing the amount was only half of what "returns the stake" means: the board
+// stayed pressable, so the player could go on guessing on it. With the zeroRng
+// deck below the first guess wins and lifts the pot off the bet — and the
+// sweeper would still hand back the 100 it had already written down, paying
+// out less than the board in front of the player said it was worth.
+//
+// The board is now refused as soon as it is marked: the refund is the whole of
+// what is left to happen on it.
+func TestHighLowRefusesAPressWhileItsRefundIsPending(t *testing.T) {
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &HighLowCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.HighLowGame { return casino.NewHighLow(bet, zeroRng{}) },
+	}
+
+	bank.settleErr = errors.New("the refund never reached the disk")
+	opener := &fakeHighLowResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(opener, highLowSlashInteraction(100)); err == nil {
+		t.Fatal("/highlow reported success although the board never reached Discord")
+	}
+	bank.settleErr = nil // the disk comes back, and the player presses before the sweep runs
+
+	// The board Discord never delivered still carries its own buttons, which
+	// is exactly how a stale press finds it.
+	_, sessionID, _, ok := ParseCustomID(highLowButtonsOf(t, opener.last(t))[0].CustomID)
+	if !ok {
+		t.Fatal("the undelivered board's first button does not carry a parsable custom_id")
+	}
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	settlesBeforeThePresses := bank.settles
+
+	// ハイ → ロー, the sequence that used to raise the pot to 101.
+	presser := &fakeHighLowResponder{}
+	for _, action := range []string{highLowActionHigh, highLowActionLow} {
+		resp := c.press(t, presser, sessionID, action)
+		if resp.Data.Content != casinoSettleFailedMessage {
+			t.Errorf("%q on a board awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoSettleFailedMessage)
+		}
+		if resp.Type == discordgo.InteractionResponseUpdateMessage {
+			t.Errorf("%q repainted a board whose refund is still owed", action)
+		}
+	}
+
+	// The numbers the presses were supposed to move, and did not.
+	if pot := highLowPotOf(t, c.sessions, sessionID); pot != 100 {
+		t.Errorf("pot = %d after the presses, want the bet (100) — the board played on while its refund was owed", pot)
+	}
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Errorf("player: %d chips / %d escrow after the presses, want 900 / 100 unchanged", chips, escrow)
+	}
+	if bank.settles != settlesBeforeThePresses {
+		t.Errorf("SettleGame was called %d times, want %d — a refused press must not settle anything", bank.settles, settlesBeforeThePresses)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d boards are live after the presses, want 1 — the sweep is what pays this one", c.sessions.Len())
+	}
+
+	// Three minutes on, the refund lands, and it is the whole stake.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 1000 || escrow != 0 {
+		t.Errorf("player: %d chips / %d escrow after the sweep, want 1000 / 0", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d boards survived the sweep, want 0", c.sessions.Len())
+	}
+}
+
+// highLowPotOf reads the pot off a live board. The board is the only place the
+// press's effect would show: a guess moves no chips on the account, so an
+// escrow that has not changed does not by itself prove the press was refused.
+func highLowPotOf(t *testing.T, sessions *casino.SessionManager, sessionID string) int64 {
+	t.Helper()
+	session, live := sessions.Get(sessionID)
+	if !live {
+		t.Fatalf("board %s is no longer live", sessionID)
+	}
+	game, isHighLow := session.State.(*casino.HighLowGame)
+	if !isHighLow {
+		t.Fatalf("board state is %T, want *casino.HighLowGame", session.State)
+	}
+	return game.Pot()
+}

@@ -1181,3 +1181,86 @@ func TestBlackjackHandSettledAtTheDealIsRetiredOnceItsPayoutLands(t *testing.T) 
 		t.Errorf("%d hands are live after a hand that ended at the deal, want 0", c.sessions.Len())
 	}
 }
+
+// --- C3B-P5: 返金待ちの手はプレイできない -----------------------------------
+
+// The refund of an undelivered hand that the store would not take leaves the
+// hand STANDING (C3B-P3) and fixes what the sweep owes for it. Fixing the
+// amount was only half of it: the hand stayed playable, so ⏫ would stake a
+// SECOND bet on a hand whose payout had already been written down as the
+// original one — 200 in escrow against a refund of 100 — and a stand would
+// decide, against a dealer, a hand the player never saw a card of.
+//
+// Both are refused now, and the numbers below are the ones that used to move.
+func TestBlackjackRefusesAPressWhileItsRefundIsPending(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	seed := blackjackSeedWhere(t, "a playable hand that can still double", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying && g.CanDouble()
+	})
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &BlackjackCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.BlackjackGame { return casino.NewBlackjack(bet, blackjackRngFor(seed)) },
+	}
+	RegisterComponent(c) // the sweeper routes a swept hand through the registry
+
+	bank.settleErr = errors.New("the refund never reached the disk")
+	opener := &fakeCasinoResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(opener, blackjackSlashInteraction(100)); err == nil {
+		t.Fatal("/blackjack reported success although the hand never reached Discord")
+	}
+	bank.settleErr = nil // the disk comes back, and the player presses before the sweep runs
+
+	// The hand Discord never delivered still carries its own buttons, which is
+	// exactly how a stale press finds it.
+	_, sessionID, _, ok := ParseCustomID(blackjackButtonsOf(t, opener.last(t))[0].CustomID)
+	if !ok {
+		t.Fatal("the undelivered hand's first button does not carry a parsable custom_id")
+	}
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	settlesBeforeThePresses := bank.settles
+
+	// ⏫ first: it is the press that writes to the ACCOUNT before the hand ever
+	// sees it, so a gate that only guarded the game move would let it through.
+	presser := &fakeCasinoResponder{}
+	for _, action := range []string{blackjackActionDouble, blackjackActionHit, blackjackActionStand} {
+		resp := c.press(t, presser, sessionID, action)
+		if resp.Data.Content != casinoSettleFailedMessage {
+			t.Errorf("%q on a hand awaiting its refund answered %q, want %q", action, resp.Data.Content, casinoSettleFailedMessage)
+		}
+		if resp.Type == discordgo.InteractionResponseUpdateMessage {
+			t.Errorf("%q repainted a hand whose refund is still owed", action)
+		}
+		if escrow := highLowEscrowOf(t, bank); escrow != 100 {
+			t.Fatalf("escrow = %d after %q, want the single stake (100) — a second bet was taken on a hand that is being refunded", escrow, action)
+		}
+	}
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Errorf("player: %d chips / %d escrow after the presses, want 900 / 100 unchanged", chips, escrow)
+	}
+	if bank.settles != settlesBeforeThePresses {
+		t.Errorf("SettleGame was called %d times, want %d — a refused press must not settle anything", bank.settles, settlesBeforeThePresses)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d hands are live after the presses, want 1 — the sweep is what pays this one", c.sessions.Len())
+	}
+
+	// Three minutes on, the refund lands, and it is the whole stake — not a
+	// hand played out on the player's behalf.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 1000 || escrow != 0 {
+		t.Errorf("player: %d chips / %d escrow after the sweep, want 1000 / 0", chips, escrow)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d hands survived the sweep, want 0", c.sessions.Len())
+	}
+}

@@ -868,3 +868,50 @@ func TestSessionMarkRefundPendingFixesWhatTheSweepPays(t *testing.T) {
 		t.Errorf("PendingPayout = %d after the refused marks, want 100", expired[0].PendingPayout)
 	}
 }
+
+// RefundPending is the ONE read the command layer uses to decide that a board
+// may no longer be operated on (C3B-P5). It has to answer for the state
+// MarkRefundPending leaves behind and for nothing else: a board that is simply
+// live is still a game, and a board the sweeper has already taken is refused
+// long before this question is asked.
+func TestSessionRefundPendingIsTrueExactlyWhileARefundIsOwed(t *testing.T) {
+	m := NewSessionManager(nil, DefaultSessionTTL)
+
+	opened, err := m.Open("g1", "u1", GameHighLow, &struct{}{}, MessageRef{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if opened.RefundPending() {
+		t.Error("a board that has just opened reports a refund pending")
+	}
+
+	// A press reads the board out of Hold, so that copy is the one that has
+	// to carry the answer.
+	if !m.MarkRefundPending(opened.ID, 100) {
+		t.Fatal("MarkRefundPending refused a live board")
+	}
+	held, ok := m.Hold(opened.ID)
+	if !ok {
+		t.Fatal("Hold refused the board a refund is owed on — the sweeper still has to reach it")
+	}
+	m.Release(opened.ID)
+	if !held.RefundPending() {
+		t.Error("the board a refund is owed on does not report it, so a press would play on")
+	}
+	if got, live := m.Get(opened.ID); !live || !got.RefundPending() {
+		t.Error("Get reports no refund pending on a marked board")
+	}
+
+	// A refund of 0 is still a refund: the answer must not be read off the
+	// amount, which is what PayoutResolved exists to separate.
+	other, err := m.Open("g1", "u2", GameBlackjack, &struct{}{}, MessageRef{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !m.MarkRefundPending(other.ID, 0) {
+		t.Fatal("MarkRefundPending refused a live board")
+	}
+	if got, live := m.Get(other.ID); !live || !got.RefundPending() {
+		t.Error("a board marked for a 0 refund reports no refund pending")
+	}
+}

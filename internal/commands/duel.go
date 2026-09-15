@@ -498,7 +498,7 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 			Components: duelButtons(session.ID, false),
 		},
 	}); err != nil {
-		c.withdrawUndeliveredChallenge(i.GuildID, challengerID, session.ID)
+		c.withdrawUndeliveredChallenge(i.GuildID, challengerID, session.ID, bet)
 		return err
 	}
 
@@ -523,7 +523,7 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 // after it would strand the stake with no button and no retry left; keeping
 // the board is what makes the next sweep (three minutes on) the retry, the
 // same order the sweeper itself keeps for a settlement (C2-10).
-func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessionID string) {
+func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessionID string, bet int64) {
 	lock := c.locks.acquire(sessionID)
 	defer c.locks.release(sessionID, lock)
 
@@ -534,11 +534,20 @@ func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessio
 
 	if err := c.store.DeclineDuel(guildID, challengerID, sessionID); err != nil {
 		slog.Error("casino: refunding an undelivered duel challenge failed, the sweeper retries it", "error", redactInteractionError(err))
-		// No MarkRefundPending here, unlike /highlow and /blackjack: a swept
-		// challenge is settled by SettleTimedOutBoard, which is already the
-		// same DeclineDuel — a withdrawal of the whole stake that never plays
-		// the coin. There is no AutoResolve on this path to take out of the
-		// decision (設計書 C-3b §4.5).
+		// The mark says the same thing here as in /highlow and /blackjack:
+		// this challenge is standing only so the next sweep can hand the
+		// stake back, and it is no longer something ⚔️ or 🚫 may move
+		// (C3B-P5). Without it the gate in handleComponent never fires on
+		// /duel, and a stale ⚔️ would stake the OPPONENT's chips too and flip
+		// a coin for a challenge that is already being refunded.
+		//
+		// The amount is the part /duel does not need: a swept challenge is
+		// settled by SettleTimedOutBoard, which is this same DeclineDuel — a
+		// withdrawal of the whole stake that never plays the coin — and
+		// settleSweptBoard asks that settler before it ever looks at
+		// PendingPayout (設計書 C-3b §4.5). It is the challenger's stake all
+		// the same, so recording it cannot describe the board wrongly.
+		c.sessions.MarkRefundPending(sessionID, bet)
 		return
 	}
 	closeBoardIfSettled(c.store, c.sessions, guildID, challengerID, sessionID)
