@@ -601,3 +601,34 @@
   文面だけの話なので P3。
 - **`NEXT_FINDINGS.md` の空化を戻した**: 反復 5 までに見出しごと消えていたが、中身は所見ではなく
   雛形の説明文だけだったので `git checkout` で復元した(コミットには含めていない)。
+
+## 反復 7(C3B-18) — 2026-09-15
+
+- **Done**: C3B-18。`casino.NewSessionID()` を公開し、H&L・BJ・duel の 3 経路とも**盤面 ID を先に作って**
+  `OpenGame(..., sessionID)` と `SessionManager.OpenWithID(sessionID, ...)` へ同じ ID を渡す形に揃えた。
+  `EscrowOpening` と `BindEscrowSession` は削除。掃除人は `ErrEscrowMismatch` で盤面を落とさなくなった。
+  ゲート 4 本とも exit=0・全 8 パッケージ ok(`.harness/runs/20260915-080323/verify-C3B-18-{1,2,3,4}.txt`)。
+- **Next**: C3B-19(`MarkAnnounced` にも同じ再試行)。未完は C3B-19・C3B-20 の 2 件。
+- **隙間を塞ぐのではなく無くした**: 2 段階(`OpenGame(EscrowOpening)` → `BindEscrowSession(session.ID)`)の
+  あいだ、預かりは**どの盤面も名乗れない印**を持っていた。掃除がそこに挟まると精算が `ErrEscrowMismatch` に
+  なり、旧コードは盤面を落として預かりを取り残した。ID の生成は乱数を引くだけでチップを動かさないので、
+  **ステークの前に**引ける — 引いてしまえば最初の書き込みからずっと印は本物の盤面 ID で、隙間が存在しない。
+  `crypto/rand` が尽きた場合はまだ何も賭けていないので、断るだけで返金は要らない。
+- **`Open` は残した**(ID を自分で作る呼び出し側のまま)。`OpenWithID` が本体で、`Open` は
+  `NewSessionID` + `OpenWithID`。既存のテスト 30 箇所が `Open` を使っており、そちらは盤面 ID を
+  先に知る必要がない。
+- **`ErrSessionIDTaken` を足した**: `OpenWithID` に生きている ID を渡すと拒否する。乱数 16 バイトでは
+  起きないが、定数を渡す呼び出し側が**他人の盤面を乗っ取る**(その預かりごと)ことだけは防いでおく。
+- **掃除人の 2 つの拒否を分けた**: `ErrNoGameInProgress` は「払うものがもう無い」なので今までどおり
+  盤面を落とす(再試行しても永久に見つからず、持ち主が新しいゲームを開けなくなるだけ)。
+  `ErrEscrowMismatch` は「**チップの持ち主について食い違っている**」で、落とすとその巡回が既に決めた
+  配当ごと捨てたうえ預かりも残る。C2-10 の「精算が成功するまで消さない」に揃え、`slog.Error` を出して
+  次の巡回に再試行させる。印が開始前に確定した今、不一致は開始の隙間ではなく**実際の不整合**を意味する。
+- **効き目の確認(mutation)**: 3 つの変異がそれぞれ対応するテストで落ちる(`mutation-C3B-18.txt`)。
+  掃除人に `Remove` を戻すと `TestSweepKeepsABoardWhoseStakeBelongsToAnotherBoard` が落ち、
+  `/highlow` が別 ID で盤面を開くと「staked for X but the board went live as Y」と
+  「escrow = 100 after the sweep」= まさに直した欠陥の形で落ち、`OpenWithID` が呼び出し側の ID を
+  捨てると 3 ゲームとも同じ形で落ちる。
+- **テストの下準備も本番と同じ 1 回書きに直した**: `sweepFixtureFor` と duel の 3 箇所は
+  `NewSessionID` → `OpenGame` → `OpenWithID`。`duelBankThatRefusesOneRefund` は
+  `BindEscrowSession` ではなく `OpenGame` を包んで盤面 ID を覚える(`bound` → `board`)。
