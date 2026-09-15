@@ -383,6 +383,11 @@ func (c *BlackjackCommand) handle(r interactionResponder, i *discordgo.Interacti
 	if err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateBlackjackError(err)))
 	}
+	// The hand comes back HELD and stays held for the whole open (C3B-P3),
+	// for the reason /highlow states: the sweep must not be able to take the
+	// board between the registration and the stake, where the open would
+	// then leave an escrow that no board names.
+	defer c.sessions.Release(sessionID)
 
 	// Store.OpenGame is still the persisted half of "one game per person",
 	// and the half that survives a restart. ⏫, every press and the sweeper
@@ -446,11 +451,14 @@ func (c *BlackjackCommand) settleDealtHand(r interactionResponder, i *discordgo.
 // exactly the bet.
 //
 // The refund goes BEFORE the hand is retired, the order /highlow and /duel
-// keep, so the chips are never in escrow with no board naming them. Unlike
-// those two the hand is retired even when the refund FAILED: blackjack's
-// AutoResolve stands the hand, so leaving this board for the idle sweep would
-// play out — and can lose — a hand the player never saw. A stake left here
-// comes back whole at the next restart (RefundStaleEscrows) instead.
+// keep, so the chips are never in escrow with no board naming them — and a
+// refund that FAILED leaves the hand standing, exactly like those two
+// (C3B-P3). Retiring it there used to be justified by "the sweep would stand
+// this hand", which was the wrong half of the trade: it did avoid playing a
+// hand the player never saw, but it did so by throwing away the only thing
+// that could still return the chips before the next restart. The mark below
+// is what removes the trade — the hand is never played out AND the stake is
+// returned by the next pass.
 func (c *BlackjackCommand) withdrawUndeliveredHand(sessionID, guildID, userID string, bet int64) {
 	lock := c.locks.acquire(sessionID)
 	defer c.locks.release(sessionID, lock)
@@ -460,22 +468,33 @@ func (c *BlackjackCommand) withdrawUndeliveredHand(sessionID, guildID, userID st
 	}
 	defer c.sessions.Release(sessionID)
 
-	c.refundUnplayableHand(guildID, userID, sessionID, bet)
+	if err := c.refundUnplayableHand(guildID, userID, sessionID, bet); err != nil {
+		// The chips never moved, so the hand may not be retired: a board that
+		// is gone has no press and no sweep left to give them back, and the
+		// stake would sit in escrow — blocking every new game — until the
+		// next restart. The mark makes the idle sweep hand back exactly this
+		// stake instead of standing the hand: the cards were never seen, so
+		// there is nothing to decide, only chips to return.
+		c.sessions.MarkRefundPending(sessionID, bet)
+		return
+	}
 	c.sessions.Close(sessionID)
 }
 
-// refundUnplayableHand returns a stake whose hand never became playable.
-// Failing only means the chips stay in escrow until the next restart returns
-// them (RefundStaleEscrows), so it is logged rather than shown to the player,
-// who already has a refusal in front of them.
+// refundUnplayableHand returns a stake whose hand never became playable and
+// reports whether the chips moved. A failure is logged rather than shown to
+// the player, who already has a refusal in front of them, and the caller
+// keeps the board so the idle sweep can retry the refund.
 //
 // escrowID is the mark the stake carries at this point of the open — see
-// /highlow's refundUnplayableBoard — so the refund can only ever hand back
+// /highlow's withdrawUndeliveredBoard — so the refund can only ever hand back
 // the chips this hand staked.
-func (c *BlackjackCommand) refundUnplayableHand(guildID, userID, escrowID string, bet int64) {
+func (c *BlackjackCommand) refundUnplayableHand(guildID, userID, escrowID string, bet int64) error {
 	if _, err := c.store.SettleGame(guildID, userID, escrowID, bet); err != nil {
-		slog.Error("casino: refunding an undelivered blackjack hand failed", "error", redactInteractionError(err))
+		slog.Error("casino: refunding an undelivered blackjack hand failed, the sweeper retries it", "error", redactInteractionError(err))
+		return err
 	}
+	return nil
 }
 
 // affordsDouble reports whether the ⏫ button should be live. The store is

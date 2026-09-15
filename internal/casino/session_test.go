@@ -33,6 +33,12 @@ func (c *fixedClock) advance(d time.Duration) {
 // carries it, so its contents never matter beyond round-tripping.
 var testRef = MessageRef{ChannelID: "chan-1", MessageID: "msg-1"}
 
+// endOpen ends the hold every open hands back (C3B-P3). It leaves the board
+// in the state a finished start path leaves it in — live, idle and visible to
+// the sweep — which is what the tests below are about. A test that does NOT
+// call it is testing the open's own hold instead.
+func endOpen(m *SessionManager, session *Session) { m.Release(session.ID) }
+
 func TestSessionOpenRefusesASecondGameForTheSamePlayer(t *testing.T) {
 	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
 	m := NewSessionManager(clock.Now, time.Minute)
@@ -243,12 +249,14 @@ func TestSessionSweepReturnsOnlyIdleSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open old: %v", err)
 	}
+	endOpen(m, old)
 
 	clock.advance(2 * time.Minute)
 	fresh, err := m.Open("guild-1", "user-fresh", GameBlackjack, &struct{}{}, testRef)
 	if err != nil {
 		t.Fatalf("Open fresh: %v", err)
 	}
+	endOpen(m, fresh)
 
 	// t+3m: the first session is exactly at the TTL (the deadline is
 	// inclusive), the second has been idle for one minute.
@@ -307,6 +315,7 @@ func TestSessionSweepKeepsReturningAnExpiredBoardUntilRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 
 	clock.advance(3 * time.Minute)
 	if swept := m.Sweep(clock.Now()); len(swept) != 1 || swept[0].ID != opened.ID {
@@ -360,6 +369,7 @@ func TestSessionExpiredBoardIsRefusedByEveryPressPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 
 	clock.advance(3 * time.Minute)
 	if swept := m.Sweep(clock.Now()); len(swept) != 1 {
@@ -410,6 +420,7 @@ func TestSessionTouchExtendsTheDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 
 	clock.advance(2 * time.Minute)
 	m.Touch(opened.ID, clock.Now())
@@ -563,10 +574,12 @@ func TestSessionSweepSkipsAHeldBoard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening the held board: %v", err)
 	}
+	endOpen(m, held)
 	idle, err := m.Open("guild-1", "user-2", GameBlackjack, &struct{}{}, testRef)
 	if err != nil {
 		t.Fatalf("opening the idle board: %v", err)
 	}
+	endOpen(m, idle)
 
 	copied, ok := m.Hold(held.ID)
 	if !ok {
@@ -632,6 +645,7 @@ func TestSessionHoldCountsEveryOperation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, session)
 	for i := 0; i < 2; i++ {
 		if _, ok := m.Hold(session.ID); !ok {
 			t.Fatalf("Hold %d refused a live board", i+1)
@@ -658,6 +672,7 @@ func TestSessionSetNeedsRedrawMarksOnlyALiveBoard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	endOpen(m, opened)
 	if session, _ := m.Get(opened.ID); session.NeedsRedraw {
 		t.Fatal("a board is born needing a redraw")
 	}
@@ -772,5 +787,84 @@ func TestNewSessionIDIsUnguessableAndUnique(t *testing.T) {
 			t.Fatalf("NewSessionID() repeated %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// --- the open's own hold (C3B-P3) ------------------------------------------
+
+// An open is the first operation on a board, and the command layer needs the
+// board to still be there when it comes back: the stake it writes next names
+// this board, and chips that no board names are unreachable by every press
+// and every later pass. Handing the board back HELD is what guarantees it,
+// and it is the only form that can — a Hold taken as a second call would
+// leave exactly the gap it is meant to close.
+func TestSessionOpenHandsBackABoardTheSweepCannotTake(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameHighLow, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// The whole TTL passes while the start path is still running.
+	clock.advance(time.Minute)
+	if expired := m.Sweep(clock.Now()); len(expired) != 0 {
+		t.Fatalf("Sweep took %d board(s) whose open has not finished, want 0", len(expired))
+	}
+	if _, live := m.Get(opened.ID); !live {
+		t.Fatal("the board was swept away in the middle of its own open")
+	}
+
+	// The hold is an ordinary one: it ends with a single Release, and the
+	// board is then swept like any other. A hold that outlived its open would
+	// strand the stake exactly as thoroughly as the sweep it prevents.
+	endOpen(m, opened)
+	if expired := m.Sweep(clock.Now()); len(expired) != 1 || expired[0].ID != opened.ID {
+		t.Fatalf("after the open ended, Sweep returned %d board(s), want the idle one", len(expired))
+	}
+}
+
+// --- a refund the caller could not persist (C3B-P3) ------------------------
+
+// MarkRefundPending is how a refund that failed stays a refund: the sweeper
+// settles a board it takes over by resolving the board first, and for
+// blackjack that stands the hand. A marked board is settled for the amount
+// the caller could not pay, and its game is never asked.
+func TestSessionMarkRefundPendingFixesWhatTheSweepPays(t *testing.T) {
+	clock := newFixedClock(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
+	m := NewSessionManager(clock.Now, time.Minute)
+
+	opened, err := m.Open("guild-1", "user-1", GameBlackjack, &struct{}{}, testRef)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !m.MarkRefundPending(opened.ID, 100) {
+		t.Fatal("MarkRefundPending refused a live board")
+	}
+	endOpen(m, opened)
+
+	clock.advance(time.Minute)
+	expired := m.Sweep(clock.Now())
+	if len(expired) != 1 {
+		t.Fatalf("Sweep returned %d board(s), want the marked one", len(expired))
+	}
+	if !expired[0].PayoutResolved {
+		t.Error("the marked board is not resolved, so the sweeper would play it out instead of refunding it")
+	}
+	if expired[0].PendingPayout != 100 {
+		t.Errorf("PendingPayout = %d, want the stake the refund could not pay (100)", expired[0].PendingPayout)
+	}
+
+	// An expired board belongs to the sweep goroutine, which reads these two
+	// fields without the lock; an unknown one is gone. Neither takes a mark.
+	if m.MarkRefundPending(opened.ID, 50) {
+		t.Error("MarkRefundPending wrote to an expired board the sweeper is already settling")
+	}
+	if m.MarkRefundPending("no-such-board", 50) {
+		t.Error("MarkRefundPending claimed a board that does not exist")
+	}
+	if expired[0].PendingPayout != 100 {
+		t.Errorf("PendingPayout = %d after the refused marks, want 100", expired[0].PendingPayout)
 	}
 }

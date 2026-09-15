@@ -487,6 +487,11 @@ func (c *DuelCommand) handle(r interactionResponder, i *discordgo.InteractionCre
 	if err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateDuelError(err)))
 	}
+	// The challenge comes back HELD and stays held for the whole open
+	// (C3B-P3), for the reason /highlow states: the sweep must not be able to
+	// withdraw a challenge between its registration and the challenger's
+	// stake, where the open would then leave an escrow that no board names.
+	defer c.sessions.Release(sessionID)
 
 	// The persisted half of "one game per person" is the half that survives a
 	// restart, so it still has its say here: an escrow left behind by a
@@ -542,6 +547,11 @@ func (c *DuelCommand) withdrawUndeliveredChallenge(guildID, challengerID, sessio
 
 	if err := c.store.DeclineDuel(guildID, challengerID, sessionID); err != nil {
 		slog.Error("casino: refunding an undelivered duel challenge failed, the sweeper retries it", "error", redactInteractionError(err))
+		// No MarkRefundPending here, unlike /highlow and /blackjack: a swept
+		// challenge is settled by SettleTimedOutBoard, which is already the
+		// same DeclineDuel — a withdrawal of the whole stake that never plays
+		// the coin. There is no AutoResolve on this path to take out of the
+		// decision (設計書 C-3b §4.5).
 		return
 	}
 	c.sessions.Close(sessionID)

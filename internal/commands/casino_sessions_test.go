@@ -114,6 +114,10 @@ func sweepFixtureFor(t *testing.T, game casino.GameKind, state any, bet int64, r
 	if err != nil {
 		t.Fatalf("opening the board: %v", err)
 	}
+	// An open hands back a HELD board (C3B-P3) and the sweeper skips held
+	// boards, so the fixture has to end the open the way a start path does
+	// before it hands the board to a test that sweeps it.
+	mgr.Release(session.ID)
 	return bank, mgr, session, opened
 }
 
@@ -732,10 +736,21 @@ func TestSweepingABoardTheInstantItOpensReturnsTheStake(t *testing.T) {
 // instant the board was opened.
 func openBoardTheCommandWay(t *testing.T, game casino.GameKind, bet int64) (*flakyBank, *casino.SessionManager, string, time.Time) {
 	t.Helper()
+	return openBoardTheCommandWayWith(t, game, bet, nil)
+}
+
+// openBoardTheCommandWayWith is openBoardTheCommandWay for a test that has to
+// arrange something on the bank or the manager BEFORE the start path runs —
+// the only way to act inside an open, which is otherwise a single call.
+func openBoardTheCommandWayWith(t *testing.T, game casino.GameKind, bet int64, before func(*flakyBank, *casino.SessionManager, time.Time)) (*flakyBank, *casino.SessionManager, string, time.Time) {
+	t.Helper()
 
 	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
 	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
 	mgr := casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL)
+	if before != nil {
+		before(bank, mgr, opened)
+	}
 
 	switch game {
 	case casino.GameHighLow:
@@ -753,6 +768,72 @@ func openBoardTheCommandWay(t *testing.T, game casino.GameKind, bet int64) (*fla
 	}
 	t.Fatalf("no start path for %q", game)
 	return nil, nil, "", opened
+}
+
+// --- the sweeper stays out of an open (C3B-P3) -----------------------------
+
+// 反復 1 の差し戻し 1: an open is TWO writes — the board into the manager, the
+// stake onto the account — and the sweeper used to be able to run between
+// them. It found a board with no stake behind it, settled it for nothing and
+// removed it; the open then carried on and wrote an escrow that named a board
+// which no longer existed. Nothing could reach those chips again: no button,
+// because the board was gone, and no later sweep, for the same reason. Only a
+// restart returned them.
+//
+// The board is now HELD from its first instant, and a held board is not in
+// the sweep's domain at all, so the pass below — a real sweepIdleBoards,
+// driven from inside the gap by the bank itself — has to leave it alone.
+func TestSweepDuringAnOpenLeavesTheBoardForTheStakeThatIsComing(t *testing.T) {
+	for _, game := range []casino.GameKind{casino.GameHighLow, casino.GameBlackjack, casino.GameDuel} {
+		t.Run(string(game), func(t *testing.T) {
+			resetComponentsForTest()
+			t.Cleanup(resetComponentsForTest)
+
+			swept := 0
+			bank, mgr, sessionID, opened := openBoardTheCommandWayWith(t, game, 100,
+				func(bank *flakyBank, mgr *casino.SessionManager, opened time.Time) {
+					// Inside the gap: the board is registered, no chips have
+					// moved, and the whole TTL passes before the stake lands.
+					bank.beforeOpenGame = func() {
+						swept++
+						sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
+					}
+				})
+
+			if swept != 1 {
+				t.Fatalf("the sweep ran %d times inside the open, want 1 — the test proves nothing otherwise", swept)
+			}
+			if _, live := mgr.Get(sessionID); !live {
+				t.Fatalf("board %q was swept away in the middle of its own open", sessionID)
+			}
+			if mgr.Len() != 1 {
+				t.Fatalf("%d boards are live after the open, want 1", mgr.Len())
+			}
+			// The stake and the board name each other (設計書 C-3b), which is
+			// the whole point: chips that no board names are unreachable.
+			view, err := bank.ViewAccount("g1", "u1", opened)
+			if err != nil {
+				t.Fatalf("ViewAccount: %v", err)
+			}
+			if view.Account.Escrow != 100 {
+				t.Fatalf("escrow = %d after the open, want 100", view.Account.Escrow)
+			}
+			if view.Account.EscrowSession != sessionID {
+				t.Fatalf("the stake names board %q, want the live board %q", view.Account.EscrowSession, sessionID)
+			}
+
+			// And the board is a normal board afterwards: the next pass takes
+			// it and the chips come back. A hold that outlived its open would
+			// strand them just as thoroughly as the sweep used to.
+			sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
+			if _, escrow := sweepChipsOf(t, bank); escrow != 0 {
+				t.Errorf("escrow = %d after the board timed out, want 0 — the stake is stranded", escrow)
+			}
+			if mgr.Len() != 0 {
+				t.Errorf("%d boards survived the timeout, want 0", mgr.Len())
+			}
+		})
+	}
 }
 
 // --- the sweeper keeps a board it could not settle (C2-10) -----------------
@@ -781,6 +862,7 @@ func TestSweepKeepsABoardWhoseStakeBelongsToAnotherBoard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening the board: %v", err)
 	}
+	mgr.Release(session.ID) // the open is over, so the sweeper may take it
 
 	logs := captureSlogOutput(t)
 	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))
@@ -877,6 +959,7 @@ func TestSweepKeepsADuelWhoseChallengerIsStakedForAnotherGame(t *testing.T) {
 		casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
 		t.Fatalf("opening the challenge: %v", err)
 	}
+	mgr.Release("stranded-duel") // the open is over, so the sweeper may take it
 
 	logs := captureSlogOutput(t)
 	sweepIdleBoards(newRecordingEditor(), mgr, bank, opened.Add(casino.DefaultSessionTTL))

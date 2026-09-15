@@ -807,6 +807,11 @@ type flakyBank struct {
 	// the chips moved and a refund happened to work.
 	openErr error
 	opens   int
+	// beforeOpenGame runs once, immediately BEFORE a stake is written. That
+	// is the gap C3B-P3 closes — the board is registered and no chips have
+	// moved — and this is how a test gets to drive a whole sweep pass inside
+	// it instead of hoping to hit it by timing.
+	beforeOpenGame func()
 	// afterAddToEscrow runs once, immediately after a stake has landed on
 	// disk. That is the gap 反復 1 の指摘 2 names — AddToEscrow is disk I/O, so
 	// it cannot run inside WithSession — and this is how a test gets to act
@@ -823,6 +828,10 @@ func (b *flakyBank) SettleGame(guildID, userID, sessionID string, payout int64) 
 }
 
 func (b *flakyBank) OpenGame(guildID, userID, game, sessionID string, bet int64, now time.Time) error {
+	if hook := b.beforeOpenGame; hook != nil {
+		b.beforeOpenGame = nil // once — the hook must not re-enter its own stake
+		hook()
+	}
 	b.opens++
 	if b.openErr != nil {
 		return b.openErr

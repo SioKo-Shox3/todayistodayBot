@@ -1023,3 +1023,71 @@ func TestBlackjackRedrawOutranksADoublesStake(t *testing.T) {
 		t.Error("the redraw closed the hand")
 	}
 }
+
+// --- 反復 1 の差し戻し 2(C3B-P3)------------------------------------------
+
+// A hand whose board never reached Discord and whose refund the store then
+// refused used to be retired anyway, and the justification was real: leaving
+// it for the idle sweep meant AutoResolve, and blackjack's AutoResolve STANDS
+// the hand — it would decide, and can lose, a hand the player never saw.
+//
+// But retiring it threw away the only thing that could still return the chips
+// before the next restart. The board is what the sweeper retries through, so
+// closing it left an escrow with no button, no board and no pass that could
+// reach it: the account was "in a game" until the process was restarted.
+//
+// Both halves are now kept. The board stays, and it is MARKED with the stake,
+// so the pass three minutes on hands back the whole bet instead of standing
+// the hand. The seed below is picked so the difference is visible: standing
+// this hand pays less than the bet, so a sweep that played it out could not
+// produce the number this test demands.
+func TestBlackjackUndeliveredHandIsKeptAndRefundedWholeRatherThanStood(t *testing.T) {
+	resetComponentsForTest()
+	t.Cleanup(resetComponentsForTest)
+
+	seed := blackjackSeedWhere(t, "a playable hand that loses when it is stood", func(g *casino.BlackjackGame) bool {
+		return g.State() == casino.BlackjackPlaying && g.AutoResolve() < 100
+	})
+	stood := blackjackProbe(100, seed).AutoResolve()
+
+	opened := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	bank := &flakyBank{Store: casino.New(filepath.Join(t.TempDir(), "casino.json"))}
+	c := &BlackjackCommand{
+		store:    bank,
+		sessions: casino.NewSessionManager(func() time.Time { return opened }, casino.DefaultSessionTTL),
+		newGame:  func(bet int64) *casino.BlackjackGame { return casino.NewBlackjack(bet, blackjackRngFor(seed)) },
+	}
+	RegisterComponent(c) // the sweeper routes a swept hand through the registry
+
+	bank.settleErr = errors.New("the refund never reached the disk")
+	r := &fakeCasinoResponder{respondErr: errors.New("https://discord.com/api/v9/interactions/1/SECRET_TOKEN/callback: 500")}
+	if err := c.handle(r, blackjackSlashInteraction(100)); err == nil {
+		t.Fatal("/blackjack reported success although the hand never reached Discord")
+	}
+	bank.settleErr = nil // the disk comes back before the sweep
+
+	if chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank); chips != 900 || escrow != 100 {
+		t.Fatalf("player: %d chips / %d escrow after a refused refund, want 900 / 100", chips, escrow)
+	}
+	if c.sessions.Len() != 1 {
+		t.Fatalf("%d hands are live after a refused refund, want 1 — a retired hand is one nothing can retry", c.sessions.Len())
+	}
+
+	// Three minutes on, the sweeper gives the stake back. It does NOT play
+	// the hand: the cards were never seen, so there is nothing to decide.
+	sweepIdleBoards(newRecordingEditor(), c.sessions, bank, opened.Add(casino.DefaultSessionTTL))
+
+	chips, escrow := highLowChipsOf(t, bank), highLowEscrowOf(t, bank)
+	if escrow != 0 {
+		t.Errorf("escrow = %d after the sweep, want 0 — the stake is stranded until a restart", escrow)
+	}
+	if chips != 1000 {
+		t.Errorf("player: %d chips after the sweep, want the whole stake back (1000) — standing this hand would have paid %d", chips, stood)
+	}
+	if c.sessions.Len() != 0 {
+		t.Errorf("%d hands survived the sweep, want 0", c.sessions.Len())
+	}
+	if bank.settles != 2 {
+		t.Errorf("SettleGame was called %d times, want 2 (the undelivered cleanup, then the sweep's retry)", bank.settles)
+	}
+}

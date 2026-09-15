@@ -420,6 +420,13 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 	if err != nil {
 		return respondVia(r, i.Interaction, messageResponse(translateHighLowError(err)))
 	}
+	// The board comes back HELD and stays held until this open is over
+	// (C3B-P3): registration, stake and first reply are ONE operation on the
+	// board, and the idle sweep skips a held board. Without it the sweep
+	// could take the board between the two halves below — the board is
+	// memory only there, so losing it costs nothing by itself, but the open
+	// carried on and staked chips onto an account whose board was gone.
+	defer c.sessions.Release(sessionID)
 
 	// Store.OpenGame is still the PERSISTED half of "one game per person",
 	// and it is the half that survives a restart: an escrow left by a board
@@ -470,10 +477,10 @@ func (c *HighLowCommand) handle(r interactionResponder, i *discordgo.Interaction
 // settled or that now belongs to the game which came after it.
 //
 // A refused refund leaves the board STANDING, which is what makes the idle
-// sweep three minutes on the retry: AutoResolve on an untouched high&low
-// board is a cash-out of a pot that still equals the bet, so the sweep hands
-// back exactly what this call could not. The player already has an error in
-// front of them, so the failure is logged rather than shown.
+// sweep three minutes on the retry, and marks it with the stake so that retry
+// pays the refund rather than re-deriving one from the board (C3B-P3). The
+// player already has an error in front of them, so the failure is logged
+// rather than shown.
 func (c *HighLowCommand) withdrawUndeliveredBoard(guildID, userID, sessionID string, bet int64) {
 	lock := c.locks.acquire(sessionID)
 	defer c.locks.release(sessionID, lock)
@@ -489,6 +496,13 @@ func (c *HighLowCommand) withdrawUndeliveredBoard(guildID, userID, sessionID str
 	// refuses that instead).
 	if _, err := c.store.SettleGame(guildID, userID, sessionID, bet); err != nil {
 		slog.Error("casino: refunding an undelivered high&low board failed, the sweeper retries it", "error", redactInteractionError(err))
+		// The board stays, and the mark fixes what the retry owes at the
+		// stake itself (C3B-P3). An untouched high&low board cashes out a pot
+		// that still equals the bet, so the sweep already handed back the
+		// right number — but only by re-deriving it from a board nobody may
+		// press again. Saying the amount here is what makes all three games
+		// the same promise: a refund that failed is retried as a REFUND.
+		c.sessions.MarkRefundPending(sessionID, bet)
 		return
 	}
 	c.sessions.Close(sessionID)

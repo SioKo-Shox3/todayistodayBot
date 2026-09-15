@@ -81,6 +81,10 @@ type Session struct {
 	// the amount alone cannot answer that. A retried settlement pays exactly
 	// this number instead of resolving the board a second time: AutoResolve
 	// draws cards, so a second call would decide a different game.
+	//
+	// MarkRefundPending is the other writer: a refund the command layer
+	// could not persist fills them in before it leaves the board standing,
+	// so the sweep gives the stake back instead of playing the board out.
 	PendingPayout  int64
 	PayoutResolved bool
 
@@ -93,7 +97,9 @@ type Session struct {
 	NeedsRedraw bool
 
 	// busy counts the operations currently running on this board (Hold /
-	// Release). Guarded by the manager's mutex like every other mutable
+	// Release). It starts at 1, not 0: the OPEN is the first such operation
+	// (C3B-P3), and it ends when the caller that registered the board
+	// Releases it. Guarded by the manager's mutex like every other mutable
 	// field, and deliberately unexported: it is the manager's bookkeeping,
 	// not part of the board a caller reads out of Get.
 	busy int
@@ -193,6 +199,8 @@ func NewSessionID() (string, error) {
 // until the sweeper's settlement lands, and Store.OpenGame would refuse the
 // new bet anyway. The two halves of the rule must agree, or the player gets
 // a board here that the store then refuses to stake.
+//
+// Like OpenWithID it hands back a HELD board: pair it with Release.
 func (m *SessionManager) Open(guildID, userID string, game GameKind, state any, ref MessageRef) (*Session, error) {
 	id, err := NewSessionID()
 	if err != nil {
@@ -215,6 +223,19 @@ func (m *SessionManager) Open(guildID, userID string, game GameKind, state any, 
 // with a NewSessionID value (16 random bytes), so it is a caller passing a
 // constant or reusing an ID — refusing is what stops the second caller from
 // taking over the first one's board, and its stake with it.
+//
+// A board is born HELD (C3B-P3), exactly as if the caller had taken a Hold on
+// it, and the caller MUST pair the open with Release — normally
+// `defer m.Release(session.ID)` over the whole of the open. Registering and
+// holding in the SAME critical section is what makes the rest of the open
+// (Store.OpenGame and the first reply) run on a board the sweeper cannot take:
+// the board is memory only until the stake lands, so a sweep that removed it
+// in that gap cost nothing by itself, but the open then carried on and wrote
+// an escrow that no board named — the one state 設計書 C-3b forbids. A Hold
+// taken as a separate call after the open could not close that gap, because
+// the gap is exactly where it would be taken. It also answers "what if the
+// hold cannot be taken": on this path it cannot fail, because no other caller
+// has ever seen the ID.
 func (m *SessionManager) OpenWithID(id, guildID, userID string, game GameKind, state any, ref MessageRef) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -241,6 +262,9 @@ func (m *SessionManager) OpenWithID(id, guildID, userID string, game GameKind, s
 		State:        state,
 		LastActionAt: m.now(),
 		Ref:          ref,
+		// Held from its first instant: the open is an operation on this
+		// board like any press, and Sweep skips a busy board.
+		busy: 1,
 	}
 	m.sessions[id] = session
 	m.byUser[key] = id
@@ -366,6 +390,35 @@ func (m *SessionManager) SetNeedsRedraw(id string, needed bool) {
 	if session, ok := m.sessions[id]; ok && !session.Expired {
 		session.NeedsRedraw = needed
 	}
+}
+
+// MarkRefundPending fixes the amount the idle sweep must pay for a board whose
+// own refund failed, and takes the board's game out of the decision (C3B-P3).
+//
+// It is what lets a refund that could not be persisted stay a REFUND. The
+// sweeper settles a board it takes over by asking the board to AutoResolve
+// itself first, and for blackjack that STANDS the hand — a hand the player
+// never saw, against a dealer who may beat it, so the retry could hand back
+// nothing where the caller meant to hand back the whole stake. A marked board
+// skips that: PayoutResolved is already true, so settleSweptBoard pays exactly
+// amount (設計書 §5 pays PendingPayout on every retry).
+//
+// The caller must be holding the board — every caller is, because a refund
+// runs under a Hold — which is also what makes writing these two fields safe:
+// an expired board's fields belong to the sweep goroutine alone, and a held
+// board cannot expire. An expired or unknown board is refused (false): it is
+// somebody else's, and its payout has already been decided.
+func (m *SessionManager) MarkRefundPending(id string, amount int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[id]
+	if !ok || session.Expired {
+		return false
+	}
+	session.PendingPayout = amount
+	session.PayoutResolved = true
+	return true
 }
 
 // Sweep marks every session idle for longer than the TTL as Expired and

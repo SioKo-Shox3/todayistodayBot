@@ -781,6 +781,9 @@ func TestDuelTimedOutChallengeIsWithdrawnAndRefunded(t *testing.T) {
 	if _, err := mgr.OpenWithID(sessionID, "g1", duelChallenger, casino.GameDuel, board, casino.MessageRef{ChannelID: "c1", MessageID: "m1"}); err != nil {
 		t.Fatalf("opening the challenge: %v", err)
 	}
+	// An open hands back a HELD challenge (C3B-P3); ending the hold is what
+	// the real start path does before it returns.
+	mgr.Release(sessionID)
 
 	editor := newRecordingEditor()
 	sweepIdleBoards(editor, mgr, bank, opened.Add(casino.DefaultSessionTTL))
@@ -922,6 +925,7 @@ func TestDuelRefusedPressDoesNotPushBackTheExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatalf("opening the challenge: %v", err)
 			}
+			mgr.Release(session.ID) // the open is over, so the sweeper may take it
 
 			// One second before the deadline, a bystander presses.
 			r := &fakeCasinoResponder{}
