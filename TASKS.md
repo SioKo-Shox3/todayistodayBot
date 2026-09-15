@@ -507,7 +507,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`
 - verify: `go test ./... -count=1`
-- paths: internal/commands/duel.go, internal/commands/duel_test.go, internal/casino/store.go, internal/casino/store_test.go
+- paths: internal/commands/duel.go, internal/commands/duel_test.go, internal/commands/casino_shared.go, internal/casino/store.go, internal/casino/store_test.go
 - notes: 受け手が「口座を持っていない」場合は進行中ではない(拒否しない)。
 
 ## C3B-16: 掲示済みの記録に失敗したときの再送を減らし、契約を明記する(blocking 5、P2)
