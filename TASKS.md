@@ -548,7 +548,7 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - notes: 契約は変えない — `at-least-once` のまま。減らすのは重複の頻度だけで、設計書 §4 と `blocked/C3B-07.md` の「重複しないとは書かない」はそのまま生きる。
 
 ## C3B-20: 上限で切り詰められたジャックポットを「獲得」と書かない(C3B-17 で開いた表示の穴、P3)
-- status: todo
+- status: done
 - done-when: C3B-17 で `Store.Spin` が入り切る分だけ入れるようになった結果、`SpinResult.JackpotWon` は**払うはずだった額**(火を噴いたプール)であって受け取った額ではなくなった。`slotJackpotLine` の `🎰 JACKPOT!! +%d チップ` と `slotCelebrationMessage` の `ジャックポット %d チップ 獲得!!` は今もその額を印字するので、`MaxChips` 手前の口座が 7️⃣7️⃣7️⃣ を引くと結果行の「40枚 獲得」と祝いの「5,000 チップ 獲得」が食い違う。`SpinResult.Payout` と `Owed` の差(= 上限で入らなかった額)を使って、切り詰められたときだけ実際に入った額を書くか一言添える形にする。回帰テスト: 上限手前の 7️⃣7️⃣7️⃣ の 2 つの文字列が結果行と食い違わない / 通常範囲の文面が 1 文字も変わらない。
 - verify: `go build ./... && go vet ./...`
 - verify: `go test ./internal/commands/... -count=1`

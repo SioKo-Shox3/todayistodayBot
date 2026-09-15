@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -182,6 +183,7 @@ func TestRunReveal_Jackpot_SendsPublicCelebrationMention(t *testing.T) {
 		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
 		Bet:         100,
 		Payout:      14321,
+		Owed:        14321,
 		IsJackpot:   true,
 		JackpotWon:  4321,
 		JackpotPool: casino.JackpotSeed,
@@ -373,7 +375,7 @@ func TestSlotJackpotLine_NotFired_ShowsPoolAfterThisSpin(t *testing.T) {
 func TestSlotJackpotLine_Fired_ShowsWonAmountNotTheReseededPool(t *testing.T) {
 	// 発火後の JackpotPool は種に戻っているので、その数を出すと
 	// 「種も賞金のうち」と読めてしまう。出すのは獲得額だけ。
-	got := slotJackpotLine(casino.SpinResult{Bet: 100, JackpotWon: 54321, JackpotPool: casino.JackpotSeed})
+	got := slotJackpotLine(casino.SpinResult{Bet: 100, Payout: 73921, Owed: 73921, JackpotWon: 54321, JackpotPool: casino.JackpotSeed})
 	if got != "🎰 JACKPOT!! +54321 チップ" {
 		t.Fatalf("unexpected jackpot line: %q", got)
 	}
@@ -387,6 +389,7 @@ func TestBuildSlotRevealStages_JackpotFireShowsTheWinLine(t *testing.T) {
 		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
 		Bet:         100,
 		Payout:      24600,
+		Owed:        24600,
 		IsJackpot:   true,
 		JackpotWon:  5000,
 		JackpotPool: casino.JackpotSeed,
@@ -402,6 +405,7 @@ func TestSlotCelebrationMessage_JackpotFire_CarriesThePool(t *testing.T) {
 		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
 		Bet:         100,
 		Payout:      24600,
+		Owed:        24600,
 		IsJackpot:   true,
 		JackpotWon:  5000,
 		JackpotPool: casino.JackpotSeed,
@@ -427,5 +431,128 @@ func TestSlotCelebrationMessage_Diamonds_CarryNoPool(t *testing.T) {
 	}
 	if strings.Contains(got, "7777") {
 		t.Fatalf("a non-firing spin must not advertise the pool as won: %q", got)
+	}
+}
+
+// TestSlotJackpotStrings_TruncatedByTheCap_NeverClaimTheUncreditedPool is the
+// regression for the display hole Store.Spin's capped credit opened:
+// SpinResult.JackpotWon is what the pool OWED, so at MaxChips the result line
+// (which prints the credited Payout) and the two jackpot strings (which
+// printed JackpotWon as「獲得」) disagreed inside one message.
+//
+// The three capped fixtures are not invented: they are the exact numbers the
+// real Store pins in internal/casino/store_test.go
+// (TestStore_Spin_JackpotAtTheCapReturnsTheUndeliveredPoolToThePool and
+// TestStore_Spin_JackpotPartlyFits_ReturnsOnlyTheShareThatMissedTheAccount) —
+// a MaxChips-30 and a MaxChips-1990 account betting 10 into a 5,000 pool.
+func TestSlotJackpotStrings_TruncatedByTheCap_NeverClaimTheUncreditedPool(t *testing.T) {
+	jackpotReels := [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven}
+	cases := []struct {
+		name            string
+		result          casino.SpinResult
+		wantResultLine  string
+		wantJackpotLine string
+		wantCelebration string
+	}{
+		{
+			// 口座は MaxChips-30。10 ベットが空けた 40 の隙間はテーブル配当
+			// 1,960 だけで埋まり、プールは 1 枚も届かない。
+			name: "プールが1枚も口座へ入らなかった",
+			result: casino.SpinResult{
+				Reels:       jackpotReels,
+				Bet:         10,
+				Payout:      40,
+				Owed:        1960 + 5000,
+				IsJackpot:   true,
+				JackpotWon:  5000,
+				JackpotPool: casino.JackpotSeed + 5000,
+			},
+			wantResultLine:  "🎉 40枚 獲得!(ベット10枚)",
+			wantJackpotLine: "🎰 JACKPOT!! +0 チップ（上限のため 5000 チップは受け取れませんでした）",
+			wantCelebration: "🎉🎉🎉 <@u1> が 7️⃣7️⃣7️⃣ で大当たり!! 🎰 ジャックポット 5000 チップ 的中!（上限のため受け取りは 0 チップ） 🎉🎉🎉",
+		},
+		{
+			// 口座は MaxChips-1990。隙間 2,000 はテーブル配当 1,960 と
+			// プールの 40 で埋まり、残り 4,960 はプールへ戻る。
+			name: "プールの一部だけが口座へ入った",
+			result: casino.SpinResult{
+				Reels:       jackpotReels,
+				Bet:         10,
+				Payout:      2000,
+				Owed:        1960 + 5000,
+				IsJackpot:   true,
+				JackpotWon:  5000,
+				JackpotPool: casino.JackpotSeed + 4960,
+			},
+			wantResultLine:  "🎉 2000枚 獲得!(ベット10枚)",
+			wantJackpotLine: "🎰 JACKPOT!! +40 チップ（上限のため 4960 チップは受け取れませんでした）",
+			wantCelebration: "🎉🎉🎉 <@u1> が 7️⃣7️⃣7️⃣ で大当たり!! 🎰 ジャックポット 5000 チップ 的中!（上限のため受け取りは 40 チップ） 🎉🎉🎉",
+		},
+		{
+			// 上限に当たらない通常の当たり。文面は 1 文字も変わらない。
+			name: "上限に当たらなかった",
+			result: casino.SpinResult{
+				Reels:       jackpotReels,
+				Bet:         10,
+				Payout:      1960 + 5000,
+				Owed:        1960 + 5000,
+				IsJackpot:   true,
+				JackpotWon:  5000,
+				JackpotPool: casino.JackpotSeed,
+			},
+			wantResultLine:  "🎉 6960枚 獲得!(ベット10枚)",
+			wantJackpotLine: "🎰 JACKPOT!! +5000 チップ",
+			wantCelebration: "🎉🎉🎉 <@u1> が 7️⃣7️⃣7️⃣ で大当たり!! 🎰 ジャックポット 5000 チップ 獲得!! 🎉🎉🎉",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := slotResultLine(tc.result); got != tc.wantResultLine {
+				t.Fatalf("result line:\n got: %q\nwant: %q", got, tc.wantResultLine)
+			}
+			if got := slotJackpotLine(tc.result); got != tc.wantJackpotLine {
+				t.Fatalf("jackpot line:\n got: %q\nwant: %q", got, tc.wantJackpotLine)
+			}
+			if got := slotCelebrationMessage("u1", tc.result); got != tc.wantCelebration {
+				t.Fatalf("celebration:\n got: %q\nwant: %q", got, tc.wantCelebration)
+			}
+
+			// 結果行と食い違わないこと: 受け取ったと書いたプール分は、
+			// 口座へ実際に入った総額を超えられない。
+			credited, missed := slotJackpotCredited(tc.result)
+			if credited+missed != tc.result.JackpotWon {
+				t.Fatalf("credited %d + missed %d != JackpotWon %d — the split must account for the whole pool", credited, missed, tc.result.JackpotWon)
+			}
+			if credited > tc.result.Payout {
+				t.Fatalf("credited %d exceeds the %d chips that reached the account", credited, tc.result.Payout)
+			}
+			// 切り詰められた額を「獲得」と書かない(タスクの表題そのもの)。
+			if missed > 0 {
+				overstated := fmt.Sprintf("%d チップ 獲得", tc.result.JackpotWon)
+				for _, s := range []string{slotJackpotLine(tc.result), slotCelebrationMessage("u1", tc.result)} {
+					if strings.Contains(s, overstated) {
+						t.Fatalf("a truncated jackpot must not be written as 獲得: %q contains %q", s, overstated)
+					}
+				}
+			}
+		})
+	}
+}
+
+// 演出の最終ステージも同じ穴を通る(結果行とジャックポット行が1つの
+// メッセージに並ぶ場所なので、食い違えばそこで見える)。
+func TestBuildSlotRevealStages_TruncatedJackpot_AgreesWithTheResultLine(t *testing.T) {
+	result := casino.SpinResult{
+		Reels:       [3]casino.SlotSymbol{casino.SymbolSeven, casino.SymbolSeven, casino.SymbolSeven},
+		Bet:         10,
+		Payout:      40,
+		Owed:        1960 + 5000,
+		IsJackpot:   true,
+		JackpotWon:  5000,
+		JackpotPool: casino.JackpotSeed + 5000,
+	}
+	want := "🎰 7️⃣ 7️⃣ 7️⃣\n🎉 40枚 獲得!(ベット10枚)\n🎰 JACKPOT!! +0 チップ（上限のため 5000 チップは受け取れませんでした）"
+	if got := buildSlotRevealStages(result)[3]; got != want {
+		t.Fatalf("final stage:\n got: %q\nwant: %q", got, want)
 	}
 }

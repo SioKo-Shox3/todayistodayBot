@@ -74,6 +74,29 @@ func slotResultLine(result casino.SpinResult) string {
 	return fmt.Sprintf("😢 ハズレ(ベット%d枚)", result.Bet)
 }
 
+// slotJackpotCredited splits a fired pool into the part that actually reached
+// the account and the part MaxChips kept out. SpinResult.JackpotWon is what
+// the pool OWED (it is a component of Owed, not of Payout), so printing it as
+// 「獲得」at the cap contradicts the result line, which prints the credited
+// Payout: a MaxChips-30 account winning a 5,000 pool is told「40枚 獲得」and
+// 「5,000 チップ 獲得」in the same breath. Store.Spin credits the table payout
+// first and sends min(shortfall, JackpotWon) back to the pool, which makes
+// that min the pool's share of the shortfall — the same split rendered here.
+//
+// missed is the pool's share alone, never the dropped table part: the result
+// line already prints the honest total, so the jackpot strings only have to
+// stop overstating the pool.
+func slotJackpotCredited(result casino.SpinResult) (credited, missed int64) {
+	short := result.Owed - result.Payout
+	if short <= 0 {
+		return result.JackpotWon, 0
+	}
+	if short > result.JackpotWon {
+		short = result.JackpotWon
+	}
+	return result.JackpotWon - short, short
+}
+
 // slotJackpotLine renders the pool line every spin result carries (設計書
 // C-3a §2). The two forms are mutually exclusive on purpose: when the pool
 // fires, result.JackpotPool is already back at JackpotSeed, and printing
@@ -84,6 +107,9 @@ func slotResultLine(result casino.SpinResult) string {
 // while this one stays true if 設計書 §2 ever adds another trigger.
 func slotJackpotLine(result casino.SpinResult) string {
 	if result.JackpotWon > 0 {
+		if credited, missed := slotJackpotCredited(result); missed > 0 {
+			return fmt.Sprintf("🎰 JACKPOT!! +%d チップ（上限のため %d チップは受け取れませんでした）", credited, missed)
+		}
 		return fmt.Sprintf("🎰 JACKPOT!! +%d チップ", result.JackpotWon)
 	}
 	return fmt.Sprintf("🎰 ジャックポット: %d チップ", result.JackpotPool)
@@ -96,6 +122,10 @@ func slotJackpotLine(result casino.SpinResult) string {
 func slotCelebrationMessage(userID string, result casino.SpinResult) string {
 	reels := fmt.Sprintf("%s%s%s", result.Reels[0], result.Reels[1], result.Reels[2])
 	if result.JackpotWon > 0 {
+		if credited, missed := slotJackpotCredited(result); missed > 0 {
+			// 発火した事実は公開するのでプールの額は残すが、それを「獲得」とは書かない。
+			return fmt.Sprintf("🎉🎉🎉 <@%s> が %s で大当たり!! 🎰 ジャックポット %d チップ 的中!（上限のため受け取りは %d チップ） 🎉🎉🎉", userID, reels, result.JackpotWon, credited)
+		}
 		return fmt.Sprintf("🎉🎉🎉 <@%s> が %s で大当たり!! 🎰 ジャックポット %d チップ 獲得!! 🎉🎉🎉", userID, reels, result.JackpotWon)
 	}
 	return fmt.Sprintf("🎉🎉🎉 <@%s> が %s で大当たり!! 🎉🎉🎉", userID, reels)

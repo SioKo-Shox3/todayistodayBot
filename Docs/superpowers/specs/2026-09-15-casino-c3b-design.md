@@ -35,6 +35,13 @@ C-2 までは「1 人 対 胴元」だけだった。C-3b は**人 対 人**の�
   プールは既にあるチップ。宝くじ(`drawLotteryLocked`)が余りをプールへ送るのと同じ形。配当表の分を先に入れる
   ものとして、プールへ戻すのは `min(入り切らなかった額, JackpotWon)` とする(`TestStore_Spin_JackpotAtTheCapReturnsTheUndeliveredPoolToThePool`・
   `TestStore_Spin_JackpotPartlyFits_ReturnsOnlyTheShareThatMissedTheAccount`)。
+- **表示も「入った額」で書く** — `SpinResult.JackpotWon` は**払うはずだった**プールであって受け取った額ではないので、
+  上限で切り詰められた回にそれを「獲得」と印字すると、入った額を出す結果行(`🎉 40枚 獲得!`)と同じ画面で食い違う。
+  `Owed - Payout` から `min(不足額, JackpotWon)` を取り、切り詰められたときだけ結果行(`🎰 JACKPOT!! +0 チップ
+  (上限のため 5,000 チップは受け取れませんでした)`)と祝いの文(`ジャックポット 5,000 チップ 的中!(上限のため
+  受け取りは 0 チップ)`)を受け取った額で書く。プールが火を噴いた事実は祝いの条件なので `JackpotWon` の意味は変えず、
+  額の出どころだけを分ける。上限に当たらない通常の範囲では文面は従来どおり
+  (`TestSlotJackpotStrings_TruncatedByTheCap_NeverClaimTheUncreditedPool`)。
 - **上限は配当を止める理由にしない** — `SettleGame`・`AcceptDuel` は入り切る分だけ入れて残りを捨て、精算そのものは
   必ず成功する。拒否にすると、同じ取引で閉じた月次切り替えごと巻き戻り、その切り替えが払う賞与こそが口座を
   埋めた張本人なので、再試行が拒否された状態を作り直す — 預かり(`Escrow`)を抱えた手が永久に閉じなくなる。
