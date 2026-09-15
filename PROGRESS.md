@@ -507,3 +507,37 @@
   掃除人の `SettleTimedOutBoard` は盤面 ID で `ErrEscrowMismatch` になり再試行にならない。
   `NEXT_FINDINGS.md` の反復 2 所見 1(紐付け前の掃除)と同じ根で、直すなら
   「紐付けが終わるまで掃除から守る」側。タスクとしてはまだ起きていない。
+
+## 反復 4(C3B-15) — 2026-09-15
+
+- **Done**: C3B-15。`/duel` の開始が受け手の預かりも見るようにした。読み取りは
+  `casino.Store.GameInProgress`(`Snapshot` 1 回)で、口座を**作らない** —
+  `ensureAccountLocked` を通すと「他人の挑戦で名前を呼ばれた」だけの人に 1,000 枚の
+  ウェルカムボーナスが出る。ゲート 3 本とも exit=0・全 8 パッケージ ok
+  (`.harness/runs/20260915-080323/verify-C3B-15-{1,2,3}.txt`)。
+- **Next**: C3B-16(掲示済みの記録に失敗したときの再送を減らし契約を明記する。blocking 5、P2)。
+  未完は C3B-16・C3B-17 の 2 件。
+- **開始時の検査は保証ではなく礼儀**: `OpenGame` が見るのは**自分が引き落とす口座**だけなので、
+  受け手の進行中は ⚔️ が押されるまで誰も見ていなかった。挑戦が立ち、挑戦者のチップが
+  3 分間預かりに入り、`AcceptDuel` が断って終わる — 最初から始まりようがなかったゲームのために。
+  ただし開始時の読み取りは**保証にはなれない**(3 分の間に相手が別のゲームを開ける)ので、
+  規則を守っているのは今も `AcceptDuel` のロック内の再検査のほう。今回足したのは「無駄な挑戦」を
+  「その場の拒否」に変える一段だけで、受諾側の検査は残してテストで固定した。
+- **文言から「先に決着してください」を落とした**: 既存の `duelInProgressMessage` をそのまま流用すると、
+  何も悪いことをしていない挑戦者に向かって「先に決着してください」と言うことになる(決着させられるのは
+  相手の手札で、挑戦者には触れない)。`duelOpponentInProgressFormat = "❌ <@%s> は進行中のゲームがあります"`
+  として相手を名指しするだけにした。
+- **読み取りエラーは開始を断る**: `GameInProgress` が失敗したら `duelStartFailedMessage` で止める。
+  同じファイルを読む `OpenGame` の `Update` もどのみち失敗するので、先に断るほうが預かりを触らない。
+- **効き目の確認(mutation)**: 2 つの検査をそれぞれ外すと、対応するテストだけが落ちる
+  (`mutation-C3B-15.txt`)。開始時の検査を外すと `TestDuelRefusesAnOpponentWhoIsAlreadyPlaying` が
+  「挑戦者 900/100・盤面 1 枚」= まさに直した欠陥の形で落ち、`AcceptDuel` の
+  `opponent.Escrow > 0` を消すと `TestDuelAcceptStillRefusesAnOpponentWhoStartedAGameMeanwhile` が
+  「両者 0 預かり・挑戦者 1100 枚」= 進行中の相手の口座を巻き込んで決着した形で落ちる。
+- **`paths:` の外に 1 ファイル(不可避)**: `internal/commands/casino_shared.go` の `casinoBank` に
+  `GameInProgress` を足さないとコマンド層から呼べない。テストの偽物(`flakyBank`)は `*casino.Store` を
+  埋め込んでいるので、そちらの追随は不要だった。
+- **`NEXT_FINDINGS.md` の未コミットの空化は触っていない**: セッション開始時点で既に 62 行が
+  消された状態(反復 1・2 の評価者所見)だった。中身は C3B-15〜17 として `TASKS.md` にあり、
+  反復 2 所見 1(紐付け前の掃除)は反復 3 の Notes に残っている。今回のタスクの `paths:` 外なので
+  判断は次の反復へ回す。
