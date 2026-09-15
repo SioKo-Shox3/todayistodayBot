@@ -527,3 +527,13 @@ blocking を直す。設計書 `Docs/superpowers/specs/2026-07-10-casino-c1-desi
 - verify: `go test ./... -count=1`
 - paths: internal/casino/store.go, internal/casino/store_test.go, internal/commands/slot.go, internal/commands/slot_test.go, Docs/superpowers/specs/2026-09-15-casino-c3b-design.md
 - notes: `SettleGame` と違い**行き詰まりはしない**(取引ごと巻き戻るので賭け金は戻り、預かりも残らない)ので P1 ではない。`slot.go` の `ErrChipCapExceeded` の分岐は変更後に到達不能になるので一緒に消す。`ClaimDaily` と両替は精算ではない(進行中のものが無く、拒否しても利用者は元手を保ったまま)ので厳格なままでよい — 揃えない。
+
+## C3B-18: 預かりの印を開始前に確定させ、掃除人が印の不一致で盤面を落とさない(C3B-13 の差し戻し)
+- status: todo
+- done-when: `NEXT_FINDINGS.md` の C3B-13 差し戻し(仮の印 `EscrowOpening = "opening"` と `BindEscrowSession` の 2 段階の間に掃除が挟まると、精算が `ErrEscrowMismatch` になり盤面が落ちて預かりが取り残される)を閉じる。親の決定(2026-09-15、差し戻しに記載済み): **仮の印を無くして隙間そのものを消す** — `casino.NewSessionID()` を公開し、コマンド側が**先にセッション ID を作って**から `OpenGame(..., sessionID)` に渡し、**同じ ID で** `SessionManager` の盤面を開く(`Open` が ID を受け取る形にするか `OpenWithID` を足す)。`EscrowOpening` と `BindEscrowSession` は削除する。H&L・BJ・duel の 3 経路すべて同じ形に揃える。併せて掃除人(`casino_sessions.go`)が**精算の失敗(`ErrEscrowMismatch` を含む)で盤面を落とさない**ようにする(C2-10 の「精算が成功するまで消さない」規律。警告をログに残し次の巡回で再試行)。回帰テスト: 盤面を開いた直後(印の紐付けを待たずに)掃除しても預かりが取り残されない / 印が不一致の盤面は落ちずに警告が出る / 正常な開始・精算・返金・時間切れが 3 ゲームとも通る。
+- verify: `go build ./... && go vet ./...`
+- verify: `go test ./internal/casino/... -count=1`
+- verify: `go test ./internal/commands/... -count=1`
+- verify: `go test ./... -count=1`
+- paths: internal/casino/session.go, internal/casino/session_test.go, internal/casino/store.go, internal/casino/store_test.go, internal/commands/highlow.go, internal/commands/blackjack.go, internal/commands/duel.go, internal/commands/casino_sessions.go, internal/commands/highlow_test.go, internal/commands/blackjack_test.go, internal/commands/duel_test.go, internal/commands/casino_sessions_test.go, internal/commands/casino_shared.go
+- notes: 危険地帯。**差し戻しに置いたままだと 2 回続けて飛ばされたので、タスクにした。** 閉じたら `NEXT_FINDINGS.md` の当該節を消す。
